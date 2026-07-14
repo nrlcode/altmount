@@ -20,7 +20,7 @@ func TestPR5ResolveCanonicalSegmentLayoutMatchesFingerprintOrder(t *testing.T) {
 		},
 		NestedSources: []*metapb.NestedSegmentSource{
 			{
-				InnerOffset:     5,
+				InnerOffset:     0,
 				InnerLength:     85,
 				InnerVolumeSize: 100,
 				Segments: []*metapb.SegmentData{
