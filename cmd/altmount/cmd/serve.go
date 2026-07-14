@@ -16,15 +16,14 @@ import (
 	"github.com/javi11/altmount/frontend"
 	"github.com/javi11/altmount/internal/api"
 	"github.com/javi11/altmount/internal/arrs"
-	"github.com/javi11/altmount/internal/stremio"
 	"github.com/javi11/altmount/internal/config"
-	"github.com/javi11/altmount/internal/health"
 	"github.com/javi11/altmount/internal/metadata"
 	"github.com/javi11/altmount/internal/nzbfilesystem/segcache"
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/progress"
 	"github.com/javi11/altmount/internal/rclone"
 	"github.com/javi11/altmount/internal/slogutil"
+	"github.com/javi11/altmount/internal/stremio"
 	"github.com/javi11/altmount/internal/webdav"
 	"github.com/spf13/cobra"
 )
@@ -82,6 +81,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	db.StartCheckpointLoop(ctx, 5*time.Minute)
 
 	repos := setupRepositories(ctx, db)
+	cfg, err = reconcileHealthProviderConfig(ctx, cfg, repos.StateRepo, configManager)
+	if err != nil {
+		return err
+	}
 	poolManager := pool.NewManager(ctx, repos.MainRepo)
 
 	metadataService, metadataReader := initializeMetadata(cfg)
@@ -196,27 +199,28 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	})
 
-	healthWorker, librarySyncWorker, err := startHealthWorker(ctx, cfg, repos.HealthRepo, poolManager, configManager, rcloneRCClient, arrsService, importerService, progressBroadcaster, streamTracker)
+	observationRuntime, err := initializeHealthObservationRuntime(
+		ctx,
+		cfg,
+		repos.StateRepo,
+		repos.HealthRepo,
+		metadataService,
+		poolManager,
+		configManager,
+		progressBroadcaster,
+		streamTracker,
+	)
 	if err != nil {
-		logger.Warn("Health worker initialization failed", "err", err)
+		return err
 	}
-	if healthWorker != nil {
-		apiServer.SetHealthWorker(healthWorker)
-	}
+	librarySyncWorker := observationRuntime.librarySyncWorker()
 	if librarySyncWorker != nil {
 		apiServer.SetLibrarySyncWorker(librarySyncWorker)
 	}
-
-	// Register health system config change handler for dynamic enable/disable
-	if healthWorker != nil && librarySyncWorker != nil {
-		healthController := health.NewHealthSystemController(healthWorker, librarySyncWorker)
-		healthController.RegisterConfigChangeHandler(ctx, configManager)
-
-		// Trigger initial metadata date sync if health is enabled
-		if cfg.Health.Enabled != nil && *cfg.Health.Enabled {
-			healthController.SyncMetadataDates(ctx)
-		}
+	if observationService := observationRuntime.observationService(); observationService != nil {
+		apiServer.SetHealthObservationController(observationService)
 	}
+	observationRuntime.registerConfigChangeHandler(ctx, configManager)
 
 	// Start ARRs queue cleanup worker
 	if err := arrsService.StartWorker(ctx); err != nil {
@@ -326,14 +330,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Shutdown API server and its managed resources (like FUSE)
 	apiServer.Shutdown(ctx)
 
-	// Stop health worker if running
-	if healthWorker != nil {
-		if err := healthWorker.Stop(ctx); err != nil {
-			logger.ErrorContext(ctx, "Failed to stop health worker", "error", err)
+	// Stop the resumable observation worker using a fresh context: the server
+	// context has already been cancelled by the shutdown signal.
+	observationStopCtx, observationStopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if observationRuntime != nil {
+		if err := observationRuntime.stop(observationStopCtx); err != nil {
+			logger.ErrorContext(ctx, "Failed to stop health observation service", "error", err)
 		} else {
-			logger.InfoContext(ctx, "Health worker stopped")
+			logger.InfoContext(ctx, "Health observation service stopped")
 		}
 	}
+	observationStopCancel()
 
 	// Stop ARRs queue cleanup worker
 	arrsService.StopWorker(ctx)

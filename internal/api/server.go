@@ -47,6 +47,7 @@ type Server struct {
 	queueRepo           *database.Repository
 	healthRepo          *database.HealthRepository
 	healthRunRepository HealthRunProgressRepository
+	healthObservation   HealthObservationController
 	authService         *auth.Service
 	userRepo            *database.UserRepository
 	configManager       ConfigManager
@@ -142,6 +143,24 @@ func (s *Server) SetHealthWorker(healthWorker *health.HealthWorker) {
 // endpoints without changing the source-compatible NewServer constructor.
 func (s *Server) SetHealthRunRepository(repository HealthRunProgressRepository) {
 	s.healthRunRepository = repository
+}
+
+// HealthObservationController is the narrow observation-only compatibility
+// surface used by existing health status and manual-check routes.
+type HealthObservationController interface {
+	Status() health.ObservationServiceStatus
+	ScheduleFile(
+		context.Context,
+		int64,
+		health.ObservationScheduleIntent,
+	) (health.ObservationScheduleResult, error)
+	CancelFile(context.Context, int64) error
+}
+
+// SetHealthObservationController keeps existing API routes on the durable,
+// non-destructive PR5 engine when the legacy repair-capable worker is absent.
+func (s *Server) SetHealthObservationController(controller HealthObservationController) {
+	s.healthObservation = controller
 }
 
 // SetLibrarySyncWorker sets the library sync worker reference for the server

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,7 @@ type HealthRunProgressRepository interface {
 // intentionally excluded.
 type HealthRunProgressResponse struct {
 	ID                string                   `json:"id"`
+	FileRevisionID    string                   `json:"file_revision_id"`
 	Trigger           string                   `json:"trigger"`
 	Mode              string                   `json:"mode"`
 	Status            database.HealthRunStatus `json:"status"`
@@ -50,6 +52,8 @@ type HealthRunProgressResponse struct {
 	UpdatedAt         time.Time                `json:"updated_at"`
 	CompletedAt       *time.Time               `json:"completed_at,omitempty"`
 	LastError         string                   `json:"last_error,omitempty"`
+	ChecksPerSecond   float64                  `json:"checks_per_second"`
+	EstimatedSeconds  int64                    `json:"estimated_completion_seconds"`
 }
 
 func toHealthRunProgressResponse(run database.HealthRun) HealthRunProgressResponse {
@@ -58,7 +62,7 @@ func toHealthRunProgressResponse(run database.HealthRun) HealthRunProgressRespon
 		value := *run.CurrentProviderID
 		providerID = &value
 	}
-	return HealthRunProgressResponse{
+	response := HealthRunProgressResponse{
 		ID: run.ID, Trigger: run.Trigger, Mode: run.Mode, Status: run.Status,
 		TotalSegments: run.TotalSegments, ResolvedSegments: run.ResolvedSegments,
 		ProviderChecks: run.ProviderChecks, MissingCandidates: run.MissingCandidates,
@@ -68,6 +72,21 @@ func toHealthRunProgressResponse(run database.HealthRun) HealthRunProgressRespon
 		CreatedAt: run.CreatedAt, StartedAt: run.StartedAt, UpdatedAt: run.UpdatedAt,
 		CompletedAt: run.CompletedAt, LastError: sanitizeHealthRunLastError(run.LastError),
 	}
+	if validHealthRunToken(run.FileRevisionID) {
+		response.FileRevisionID = run.FileRevisionID
+	}
+	start := run.CreatedAt
+	if run.StartedAt != nil {
+		start = run.StartedAt.UTC()
+	}
+	if elapsed := run.UpdatedAt.UTC().Sub(start); elapsed > 0 && run.ProviderChecks > 0 {
+		response.ChecksPerSecond = float64(run.ProviderChecks) / elapsed.Seconds()
+		remaining := max(run.TotalSegments-run.ResolvedSegments, 0)
+		if remaining > 0 && run.Status == database.HealthRunRunning {
+			response.EstimatedSeconds = int64(math.Ceil(float64(remaining) / response.ChecksPerSecond))
+		}
+	}
+	return response
 }
 
 func validHealthRunToken(value string) bool {
@@ -161,8 +180,21 @@ func (s *Server) handleControlHealthRun(c *fiber.Ctx) error {
 		return RespondValidationError(c, "Invalid health run identifier", "")
 	}
 	action := strings.TrimSpace(c.Params("action"))
+	if action != "pause" && action != "resume" && action != "cancel" {
+		return RespondValidationError(c, "Invalid health run action", "supported actions are pause, resume, and cancel")
+	}
+	run, err := s.healthRunRepository.GetHealthRun(c.Context(), id)
+	if err != nil {
+		return RespondInternalError(c, "Failed to retrieve durable health run", "")
+	}
+	if run == nil {
+		return RespondNotFound(c, "Health run", "")
+	}
+	if run.Trigger == "import" {
+		return RespondConflict(c, "Import validation runs cannot be controlled here",
+			"Import admission owns pause, resume, and cancellation so validation remains resumable")
+	}
 	now := time.Now().UTC()
-	var err error
 	switch action {
 	case "pause":
 		err = s.healthRunRepository.RequestRunPause(c.Context(), id, true, now)
@@ -170,11 +202,13 @@ func (s *Server) handleControlHealthRun(c *fiber.Ctx) error {
 		err = s.healthRunRepository.RequestRunPause(c.Context(), id, false, now)
 	case "cancel":
 		err = s.healthRunRepository.RequestRunCancel(c.Context(), id, now)
-	default:
-		return RespondValidationError(c, "Invalid health run action", "supported actions are pause, resume, and cancel")
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return RespondNotFound(c, "Health run", "")
+	}
+	if errors.Is(err, database.ErrImportRunControl) {
+		return RespondConflict(c, "Import validation runs cannot be controlled here",
+			"Import admission owns pause, resume, and cancellation so validation remains resumable")
 	}
 	if err != nil {
 		return RespondInternalError(c, "Failed to control durable health run", "")
@@ -182,7 +216,7 @@ func (s *Server) handleControlHealthRun(c *fiber.Ctx) error {
 	if s.progressBroadcaster != nil {
 		s.progressBroadcaster.BroadcastHealthChanged()
 	}
-	run, err := s.healthRunRepository.GetHealthRun(c.Context(), id)
+	run, err = s.healthRunRepository.GetHealthRun(c.Context(), id)
 	if err != nil {
 		return RespondInternalError(c, "Failed to retrieve durable health run", "")
 	}

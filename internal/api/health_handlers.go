@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/health"
 	"github.com/javi11/altmount/internal/utils"
 )
 
@@ -284,7 +286,6 @@ func (s *Server) handleDeleteHealthBulk(c *fiber.Ctx) error {
 		return RespondValidationError(c, "At least one file path is required", "")
 	}
 
-
 	metaDeletedCount := 0
 	symlinkDeletedCount := 0
 
@@ -487,7 +488,6 @@ func (s *Server) handleRepairHealthBulk(c *fiber.Ctx) error {
 	if len(req.FilePaths) == 0 {
 		return RespondValidationError(c, "At least one file path is required", "")
 	}
-
 
 	ctx := c.Context()
 	cfg := s.configManager.GetConfig()
@@ -887,6 +887,11 @@ func (s *Server) handleAddHealthCheck(c *fiber.Ctx) error {
 //	@Security		BearerAuth
 //	@Router			/health/worker/status [get]
 func (s *Server) handleGetHealthWorkerStatus(c *fiber.Ctx) error {
+	if s.healthObservation != nil {
+		return RespondSuccess(c, HealthWorkerStatusResponse{
+			Status: string(s.healthObservation.Status()),
+		})
+	}
 	if s.healthWorker == nil {
 		return RespondNotFound(c, "Health worker", "Health worker is not configured or not running")
 	}
@@ -932,6 +937,28 @@ func (s *Server) handleDirectHealthCheck(c *fiber.Ctx) error {
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		return RespondBadRequest(c, "Invalid health record ID", "ID must be a valid integer")
+	}
+
+	if s.healthObservation != nil {
+		item, lookupErr := s.healthRepo.GetFileHealthByID(c.Context(), id)
+		if lookupErr != nil {
+			return RespondInternalError(c, "Failed to check health record", "")
+		}
+		if item == nil {
+			return RespondNotFound(c, "Health record", "")
+		}
+		result, scheduleErr := s.healthObservation.ScheduleFile(
+			c.Context(), id, health.ObservationScheduleIntentManual,
+		)
+		if scheduleErr != nil {
+			return RespondInternalError(c, "Failed to schedule health observation", "")
+		}
+		return RespondSuccess(c, fiber.Map{
+			"message": "Health observation scheduled", "id": id,
+			"file_path": item.FilePath, "old_status": string(item.Status),
+			"new_status": string(item.Status), "health_data": ToHealthItemResponse(item),
+			"created": result.Created, "existing": result.Existing,
+		})
 	}
 
 	// Check if health worker is available
@@ -1019,7 +1046,6 @@ func (s *Server) handleRestartHealthChecksBulk(c *fiber.Ctx) error {
 		return RespondValidationError(c, "At least one file path is required", "")
 	}
 
-
 	// Cancel any active checks for these files
 	if s.healthWorker != nil {
 		for _, filePath := range req.FilePaths {
@@ -1074,6 +1100,28 @@ func (s *Server) handleCancelHealthCheck(c *fiber.Ctx) error {
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		return RespondBadRequest(c, "Invalid health record ID", "ID must be a valid integer")
+	}
+
+	if s.healthObservation != nil {
+		item, lookupErr := s.healthRepo.GetFileHealthByID(c.Context(), id)
+		if lookupErr != nil {
+			return RespondInternalError(c, "Failed to check health record", "")
+		}
+		if item == nil {
+			return RespondNotFound(c, "Health record", "")
+		}
+		cancelErr := s.healthObservation.CancelFile(c.Context(), id)
+		if errors.Is(cancelErr, health.ErrObservationRunNotActive) {
+			return RespondConflict(c, "No active health check found", "")
+		}
+		if cancelErr != nil {
+			return RespondInternalError(c, "Failed to cancel health observation", "")
+		}
+		return RespondSuccess(c, fiber.Map{
+			"message": "Health observation cancelled", "id": id,
+			"file_path": item.FilePath, "old_status": string(item.Status),
+			"new_status": string(item.Status), "health_data": ToHealthItemResponse(item),
+		})
 	}
 
 	// Check if health worker is available

@@ -150,11 +150,13 @@ func decodePR5APIResponse(t *testing.T, response *http.Response) map[string]any 
 }
 
 func TestPR5HealthRunsStaticListRouteUsesDurableRepository(t *testing.T) {
+	first := pr5RunFixture("run-list-1")
+	first.FileRevisionID = "revision-list-1"
+	second := pr5RunFixture("run-list-2")
+	second.FileRevisionID = "revision-list-2"
 	repo := &pr5HealthRunRepository{
-		runs: map[string]database.HealthRun{},
-		listed: []database.HealthRun{
-			pr5RunFixture("run-list-1"),
-		},
+		runs:   map[string]database.HealthRun{},
+		listed: []database.HealthRun{first, second},
 	}
 	app, _ := newPR5HealthRunAPI(t, repo)
 
@@ -164,6 +166,11 @@ func TestPR5HealthRunsStaticListRouteUsesDurableRepository(t *testing.T) {
 		"the static runs route must be registered before legacy /health/:id")
 	decoded := decodePR5APIResponse(t, response)
 	assert.Equal(t, true, decoded["success"])
+	data, ok := decoded["data"].([]any)
+	require.True(t, ok)
+	require.Len(t, data, 2)
+	assert.Equal(t, "revision-list-1", data[0].(map[string]any)["file_revision_id"])
+	assert.Equal(t, "revision-list-2", data[1].(map[string]any)["file_revision_id"])
 	repo.mu.Lock()
 	defer repo.mu.Unlock()
 	assert.Equal(t, 1, repo.listCalls)
@@ -189,13 +196,73 @@ func TestPR5HealthRunProgressResponseOnlyExposesSafeCommittedFields(t *testing.T
 	assert.NotContains(t, data, "lease_owner")
 	assert.NotContains(t, data, "lease_expires_at")
 	assert.NotContains(t, data, "fencing_token")
-	assert.NotContains(t, data, "file_revision_id")
+	assert.Equal(t, run.FileRevisionID, data["file_revision_id"])
 	assert.NotContains(t, data, "provider_snapshot_id")
 	assert.NotContains(t, data, "current_provider_generation")
 	encoded, err := json.Marshal(body)
 	require.NoError(t, err)
 	assert.NotContains(t, string(encoded), "raw-message-id")
 	assert.NotContains(t, string(encoded), "internal-worker")
+}
+
+func TestPR5HealthRunProgressDerivesThroughputAndETAFromCommittedState(t *testing.T) {
+	run := pr5RunFixture("run-derived-progress")
+	started := run.UpdatedAt.Add(-10 * time.Second)
+	run.StartedAt = &started
+	run.ProviderChecks = 25
+	run.ResolvedSegments = 50
+	run.TotalSegments = 100
+	repo := &pr5HealthRunRepository{runs: map[string]database.HealthRun{run.ID: run}}
+	app, _ := newPR5HealthRunAPI(t, repo)
+
+	response, err := app.Test(httptest.NewRequest(
+		http.MethodGet, "/api/health/runs/"+run.ID, nil,
+	), -1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	body := decodePR5APIResponse(t, response)
+	data, ok := body["data"].(map[string]any)
+	require.True(t, ok)
+	assert.InDelta(t, 2.5, data["checks_per_second"], 0.0001)
+	assert.Equal(t, float64(20), data["estimated_completion_seconds"])
+}
+
+func TestPR5TargetedHealthRunETAUsesSparseWorkTotal(t *testing.T) {
+	run := pr5RunFixture("run-targeted-progress")
+	run.Trigger = "gap_revalidation_1"
+	run.TotalSegments = 1
+	run.ResolvedSegments = 0
+	run.ProviderChecks = 2
+	started := run.UpdatedAt.Add(-10 * time.Second)
+	run.StartedAt = &started
+	response := toHealthRunProgressResponse(run)
+
+	assert.Equal(t, int64(1), response.TotalSegments)
+	assert.InDelta(t, 0.2, response.ChecksPerSecond, 0.0001)
+	assert.Equal(t, int64(5), response.EstimatedSeconds,
+		"targeted ETA must not include untouched positions from the full revision")
+
+	run.Status = database.HealthRunCompleted
+	run.ResolvedSegments = 1
+	completed := run.UpdatedAt
+	run.CompletedAt = &completed
+	response = toHealthRunProgressResponse(run)
+	assert.Equal(t, response.TotalSegments, response.ResolvedSegments)
+	assert.Zero(t, response.EstimatedSeconds)
+}
+
+func TestPR5TerminalHealthRunHasNoEstimatedCompletion(t *testing.T) {
+	run := pr5RunFixture("run-terminal-progress")
+	run.Status = database.HealthRunCompleted
+	run.TotalSegments = 100
+	run.ResolvedSegments = 3
+	started := run.UpdatedAt.Add(-10 * time.Second)
+	run.StartedAt = &started
+	completed := run.UpdatedAt
+	run.CompletedAt = &completed
+	response := toHealthRunProgressResponse(run)
+
+	assert.Zero(t, response.EstimatedSeconds)
 }
 
 func TestPR5HealthRunControlsPersistIntentAndBroadcastInvalidation(t *testing.T) {
@@ -288,5 +355,47 @@ func TestPR5HealthRunControlsReturnNotFoundForUnknownRun(t *testing.T) {
 	), -1)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusNotFound, response.StatusCode)
+	response.Body.Close()
+}
+
+func TestPR5HealthRunControlsCannotInterruptImportAdmission(t *testing.T) {
+	for _, action := range []string{"pause", "resume", "cancel"} {
+		t.Run(action, func(t *testing.T) {
+			run := pr5RunFixture("run-import-control-" + action)
+			run.Trigger = "import"
+			repo := &pr5HealthRunRepository{runs: map[string]database.HealthRun{run.ID: run}}
+			app, _ := newPR5HealthRunAPI(t, repo)
+
+			response, err := app.Test(httptest.NewRequest(
+				http.MethodPost, "/api/health/runs/"+run.ID+"/"+action, nil,
+			), -1)
+			require.NoError(t, err)
+			assert.Equal(t, http.StatusConflict, response.StatusCode)
+			response.Body.Close()
+
+			repo.mu.Lock()
+			defer repo.mu.Unlock()
+			assert.Empty(t, repo.pauseCalls)
+			assert.Empty(t, repo.cancelIDs)
+			assert.Equal(t, database.HealthRunRunning, repo.runs[run.ID].Status)
+			assert.False(t, repo.runs[run.ID].PauseRequested)
+			assert.False(t, repo.runs[run.ID].CancelRequested)
+		})
+	}
+}
+
+func TestPR5HealthRunControlsMapRepositoryImportFenceToConflict(t *testing.T) {
+	run := pr5RunFixture("run-import-control-race")
+	repo := &pr5HealthRunRepository{
+		runs:     map[string]database.HealthRun{run.ID: run},
+		pauseErr: database.ErrImportRunControl,
+	}
+	app, _ := newPR5HealthRunAPI(t, repo)
+
+	response, err := app.Test(httptest.NewRequest(
+		http.MethodPost, "/api/health/runs/"+run.ID+"/pause", nil,
+	), -1)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusConflict, response.StatusCode)
 	response.Body.Close()
 }
