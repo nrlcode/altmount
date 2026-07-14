@@ -96,6 +96,21 @@ func TestPR4CanonicalFingerprintNormalizesSharedNestedSources(t *testing.T) {
 	assert.NotEqual(t, expandedFingerprint, changedFingerprint)
 }
 
+func TestPR4CanonicalFingerprintUsesResolvedLayoutRegardlessOfRetainedV3Refs(t *testing.T) {
+	inline := pr4FingerprintMetadata()
+	resolvedV3 := proto.Clone(inline).(*metapb.FileMetadata)
+	resolvedV3.StoreRef = "storage-only-reference"
+	resolvedV3.SegmentRuns = []*metapb.SegmentRun{{BaseStoreIndex: 20, Count: 1, DecodedBytes: 200}}
+	resolvedV3.SegmentRefs = []*metapb.SegmentRef{{StoreIndex: 21, StartOffset: 20, EndOffset: 119, DecodedBytes: 200}}
+
+	inlineFingerprint, err := CanonicalSegmentLayoutFingerprint(inline)
+	require.NoError(t, err)
+	resolvedFingerprint, err := CanonicalSegmentLayoutFingerprint(resolvedV3)
+	require.NoError(t, err)
+	assert.Equal(t, inlineFingerprint, resolvedFingerprint,
+		"resolved v3 storage references must not alter the final article-layout identity")
+}
+
 func TestPR4CanonicalFingerprintRejectsInvalidLayout(t *testing.T) {
 	_, err := CanonicalSegmentLayoutFingerprint(nil)
 	require.Error(t, err)
@@ -109,4 +124,56 @@ func TestPR4CanonicalFingerprintRejectsInvalidLayout(t *testing.T) {
 	invalid.SegmentData[0].EndOffset = -1
 	_, err = CanonicalSegmentLayoutFingerprint(invalid)
 	require.Error(t, err)
+
+	unresolved := &metapb.FileMetadata{
+		FileSize: 100,
+		SegmentRuns: []*metapb.SegmentRun{{
+			BaseStoreIndex: 7, Count: 1, DecodedBytes: 100,
+		}},
+	}
+	_, err = CanonicalSegmentLayoutFingerprint(unresolved)
+	require.Error(t, err, "store-backed metadata must be resolved to article identities before fingerprinting")
+
+	unresolvedNested := &metapb.FileMetadata{
+		FileSize: 100,
+		NestedSources: []*metapb.NestedSegmentSource{{
+			InnerLength: 100,
+			SegmentRefs: []*metapb.SegmentRef{{StoreIndex: 9, StartOffset: 0, EndOffset: 99, DecodedBytes: 100}},
+		}},
+	}
+	_, err = CanonicalSegmentLayoutFingerprint(unresolvedNested)
+	require.Error(t, err, "nested store references must also be resolved before fingerprinting")
+
+	danglingShared := &metapb.FileMetadata{
+		FileSize: 100,
+		NestedSources: []*metapb.NestedSegmentSource{{
+			SharedOuterSourceIndex: 1, InnerLength: 100,
+		}},
+	}
+	_, err = CanonicalSegmentLayoutFingerprint(danglingShared)
+	require.Error(t, err, "dangling shared-source references must not collapse to an empty layout")
+
+	nilShared := &metapb.FileMetadata{
+		FileSize:           100,
+		SharedOuterSources: []*metapb.NestedSegmentSource{nil},
+		NestedSources: []*metapb.NestedSegmentSource{{
+			SharedOuterSourceIndex: 1, InnerLength: 100,
+		}},
+	}
+	assert.NotPanics(t, func() {
+		_, err = CanonicalSegmentLayoutFingerprint(nilShared)
+	})
+	require.Error(t, err, "nil shared sources must be rejected without panicking")
+
+	nilNested := &metapb.FileMetadata{
+		FileSize: 100,
+		SharedOuterSources: []*metapb.NestedSegmentSource{{
+			Segments: []*metapb.SegmentData{{Id: "outer.invalid", SegmentSize: 100, EndOffset: 99}},
+		}},
+		NestedSources: []*metapb.NestedSegmentSource{nil},
+	}
+	assert.NotPanics(t, func() {
+		_, err = CanonicalSegmentLayoutFingerprint(nilNested)
+	})
+	require.Error(t, err, "nil nested sources must be rejected without panicking")
 }
