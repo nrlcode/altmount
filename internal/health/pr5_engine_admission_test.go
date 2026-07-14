@@ -7,12 +7,36 @@ import (
 	"testing"
 	"time"
 
+	"github.com/javi11/altmount/internal/database"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 type mutablePlaybackActivity struct {
 	active atomic.Int32
+}
+
+type blockingSharedWireAdmission struct {
+	slots   chan int
+	permits chan struct{}
+	granted atomic.Int32
+}
+
+func (a *blockingSharedWireAdmission) AcquireImportConnections(
+	ctx context.Context,
+	slots int,
+) (func(), int, error) {
+	a.slots <- slots
+	select {
+	case <-a.permits:
+		granted := int(a.granted.Load())
+		if granted <= 0 {
+			granted = slots
+		}
+		return func() {}, granted, nil
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
+	}
 }
 
 func (s *mutablePlaybackActivity) ActiveStreams() int { return int(s.active.Load()) }
@@ -81,6 +105,111 @@ func TestPR5ObservationAdmissionWaitIsInterruptible(t *testing.T) {
 	}()
 	cancel()
 	assert.ErrorIs(t, receiveAdmissionResult(t, result), context.Canceled)
+}
+
+func TestPR5ObservationAdmissionWeightsWireOccupancy(t *testing.T) {
+	admission := newObservationAdmission(3, 2)
+	releaseProviderA, err := admission.AcquireSlots(context.Background(), "provider-a", 2)
+	require.NoError(t, err)
+	defer releaseProviderA()
+
+	providerCtx, cancelProvider := context.WithCancel(context.Background())
+	providerResult := make(chan error, 1)
+	go func() {
+		release, acquireErr := admission.AcquireSlots(providerCtx, "provider-a", 1)
+		if acquireErr == nil {
+			release()
+		}
+		providerResult <- acquireErr
+	}()
+
+	releaseProviderB, err := admission.AcquireSlots(context.Background(), "provider-b", 1)
+	require.NoError(t, err)
+	defer releaseProviderB()
+
+	globalCtx, cancelGlobal := context.WithCancel(context.Background())
+	globalResult := make(chan error, 1)
+	go func() {
+		release, acquireErr := admission.AcquireSlots(globalCtx, "provider-c", 1)
+		if acquireErr == nil {
+			release()
+		}
+		globalResult <- acquireErr
+	}()
+
+	select {
+	case err := <-providerResult:
+		t.Fatalf("weighted provider admission escaped its wire cap: %v", err)
+	case err := <-globalResult:
+		t.Fatalf("weighted global admission escaped its wire cap: %v", err)
+	default:
+	}
+
+	cancelProvider()
+	cancelGlobal()
+	require.ErrorIs(t, receiveAdmissionResult(t, providerResult), context.Canceled)
+	require.ErrorIs(t, receiveAdmissionResult(t, globalResult), context.Canceled)
+}
+
+func TestPR5ObservationRequestReservesActualWireSlots(t *testing.T) {
+	targets := make([]observationSegmentTarget, 256)
+	stat := observationTransportRequest{
+		ObservationKind: database.HealthObservationSTAT,
+		Targets:         targets,
+	}
+	body := observationTransportRequest{
+		ObservationKind: database.HealthObservationValidatedBody,
+		Targets:         targets,
+	}
+
+	require.Equal(t, 17, observationRequestWireSlots(stat, 17))
+	require.Equal(t, 1, observationRequestWireSlots(body, 17))
+	require.Equal(t, 1, observationRequestWireSlots(stat, 0))
+}
+
+func TestPR5ObservationGateUsesSharedPlaybackAwareWireBudget(t *testing.T) {
+	shared := &blockingSharedWireAdmission{
+		slots: make(chan int, 1), permits: make(chan struct{}, 1),
+	}
+	gate := newObservationDispatchGateWithSharedBudget(
+		newObservationAdmission(3, 3), shared, nil, true,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		release, err := gate.AcquireSlots(ctx, "provider-a", 2)
+		if err == nil {
+			release()
+		}
+		result <- err
+	}()
+	require.Equal(t, 2, <-shared.slots)
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
+
+	// Cancellation while waiting on the shared pool budget must release the
+	// local provider/global reservation rather than leaking capacity.
+	shared.permits <- struct{}{}
+	release, err := gate.AcquireSlots(context.Background(), "provider-a", 3)
+	require.NoError(t, err)
+	require.Equal(t, 3, <-shared.slots)
+	release()
+}
+
+func TestPR5ObservationGateUsesAtomicDynamicGrant(t *testing.T) {
+	shared := &blockingSharedWireAdmission{
+		slots: make(chan int, 1), permits: make(chan struct{}, 1),
+	}
+	shared.granted.Store(2)
+	shared.permits <- struct{}{}
+	gate := newObservationDispatchGateWithSharedBudget(
+		newObservationAdmission(17, 17), shared, nil, true,
+	)
+	release, granted, err := gate.AcquireWireSlots(context.Background(), "provider-a", 17)
+	require.NoError(t, err)
+	require.Equal(t, 17, <-shared.slots)
+	require.Equal(t, 2, granted)
+	release()
 }
 
 func TestPR5PlaybackGateChecksAtActualDispatchBoundary(t *testing.T) {

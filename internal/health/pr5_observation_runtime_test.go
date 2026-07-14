@@ -1,12 +1,17 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
 	"github.com/javi11/altmount/internal/metadata"
@@ -31,6 +36,18 @@ type pr5RuntimeMetadataReader struct {
 	metadata *metapb.FileMetadata
 	err      error
 	paths    []string
+}
+
+type pr5SelectiveMetadataReader struct {
+	metadata *metapb.FileMetadata
+	fail     map[string]bool
+}
+
+func (r *pr5SelectiveMetadataReader) ReadFileMetadata(path string) (*metapb.FileMetadata, error) {
+	if r.fail[path] {
+		return nil, errors.New("synthetic metadata preparation failure")
+	}
+	return r.metadata, nil
 }
 
 func (r *pr5RuntimeMetadataReader) ReadFileMetadata(path string) (*metapb.FileMetadata, error) {
@@ -96,6 +113,7 @@ func (g pr5RuntimePoolGetter) GetPool() (altpool.NntpClient, error) { return g.c
 type pr5RuntimeNNTPClient struct {
 	altpool.NntpClient
 	mu          sync.Mutex
+	providerID  string
 	statOptions []nntppool.StatManyOptions
 	statIDs     [][]string
 	statResults []nntppool.StatManyResult
@@ -130,9 +148,10 @@ func (c *pr5RuntimeNNTPClient) BodyTargeted(
 	c.bodyOptions = append(c.bodyOptions, opts)
 	c.mu.Unlock()
 	return &nntppool.ArticleBody{
-		MessageID: messageID, ProviderID: opts.Provider,
+		MessageID: messageID, ProviderID: c.providerID,
 		Attempts: []nntppool.AttemptEvidence{{
-			Operation: nntppool.OperationBody, Outcome: nntppool.OutcomeSuccess,
+			ProviderID: c.providerID,
+			Operation:  nntppool.OperationBody, Outcome: nntppool.OutcomeSuccess,
 			BodyValidation: nntppool.BodyValidationValid,
 		}},
 	}, nil
@@ -151,9 +170,17 @@ func (r pr5RuntimeProviderResolver) ResolveObservationProvider(
 }
 
 func TestPR5NNTPObservationTransportTargetsOneProviderAndRequiresFreshBody(t *testing.T) {
-	client := &pr5RuntimeNNTPClient{statResults: []nntppool.StatManyResult{
-		{MessageID: "fixture-article-two", Err: &nntppool.TransportError{Kind: nntppool.OutcomeHardArticleAbsence}},
-		{MessageID: "fixture-article-one", Result: &nntppool.StatResult{MessageID: "fixture-article-one"}},
+	client := &pr5RuntimeNNTPClient{providerID: "provider-stable", statResults: []nntppool.StatManyResult{
+		{MessageID: "fixture-article-two", Err: &nntppool.TransportError{
+			Kind: nntppool.OutcomeHardArticleAbsence, ProviderID: "provider-stable",
+			Attempts: []nntppool.AttemptEvidence{{
+				ProviderID: "provider-stable", Operation: nntppool.OperationStat,
+				Outcome: nntppool.OutcomeHardArticleAbsence,
+			}},
+		}},
+		{MessageID: "fixture-article-one", Result: &nntppool.StatResult{
+			MessageID: "fixture-article-one", ProviderID: "provider-stable",
+		}},
 	}}
 	transport := newNNTPObservationTransport(
 		pr5RuntimePoolGetter{client: client},
@@ -164,16 +191,20 @@ func TestPR5NNTPObservationTransportTargetsOneProviderAndRequiresFreshBody(t *te
 	targets := []observationSegmentTarget{
 		{Position: 0, MessageID: "fixture-article-one", UsableBytes: 3},
 		{Position: 1, MessageID: "fixture-article-two", UsableBytes: 3},
+		{Position: 2, MessageID: "fixture-article-one", UsableBytes: 3},
 	}
 
 	stat, err := transport.Observe(context.Background(), observationTransportRequest{
 		RunID: "run-a", Provider: provider, Stage: "observe_initial",
-		ObservationKind: database.HealthObservationSTAT, Targets: targets,
+		ObservationKind: database.HealthObservationSTAT, WireConcurrency: 1, Targets: targets,
 	})
 	require.NoError(t, err)
 	require.Len(t, stat, 2)
+	require.Len(t, client.statIDs, 1)
+	assert.Equal(t, []string{"fixture-article-one", "fixture-article-two"}, client.statIDs[0],
+		"STAT submits one wire request per unique canonical message identity")
 	assert.Equal(t, "synthetic.invalid:119+account", client.statOptions[0].Provider)
-	assert.Equal(t, 2, client.statOptions[0].Concurrency)
+	assert.Equal(t, 1, client.statOptions[0].Concurrency)
 	assert.False(t, client.statOptions[0].Priority)
 	assert.Equal(t, observationOutcomeHardAbsent, stat[0].Outcome)
 	assert.Equal(t, observationOutcomePresent, stat[1].Outcome)
@@ -181,23 +212,33 @@ func TestPR5NNTPObservationTransportTargetsOneProviderAndRequiresFreshBody(t *te
 	body, err := transport.Observe(context.Background(), observationTransportRequest{
 		RunID: "run-a", Provider: provider, Stage: "observe_confirmation_2",
 		ObservationKind: database.HealthObservationValidatedBody, FreshTransport: true,
-		Targets: targets[:1],
+		Targets: []observationSegmentTarget{targets[0], targets[2]},
 	})
 	require.NoError(t, err)
 	require.Len(t, body, 1)
 	assert.Equal(t, observationOutcomePresent, body[0].Outcome)
 	require.Len(t, client.bodyOptions, 1)
+	assert.Equal(t, "fixture-article-one", body[0].MessageID,
+		"one validated BODY proof is shared by duplicate canonical owners")
 	assert.Equal(t, "synthetic.invalid:119+account", client.bodyOptions[0].Provider)
 	assert.True(t, client.bodyOptions[0].FreshTransport)
 	assert.False(t, client.bodyOptions[0].Priority)
 }
 
 type pr5RuntimeRegistry struct {
-	providers []database.HealthProvider
+	providers   []database.HealthProvider
+	generations map[string][]database.HealthProviderGeneration
 }
 
 func (r pr5RuntimeRegistry) ListProviders(context.Context, bool) ([]database.HealthProvider, error) {
 	return append([]database.HealthProvider(nil), r.providers...), nil
+}
+
+func (r pr5RuntimeRegistry) ListProviderGenerations(
+	_ context.Context,
+	providerID string,
+) ([]database.HealthProviderGeneration, error) {
+	return append([]database.HealthProviderGeneration(nil), r.generations[providerID]...), nil
 }
 
 func TestPR5CurrentProviderResolverFencesGenerationAndActivation(t *testing.T) {
@@ -208,9 +249,17 @@ func TestPR5CurrentProviderResolverFencesGenerationAndActivation(t *testing.T) {
 			Username: "account", Enabled: &enabled,
 		}}}
 	}
-	resolver := newCurrentObservationProviderResolver(pr5RuntimeRegistry{providers: []database.HealthProvider{{
-		ID: "provider-a", Active: true, CurrentGeneration: 4, ActivationEpoch: 7,
-	}}}, getter)
+	resolver := newCurrentObservationProviderResolver(pr5RuntimeRegistry{
+		providers: []database.HealthProvider{{
+			ID: "provider-a", Active: true, CurrentGeneration: 4, ActivationEpoch: 7,
+		}},
+		generations: map[string][]database.HealthProviderGeneration{
+			"provider-a": {{
+				ProviderID: "provider-a", Generation: 4, Endpoint: "synthetic.invalid",
+				Port: 563, Account: "account",
+			}},
+		},
+	}, getter)
 
 	name, err := resolver.ResolveObservationProvider(context.Background(), observationDispatchProvider{
 		ID: "provider-a", Generation: 4, ActivationEpoch: 7,
@@ -229,13 +278,111 @@ func TestPR5CurrentProviderResolverFencesGenerationAndActivation(t *testing.T) {
 	}
 }
 
-type pr5RuntimeDueRepository struct {
-	files       []*database.FileHealth
-	rescheduled map[string]time.Time
+func TestPR5CurrentProviderResolverUsesEffectiveIDAndRejectsNilEnabled(t *testing.T) {
+	enabled := true
+	provider := config.ProviderConfig{
+		Host: "fallback.invalid", Port: 119, Username: "synthetic-account", Enabled: &enabled,
+	}
+	effectiveID := uuid.NewString()
+	cfg := &config.Config{Providers: []config.ProviderConfig{provider}}
+	resolver := newCurrentObservationProviderResolver(pr5RuntimeRegistry{
+		providers: []database.HealthProvider{{
+			ID: effectiveID, Active: true, CurrentGeneration: 2, ActivationEpoch: 3,
+		}},
+		generations: map[string][]database.HealthProviderGeneration{
+			effectiveID: {{
+				ProviderID: effectiveID, Generation: 2, Endpoint: "fallback.invalid",
+				Port: 119, Account: "synthetic-account",
+			}},
+		},
+	}, func() *config.Config { return cfg })
+	target := observationDispatchProvider{ID: effectiveID, Generation: 2, ActivationEpoch: 3}
+
+	name, err := resolver.ResolveObservationProvider(context.Background(), target)
+	require.NoError(t, err)
+	assert.Equal(t, provider.NNTPPoolName(), name)
+
+	cfg.Providers[0].Enabled = nil
+	_, err = resolver.ResolveObservationProvider(context.Background(), target)
+	require.Error(t, err)
 }
 
-func (r *pr5RuntimeDueRepository) GetUnhealthyFiles(
-	context.Context, int, string, string, int,
+func TestPR5CurrentProviderResolverFencesConfigAheadOfPersistedGeneration(t *testing.T) {
+	enabled := true
+	cfg := &config.Config{Providers: []config.ProviderConfig{{
+		ID: "provider-a", Host: "new.invalid", Port: 563,
+		Username: "new-account", Enabled: &enabled,
+	}}}
+	resolver := newCurrentObservationProviderResolver(pr5RuntimeRegistry{
+		providers: []database.HealthProvider{{
+			ID: "provider-a", Active: true, CurrentGeneration: 4, ActivationEpoch: 7,
+		}},
+		generations: map[string][]database.HealthProviderGeneration{
+			"provider-a": {{
+				ProviderID: "provider-a", Generation: 4, Endpoint: "old.invalid",
+				Port: 119, Account: "old-account",
+			}},
+		},
+	}, func() *config.Config { return cfg })
+
+	_, err := resolver.ResolveObservationProvider(context.Background(), observationDispatchProvider{
+		ID: "provider-a", Generation: 4, ActivationEpoch: 7,
+	})
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "old-account")
+	assert.NotContains(t, err.Error(), "new-account")
+}
+
+func TestPR5ObservationProviderSpecsUseContiguousActiveOrderAndStableFallback(t *testing.T) {
+	enabled := true
+	disabled := false
+	providers := []config.ProviderConfig{
+		{ID: "provider-a", Name: "A", Host: "a.invalid", Port: 119, Enabled: &enabled},
+		{ID: "disabled", Name: "X", Host: "x.invalid", Port: 119, Enabled: &disabled},
+		{Host: "fallback.invalid", Port: 563, Username: "synthetic-account", Enabled: &enabled},
+		{ID: "nil-enabled", Name: "N", Host: "n.invalid", Port: 119},
+	}
+
+	specs := observationProviderSpecs(providers)
+	require.Len(t, specs, 2)
+	assert.Equal(t, []int{0, 1}, []int{specs[0].Order, specs[1].Order})
+	assert.Equal(t, "provider-a", specs[0].StableID)
+	assert.Empty(t, specs[1].StableID)
+}
+
+func TestPR5ObservationProviderEmptyIDReconcileIsStable(t *testing.T) {
+	db, err := database.NewDB(database.Config{
+		Type: "sqlite", DatabasePath: filepath.Join(t.TempDir(), "provider-reconcile.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	repository := database.NewHealthStateRepository(db.Connection(), database.DialectSQLite)
+	enabled := true
+	provider := config.ProviderConfig{
+		Host: "stable.invalid", Port: 119, Username: "synthetic-account", Enabled: &enabled,
+	}
+	specs := observationProviderSpecs([]config.ProviderConfig{provider})
+
+	first, err := repository.ReconcileProviders(context.Background(), specs)
+	require.NoError(t, err)
+	second, err := repository.ReconcileProviders(context.Background(), specs)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	require.Len(t, second, 1)
+	assert.NoError(t, uuid.Validate(first[0].ID))
+	assert.NotContains(t, first[0].ID, "synthetic-account")
+	assert.Equal(t, first[0].ID, second[0].ID)
+	assert.Equal(t, first[0].CurrentGeneration, second[0].CurrentGeneration)
+}
+
+type pr5RuntimeDueRepository struct {
+	files           []*database.FileHealth
+	rescheduled     map[string]time.Time
+	discoveryDefers map[int64]time.Time
+}
+
+func (r *pr5RuntimeDueRepository) ListDueObservationFiles(
+	context.Context, time.Time, time.Time, int,
 ) ([]*database.FileHealth, error) {
 	return append([]*database.FileHealth(nil), r.files...), nil
 }
@@ -258,14 +405,50 @@ func (r *pr5RuntimeDueRepository) DeferScheduledHealthCheck(_ context.Context, p
 	return nil
 }
 
+func (r *pr5RuntimeDueRepository) DeferObservationDiscoveryFailure(
+	_ context.Context,
+	fileHealthID int64,
+	_ time.Time,
+	retryAt time.Time,
+) error {
+	if r.discoveryDefers == nil {
+		r.discoveryDefers = make(map[int64]time.Time)
+	}
+	r.discoveryDefers[fileHealthID] = retryAt
+	return nil
+}
+
 type pr5RuntimeScheduleRepository struct {
-	revision        database.HealthFileRevision
-	snapshot        database.ProviderSnapshot
-	reusable        bool
-	reuseChecks     int
-	snapshotCalls   int
-	scheduled       []database.ScheduledHealthRunSpec
-	reconciledSpecs []database.ProviderSpec
+	revision         database.HealthFileRevision
+	revisionErr      error
+	revisionCalls    int
+	snapshot         database.ProviderSnapshot
+	reusable         bool
+	coverage         *database.CompletedImportSTATCoverage
+	reuseChecks      int
+	coverageReads    int
+	coverageConsumed bool
+	coverageDefers   map[string]time.Time
+	snapshotCalls    int
+	scheduled        []database.ScheduledHealthRunSpec
+	reconciledSpecs  []database.ProviderSpec
+	providerWork     []database.ProviderActivationWork
+	revalidationWork []database.GapRevalidationWork
+}
+
+func (r *pr5RuntimeScheduleRepository) ListProviderActivationWork(
+	context.Context,
+	int,
+) ([]database.ProviderActivationWork, error) {
+	return append([]database.ProviderActivationWork(nil), r.providerWork...), nil
+}
+
+func (r *pr5RuntimeScheduleRepository) ListDueGapRevalidations(
+	context.Context,
+	time.Time,
+	int,
+) ([]database.GapRevalidationWork, error) {
+	return append([]database.GapRevalidationWork(nil), r.revalidationWork...), nil
 }
 
 func (r *pr5RuntimeScheduleRepository) ReconcileProviders(
@@ -276,23 +459,93 @@ func (r *pr5RuntimeScheduleRepository) ReconcileProviders(
 	return nil, nil
 }
 
-func (r *pr5RuntimeScheduleRepository) EnsureFileRevision(
+func (r *pr5RuntimeScheduleRepository) EnsureObservationFileRevision(
 	_ context.Context,
 	spec database.FileRevisionSpec,
 ) (*database.HealthFileRevision, error) {
+	r.revisionCalls++
+	if r.revisionErr != nil {
+		return nil, r.revisionErr
+	}
 	r.revision.LayoutFingerprint = spec.LayoutFingerprint
 	r.revision.VirtualSize = spec.VirtualSize
 	r.revision.SegmentCount = spec.SegmentCount
 	return &r.revision, nil
 }
 
-func (r *pr5RuntimeScheduleRepository) HasReusableCompletedImportSTATCoverage(
+func TestPR5OrdinarySchedulerDoesNotReactivateInactiveImportRevision(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	due := &pr5RuntimeDueRepository{files: []*database.FileHealth{{
+		ID: 80, FilePath: "library/inactive-import.mkv", Status: database.HealthStatusPending,
+	}}}
+	state := &pr5RuntimeScheduleRepository{revisionErr: database.ErrInactiveFileRevision}
+	scheduler := newOrdinaryObservationScheduler(
+		due, state, &pr5RuntimeMetadataReader{metadata: pr5RuntimeMetadata()},
+		func() *config.Config { return &config.Config{} },
+		observationSchedulerConfig{BatchSize: 8, MaxRetries: 3, RecheckInterval: 24 * time.Hour},
+		pr5RuntimeClock{now: now},
+	)
+
+	result, err := scheduler.ScheduleDue(context.Background())
+	require.ErrorIs(t, err, database.ErrInactiveFileRevision)
+	assert.Equal(t, 1, result.Examined)
+	assert.Equal(t, 1, result.Failed)
+	assert.Equal(t, 1, state.revisionCalls)
+	assert.Zero(t, state.snapshotCalls)
+	assert.Empty(t, state.scheduled)
+}
+
+func (r *pr5RuntimeScheduleRepository) GetCompletedImportSTATCoverage(
 	context.Context,
 	string,
 	int64,
-) (bool, error) {
+) (*database.CompletedImportSTATCoverage, error) {
+	r.coverageReads++
+	if r.coverage != nil {
+		if r.coverage.Reusable && r.coverageConsumed {
+			return nil, nil
+		}
+		copy := *r.coverage
+		copy.UnresolvedPositions = append([]int64(nil), r.coverage.UnresolvedPositions...)
+		return &copy, nil
+	}
+	if r.reusable && !r.coverageConsumed {
+		return &database.CompletedImportSTATCoverage{Reusable: true}, nil
+	}
+	return nil, nil
+}
+
+func (r *pr5RuntimeScheduleRepository) ConsumeReusableCompletedImportSTATCoverageAndDeferHealth(
+	_ context.Context,
+	_ string,
+	_ int64,
+	filePath string,
+	nextCheckAt time.Time,
+	_ time.Time,
+) (*database.CompletedImportSTATCoverage, error) {
 	r.reuseChecks++
-	return r.reusable, nil
+	if r.coverageConsumed {
+		return nil, nil
+	}
+	if r.coverage != nil && r.coverage.Reusable {
+		r.coverageConsumed = true
+		if r.coverageDefers == nil {
+			r.coverageDefers = make(map[string]time.Time)
+		}
+		r.coverageDefers[filePath] = nextCheckAt
+		copy := *r.coverage
+		copy.UnresolvedPositions = append([]int64(nil), r.coverage.UnresolvedPositions...)
+		return &copy, nil
+	}
+	if r.reusable {
+		r.coverageConsumed = true
+		if r.coverageDefers == nil {
+			r.coverageDefers = make(map[string]time.Time)
+		}
+		r.coverageDefers[filePath] = nextCheckAt
+		return &database.CompletedImportSTATCoverage{Reusable: true}, nil
+	}
+	return nil, nil
 }
 
 func (r *pr5RuntimeScheduleRepository) CaptureActiveProviderSnapshot(context.Context, time.Time) (*database.ProviderSnapshot, error) {
@@ -301,12 +554,38 @@ func (r *pr5RuntimeScheduleRepository) CaptureActiveProviderSnapshot(context.Con
 	return &copy, nil
 }
 
+func (r *pr5RuntimeScheduleRepository) GetActiveScheduledHealthRun(
+	_ context.Context,
+	dedupeKey string,
+) (*database.HealthRun, error) {
+	for _, scheduled := range r.scheduled {
+		if scheduled.DedupeKey != dedupeKey {
+			continue
+		}
+		return &database.HealthRun{
+			ID: "existing-run", FileRevisionID: scheduled.Run.FileRevisionID,
+			ProviderSnapshotID: scheduled.Run.ProviderSnapshotID,
+			Trigger:            scheduled.Run.Trigger, Mode: scheduled.Run.Mode,
+			TotalSegments: scheduled.Run.TotalSegments,
+		}, nil
+	}
+	return nil, nil
+}
+
 func (r *pr5RuntimeScheduleRepository) EnsureScheduledHealthRun(
 	_ context.Context,
 	spec database.ScheduledHealthRunSpec,
 ) (*database.HealthRun, bool, error) {
+	if existing, _ := r.GetActiveScheduledHealthRun(context.Background(), spec.DedupeKey); existing != nil {
+		return existing, false, nil
+	}
 	r.scheduled = append(r.scheduled, spec)
-	return &database.HealthRun{ID: "ordinary-run", FileRevisionID: spec.Run.FileRevisionID}, true, nil
+	return &database.HealthRun{
+		ID: "ordinary-run", FileRevisionID: spec.Run.FileRevisionID,
+		ProviderSnapshotID: spec.Run.ProviderSnapshotID,
+		Trigger:            spec.Run.Trigger, Mode: spec.Run.Mode,
+		TotalSegments: spec.Run.TotalSegments,
+	}, true, nil
 }
 
 func TestPR5OrdinarySchedulerReusesCompletedImportCoverage(t *testing.T) {
@@ -320,6 +599,11 @@ func TestPR5OrdinarySchedulerReusesCompletedImportCoverage(t *testing.T) {
 	state := &pr5RuntimeScheduleRepository{
 		revision: database.HealthFileRevision{ID: "revision-import", FileHealthID: 81, Active: true},
 		reusable: true,
+		snapshot: database.ProviderSnapshot{ID: "snapshot-after-reuse", Entries: []database.ProviderSnapshotEntry{{
+			ProviderID: "provider-a", ProviderGeneration: 1, ProviderActivationEpoch: 1,
+			Role: database.ProviderRolePrimary,
+		}},
+		},
 	}
 	scheduler := newOrdinaryObservationScheduler(
 		due, state, &pr5RuntimeMetadataReader{metadata: meta},
@@ -335,8 +619,352 @@ func TestPR5OrdinarySchedulerReusesCompletedImportCoverage(t *testing.T) {
 	assert.Equal(t, 1, state.reuseChecks)
 	assert.Zero(t, state.snapshotCalls, "reused import coverage must not create a redundant snapshot")
 	assert.Empty(t, state.scheduled)
-	assert.Equal(t, now.Add(24*time.Hour), due.rescheduled["library/imported.mkv"])
+	assert.Equal(t, now.Add(24*time.Hour), state.coverageDefers["library/imported.mkv"])
 	assert.Equal(t, layout.Fingerprint, state.revision.LayoutFingerprint)
+
+	second, err := scheduler.ScheduleDue(context.Background())
+	require.NoError(t, err)
+	assert.Zero(t, second.CoverageReused,
+		"accepted import coverage suppresses only the immediate duplicate sweep")
+	assert.Equal(t, 1, second.Created)
+	assert.Equal(t, 2, state.reuseChecks)
+	require.Len(t, state.scheduled, 1)
+	assert.Equal(t, "ordinary", state.scheduled[0].Run.Trigger)
+}
+
+func TestPR5ManualObservationBypassesImportCoverageAndSchedulesIdempotently(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 30, 0, 0, time.UTC)
+	meta := pr5RuntimeMetadata()
+	due := &pr5RuntimeDueRepository{files: []*database.FileHealth{{
+		ID: 811, FilePath: "library/manual-imported.mkv",
+		Status: database.HealthStatusCorrupted, RetryCount: 9, MaxRetries: 3,
+	}}}
+	state := &pr5RuntimeScheduleRepository{
+		revision: database.HealthFileRevision{
+			ID: "revision-manual-import", FileHealthID: 811, Active: true,
+		},
+		reusable: true,
+		snapshot: database.ProviderSnapshot{
+			ID: "snapshot-manual-import",
+			Entries: []database.ProviderSnapshotEntry{{
+				ProviderID: "provider-a", ProviderGeneration: 1,
+				ProviderActivationEpoch: 1, Role: database.ProviderRolePrimary,
+			}},
+		},
+	}
+	scheduler := newOrdinaryObservationScheduler(
+		due, state, &pr5RuntimeMetadataReader{metadata: meta},
+		func() *config.Config { return &config.Config{} },
+		observationSchedulerConfig{BatchSize: 8, RecheckInterval: 24 * time.Hour},
+		pr5RuntimeClock{now: now},
+	)
+
+	result, err := scheduler.ScheduleFile(
+		context.Background(), 811, ObservationScheduleIntentManual,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Examined)
+	assert.Equal(t, 1, result.Created)
+	assert.Zero(t, result.CoverageReused)
+	assert.Zero(t, state.reuseChecks,
+		"an explicit manual request must not consult or consume accepted import coverage")
+	assert.False(t, state.coverageConsumed)
+	require.Len(t, state.scheduled, 1)
+	assert.Equal(t, "manual", state.scheduled[0].Run.Trigger)
+	assert.Equal(t, database.HealthRunPriorityHigh, state.scheduled[0].Priority)
+	assert.Equal(t, now, state.scheduled[0].NotBefore)
+	assert.Empty(t, due.rescheduled, "manual scheduling must preserve the automatic cadence")
+
+	second, err := scheduler.ScheduleFile(
+		context.Background(), 811, ObservationScheduleIntentManual,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, second.Examined)
+	assert.Equal(t, 1, second.Existing)
+	assert.Zero(t, second.Created)
+	assert.Zero(t, state.reuseChecks)
+	assert.False(t, state.coverageConsumed)
+	assert.Len(t, state.scheduled, 1, "repeated manual requests must reuse the durable schedule")
+}
+
+func TestPR5ManualObservationCoexistsIdempotentlyWithRunningOrdinaryRun(t *testing.T) {
+	db, err := database.NewDB(database.Config{
+		Type: "sqlite", DatabasePath: filepath.Join(t.TempDir(), "manual-existing-owner.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	healthRepository := database.NewHealthRepository(db.Connection(), database.DialectSQLite)
+	stateRepository := database.NewHealthStateRepository(db.Connection(), database.DialectSQLite)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 14, 12, 45, 0, 0, time.UTC)
+	meta := pr5RuntimeMetadata()
+	layout, err := metadata.ResolveCanonicalSegmentLayout(meta)
+	require.NoError(t, err)
+	revision, err := stateRepository.EnsureFileRevision(ctx, database.FileRevisionSpec{
+		FilePath: "library/manual-with-owner.mkv", LayoutFingerprint: layout.Fingerprint,
+		VirtualSize: layout.VirtualSize, SegmentCount: int64(len(layout.Segments)),
+	})
+	require.NoError(t, err)
+	enabled := true
+	cfg := &config.Config{Providers: []config.ProviderConfig{{
+		ID: "manual-owner-provider", Name: "Synthetic provider",
+		Host: "manual-owner.invalid", Port: 119,
+		Username: "synthetic-account", Enabled: &enabled,
+	}}}
+	_, err = stateRepository.ReconcileProviders(ctx, observationProviderSpecs(cfg.Providers))
+	require.NoError(t, err)
+	snapshot, err := stateRepository.CaptureActiveProviderSnapshot(ctx, now)
+	require.NoError(t, err)
+	ordinary, _, err := stateRepository.EnsureScheduledHealthRun(ctx, database.ScheduledHealthRunSpec{
+		Run: database.HealthRunSpec{
+			ID: "manual-existing-ordinary", FileRevisionID: revision.ID,
+			ProviderSnapshotID: snapshot.ID, Trigger: "ordinary", Mode: "observation",
+			TotalSegments: revision.SegmentCount, CreatedAt: now,
+		},
+		DedupeKey: "ordinary:" + revision.ID, Priority: database.HealthRunPriorityNormal,
+		NotBefore: now,
+	})
+	require.NoError(t, err)
+	lease, err := stateRepository.ClaimDueObservationHealthRun(ctx, "manual-existing-owner", time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, ordinary.ID, lease.ID)
+
+	scheduler := newOrdinaryObservationScheduler(
+		healthRepository, stateRepository, &pr5RuntimeMetadataReader{metadata: meta},
+		func() *config.Config { return cfg }, observationSchedulerConfig{BatchSize: 8},
+		pr5RuntimeClock{now: now},
+	)
+	first, err := scheduler.ScheduleFile(ctx, revision.FileHealthID, ObservationScheduleIntentManual)
+	require.NoError(t, err)
+	assert.Equal(t, 1, first.Created)
+	second, err := scheduler.ScheduleFile(ctx, revision.FileHealthID, ObservationScheduleIntentManual)
+	require.NoError(t, err)
+	assert.Equal(t, 1, second.Existing)
+
+	var activeSchedules, runningRuns int
+	require.NoError(t, db.Connection().QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM health_run_schedule schedule
+		JOIN health_runs run ON run.id = schedule.run_id
+		WHERE run.file_revision_id = ? AND schedule.active = TRUE
+	`, revision.ID).Scan(&activeSchedules))
+	require.NoError(t, db.Connection().QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM health_runs
+		WHERE file_revision_id = ? AND status = 'running'
+	`, revision.ID).Scan(&runningRuns))
+	assert.Equal(t, 2, activeSchedules,
+		"manual work may queue behind the current revision owner without a uniqueness failure")
+	assert.Equal(t, 1, runningRuns)
+	selected, err := stateRepository.GetActiveObservationHealthRunForFile(ctx, revision.FileHealthID)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, ordinary.ID, selected.ID)
+}
+
+func TestPR5ObservationSchedulerIncludesRediscoveredTerminalAndRetryExhaustedFiles(t *testing.T) {
+	db, err := database.NewDB(database.Config{
+		Type: "sqlite", DatabasePath: filepath.Join(t.TempDir(), "observation-due.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	healthRepository := database.NewHealthRepository(db.Connection(), database.DialectSQLite)
+	stateRepository := database.NewHealthStateRepository(db.Connection(), database.DialectSQLite)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 14, 13, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Hour)
+	lastChecked := now.Add(-48 * time.Hour)
+	type retainedState struct {
+		path                         string
+		status                       database.HealthStatus
+		retryCount, repairRetryCount int
+		lastError, details           string
+		schedule                     any
+	}
+	states := []retainedState{
+		{
+			path: "library/rediscovered-corrupted.mkv", status: database.HealthStatusCorrupted,
+			retryCount: 7, repairRetryCount: 2, lastError: "synthetic terminal result",
+			details: "synthetic retained evidence", schedule: past,
+		},
+		{
+			path: "library/rediscovered-retry-exhausted.mkv", status: database.HealthStatusPending,
+			retryCount: 3, repairRetryCount: 1, lastError: "synthetic retry result",
+			details: "synthetic retry evidence", schedule: nil,
+		},
+	}
+	for _, state := range states {
+		_, err := db.Connection().ExecContext(ctx, `
+			INSERT INTO file_health
+				(file_path, status, last_checked, last_error, error_details,
+				 retry_count, max_retries, repair_retry_count, max_repair_retries,
+				 scheduled_check_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, 3, ?, 4, ?, ?, ?)
+		`, state.path, state.status, lastChecked, state.lastError, state.details,
+			state.retryCount, state.repairRetryCount, state.schedule,
+			now.Add(-72*time.Hour), now.Add(-48*time.Hour))
+		require.NoError(t, err)
+	}
+	sourceA, sourceB := "synthetic-a.nzb", "synthetic-b.nzb"
+	release := now.Add(-30 * 24 * time.Hour)
+	require.NoError(t, healthRepository.BatchUpsertObservationDiscoveries(ctx, []database.AutomaticHealthCheckRecord{
+		{
+			FilePath: states[0].path, ReleaseDate: &release, ScheduledCheckAt: &now,
+			SourceNzbPath: &sourceA, MaxRetries: 3, MaxRepairRetries: 4,
+		},
+		{
+			FilePath: states[1].path, ReleaseDate: &release, ScheduledCheckAt: &now,
+			SourceNzbPath: &sourceB, MaxRetries: 3, MaxRepairRetries: 4,
+		},
+	}))
+
+	enabled := true
+	cfg := &config.Config{Providers: []config.ProviderConfig{{
+		ID: "observation-due-provider", Name: "Synthetic provider",
+		Host: "observation-due.invalid", Port: 119,
+		Username: "synthetic-account", Enabled: &enabled,
+	}}}
+	scheduler := newOrdinaryObservationScheduler(
+		healthRepository, stateRepository,
+		&pr5RuntimeMetadataReader{metadata: pr5RuntimeMetadata()},
+		func() *config.Config { return cfg },
+		observationSchedulerConfig{BatchSize: 8, RecheckInterval: 24 * time.Hour},
+		pr5RuntimeClock{now: now},
+	)
+
+	result, err := scheduler.ScheduleDue(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, result.Examined)
+	assert.Equal(t, 2, result.Created)
+	assert.Zero(t, result.Failed)
+	runs, err := stateRepository.ListHealthRuns(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, runs, 2)
+	for _, run := range runs {
+		assert.Equal(t, "ordinary", run.Trigger)
+		assert.Equal(t, database.HealthRunPending, run.Status)
+	}
+
+	var rowCount int
+	require.NoError(t, db.Connection().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM file_health`).Scan(&rowCount))
+	assert.Equal(t, 2, rowCount, "observation scheduling must not delete retained records")
+	for _, expected := range states {
+		var (
+			status                       database.HealthStatus
+			retryCount, repairRetryCount int
+			lastError, details           string
+			scheduled                    time.Time
+		)
+		require.NoError(t, db.Connection().QueryRowContext(ctx, `
+			SELECT status, retry_count, repair_retry_count, last_error,
+			       error_details, scheduled_check_at
+			FROM file_health WHERE file_path = ?
+		`, expected.path).Scan(
+			&status, &retryCount, &repairRetryCount, &lastError, &details, &scheduled,
+		))
+		assert.Equal(t, expected.status, status)
+		assert.Equal(t, expected.retryCount, retryCount)
+		assert.Equal(t, expected.repairRetryCount, repairRetryCount)
+		assert.Equal(t, expected.lastError, lastError)
+		assert.Equal(t, expected.details, details)
+		assert.True(t, scheduled.Equal(now.Add(24*time.Hour)), "%v", scheduled)
+	}
+}
+
+func TestPR5ObservationDiscoveryFailureBackoffPreventsStableLimitStarvation(t *testing.T) {
+	db, err := database.NewDB(database.Config{
+		Type: "sqlite", DatabasePath: filepath.Join(t.TempDir(), "observation-fairness.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	healthRepository := database.NewHealthRepository(db.Connection(), database.DialectSQLite)
+	stateRepository := database.NewHealthStateRepository(db.Connection(), database.DialectSQLite)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 14, 13, 30, 0, 0, time.UTC)
+	due := now.Add(-time.Minute)
+	paths := []string{
+		"library/malformed-one.mkv",
+		"library/malformed-two.mkv",
+		"library/malformed-three.mkv",
+		"library/valid-after-malformed.mkv",
+	}
+	for _, path := range paths {
+		_, err := db.Connection().ExecContext(ctx, `
+			INSERT INTO file_health
+				(file_path, status, last_error, error_details, retry_count, max_retries,
+				 repair_retry_count, max_repair_retries, source_nzb_path,
+				 scheduled_check_at, created_at, updated_at)
+			VALUES (?, 'corrupted', 'retained result', 'retained detail', 7, 3,
+			        2, 4, 'synthetic.nzb', ?, ?, ?)
+		`, path, due, now.Add(-time.Hour), now.Add(-time.Hour))
+		require.NoError(t, err)
+	}
+	enabled := true
+	cfg := &config.Config{Providers: []config.ProviderConfig{{
+		ID: "observation-fairness-provider", Name: "Synthetic provider",
+		Host: "observation-fairness.invalid", Port: 119,
+		Username: "synthetic-account", Enabled: &enabled,
+	}}}
+	reader := &pr5SelectiveMetadataReader{
+		metadata: pr5RuntimeMetadata(),
+		fail: map[string]bool{
+			paths[0]: true,
+			paths[1]: true,
+			paths[2]: true,
+		},
+	}
+	scheduler := newOrdinaryObservationScheduler(
+		healthRepository, stateRepository, reader,
+		func() *config.Config { return cfg },
+		observationSchedulerConfig{BatchSize: 2, RecheckInterval: 24 * time.Hour},
+		pr5RuntimeClock{now: now},
+	)
+
+	first, err := scheduler.ScheduleDue(ctx)
+	require.Error(t, err)
+	assert.Equal(t, 2, first.Examined)
+	assert.Equal(t, 2, first.Failed)
+	assert.Zero(t, first.Created)
+
+	second, err := scheduler.ScheduleDue(ctx)
+	require.Error(t, err)
+	assert.Equal(t, 2, second.Examined,
+		"the durable backoff must move the first failed batch behind later due rows")
+	assert.Equal(t, 1, second.Failed)
+	assert.Equal(t, 1, second.Created)
+
+	runs, err := stateRepository.ListHealthRuns(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	assert.Equal(t, "ordinary", runs[0].Trigger)
+	var rowCount int
+	require.NoError(t, db.Connection().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM file_health`).Scan(&rowCount))
+	assert.Equal(t, len(paths), rowCount)
+	for index, path := range paths {
+		var (
+			status                       database.HealthStatus
+			retryCount, repairRetryCount int
+			lastError, details           string
+			scheduled                    time.Time
+		)
+		require.NoError(t, db.Connection().QueryRowContext(ctx, `
+			SELECT status, retry_count, repair_retry_count, last_error,
+			       error_details, scheduled_check_at
+			FROM file_health WHERE file_path = ?
+		`, path).Scan(
+			&status, &retryCount, &repairRetryCount, &lastError, &details, &scheduled,
+		))
+		assert.Equal(t, database.HealthStatusCorrupted, status)
+		assert.Equal(t, 7, retryCount)
+		assert.Equal(t, 2, repairRetryCount)
+		assert.Equal(t, "retained result", lastError)
+		assert.Equal(t, "retained detail", details)
+		if index < 3 {
+			assert.True(t, scheduled.Equal(now.Add(observationDiscoveryFailureBackoff)), "%v", scheduled)
+		} else {
+			assert.True(t, scheduled.Equal(now.Add(24*time.Hour)), "%v", scheduled)
+		}
+	}
 }
 
 func TestPR5OrdinarySchedulerCreatesIndependentDurableRunWhenCoverageIsNotReusable(t *testing.T) {
@@ -382,6 +1010,41 @@ func TestPR5OrdinarySchedulerCreatesIndependentDurableRunWhenCoverageIsNotReusab
 	assert.Equal(t, now.Add(12*time.Hour), due.rescheduled["library/due.mkv"])
 }
 
+func TestPR5OrdinarySchedulerQueuesHealthPendingInsteadOfDeferringItAsReusable(t *testing.T) {
+	now := time.Date(2026, 7, 14, 14, 0, 0, 0, time.UTC)
+	due := &pr5RuntimeDueRepository{files: []*database.FileHealth{{
+		ID: 83, FilePath: "library/health-pending.mkv", Status: database.HealthStatusPending,
+	}}}
+	state := &pr5RuntimeScheduleRepository{
+		revision: database.HealthFileRevision{ID: "revision-health-pending", FileHealthID: 83, Active: true},
+		coverage: &database.CompletedImportSTATCoverage{
+			HealthPending: true, UnresolvedPositions: []int64{1},
+		},
+		snapshot: database.ProviderSnapshot{ID: "snapshot-health-pending", Entries: []database.ProviderSnapshotEntry{{
+			ProviderID: "provider-a", ProviderGeneration: 1, ProviderActivationEpoch: 1,
+			Role: database.ProviderRolePrimary,
+		}}},
+	}
+	scheduler := newOrdinaryObservationScheduler(
+		due, state, &pr5RuntimeMetadataReader{metadata: pr5RuntimeMetadata()},
+		func() *config.Config { return &config.Config{} },
+		observationSchedulerConfig{BatchSize: 8, MaxRetries: 3, RecheckInterval: 24 * time.Hour},
+		pr5RuntimeClock{now: now},
+	)
+
+	result, err := scheduler.ScheduleDue(context.Background())
+	require.NoError(t, err)
+	assert.Zero(t, result.CoverageReused)
+	assert.Equal(t, 1, result.Created)
+	require.Len(t, state.scheduled, 1)
+	assert.Equal(t, "health_pending", state.scheduled[0].Run.Trigger)
+	assert.Equal(t, "health-pending:revision-health-pending", state.scheduled[0].DedupeKey)
+	assert.Equal(t, database.HealthRunPriorityHigh, state.scheduled[0].Priority)
+	assert.Equal(t, 1, state.reuseChecks)
+	assert.Equal(t, 1, state.coverageReads,
+		"health-pending coverage remains read-only and preserves exact unresolved targeting")
+}
+
 type pr5RuntimeClock struct{ now time.Time }
 
 func (c pr5RuntimeClock) Now() time.Time { return c.now }
@@ -405,6 +1068,85 @@ func (pr5RuntimeScheduler) ScheduleDue(context.Context) (ObservationScheduleResu
 	return ObservationScheduleResult{}, nil
 }
 
+type pr5RuntimeFileController struct {
+	run       *database.HealthRun
+	requested []string
+	cancelErr error
+	lookupErr error
+}
+
+func (c *pr5RuntimeFileController) GetActiveObservationHealthRunForFile(
+	context.Context,
+	int64,
+) (*database.HealthRun, error) {
+	if c.lookupErr != nil || c.run == nil {
+		return nil, c.lookupErr
+	}
+	copy := *c.run
+	return &copy, nil
+}
+
+func (c *pr5RuntimeFileController) RequestRunCancel(
+	_ context.Context,
+	runID string,
+	_ time.Time,
+) error {
+	c.requested = append(c.requested, runID)
+	if c.cancelErr != nil {
+		return c.cancelErr
+	}
+	c.run = nil
+	return nil
+}
+
+type pr5BlockingRuntimeProcessor struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+type pr5ErrorRuntimeProcessor struct{ called chan struct{} }
+
+type pr5LockedLogBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *pr5LockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(p)
+}
+
+func (b *pr5LockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
+func (p *pr5ErrorRuntimeProcessor) ProcessNext(context.Context) (observationWorkerStep, error) {
+	select {
+	case p.called <- struct{}{}:
+	default:
+	}
+	return observationWorkerIdle, errors.New("fixture-article-id synthetic-credential")
+}
+
+type pr5ErrorRuntimeScheduler struct{ called chan struct{} }
+
+func (s *pr5ErrorRuntimeScheduler) ScheduleDue(context.Context) (ObservationScheduleResult, error) {
+	select {
+	case s.called <- struct{}{}:
+	default:
+	}
+	return ObservationScheduleResult{}, errors.New("fixture-article-id synthetic-credential")
+}
+
+func (p *pr5BlockingRuntimeProcessor) ProcessNext(context.Context) (observationWorkerStep, error) {
+	p.started <- struct{}{}
+	<-p.release
+	return observationWorkerIdle, nil
+}
+
 func TestPR5ObservationServiceStartStopIsInterruptible(t *testing.T) {
 	processor := &pr5RuntimeProcessor{started: make(chan struct{}, 1)}
 	service := newObservationServiceForTest(processor, pr5RuntimeScheduler{}, ObservationServiceConfig{
@@ -422,6 +1164,94 @@ func TestPR5ObservationServiceStartStopIsInterruptible(t *testing.T) {
 	require.NoError(t, service.Stop(stopCtx))
 	assert.Equal(t, ObservationServiceStopped, service.Status())
 	assert.ErrorIs(t, service.ProcessNext(context.Background()), ErrObservationServiceStopped)
+}
+
+func TestPR5ObservationServiceFileCancelUsesDurableControlAndReportsNotActive(t *testing.T) {
+	controller := &pr5RuntimeFileController{run: &database.HealthRun{
+		ID: "file-cancel-run", Trigger: "manual", Mode: "observation",
+		Status: database.HealthRunPending,
+	}}
+	service := newObservationServiceForTest(
+		&pr5RuntimeProcessor{started: make(chan struct{}, 1)},
+		pr5RuntimeScheduler{}, ObservationServiceConfig{},
+	)
+	service.status = ObservationServiceRunning
+	service.controller = controller
+
+	require.NoError(t, service.CancelFile(context.Background(), 41))
+	assert.Equal(t, []string{"file-cancel-run"}, controller.requested)
+	require.ErrorIs(t, service.CancelFile(context.Background(), 41), ErrObservationRunNotActive)
+	assert.Error(t, service.CancelFile(context.Background(), 0))
+}
+
+func TestPR5ObservationServiceTimedOutStopCanBeJoinedBeforeRestart(t *testing.T) {
+	processor := &pr5BlockingRuntimeProcessor{
+		started: make(chan struct{}, 2), release: make(chan struct{}),
+	}
+	service := newObservationServiceForTest(processor, pr5RuntimeScheduler{}, ObservationServiceConfig{
+		WorkerCount: 1, PollInterval: time.Hour, ScheduleInterval: time.Hour,
+	})
+	require.NoError(t, service.Start(context.Background()))
+	select {
+	case <-processor.started:
+	case <-time.After(time.Second):
+		t.Fatal("observation processor did not start")
+	}
+
+	stopCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, service.StopAndWait(stopCtx), context.Canceled)
+	assert.Equal(t, ObservationServiceStopping, service.Status())
+	assert.ErrorIs(t, service.Start(context.Background()), ErrObservationServiceRunning)
+
+	close(processor.release)
+	joinCtx, joinCancel := context.WithTimeout(context.Background(), time.Second)
+	defer joinCancel()
+	require.NoError(t, service.StopAndWait(joinCtx))
+	assert.Equal(t, ObservationServiceStopped, service.Status())
+
+	require.NoError(t, service.Start(context.Background()))
+	select {
+	case <-processor.started:
+	case <-time.After(time.Second):
+		t.Fatal("replacement observation processor did not start")
+	}
+	finalStopCtx, finalStopCancel := context.WithTimeout(context.Background(), time.Second)
+	defer finalStopCancel()
+	require.NoError(t, service.StopAndWait(finalStopCtx))
+}
+
+func TestPR5ObservationServiceReportsFailuresWithoutSensitiveEvidence(t *testing.T) {
+	processor := &pr5ErrorRuntimeProcessor{called: make(chan struct{}, 1)}
+	scheduler := &pr5ErrorRuntimeScheduler{called: make(chan struct{}, 1)}
+	service := newObservationServiceForTest(processor, scheduler, ObservationServiceConfig{
+		WorkerCount: 1, PollInterval: time.Hour, ScheduleInterval: time.Hour,
+	})
+	var logs pr5LockedLogBuffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	require.NoError(t, service.Start(context.Background()))
+	select {
+	case <-processor.called:
+	case <-time.After(time.Second):
+		t.Fatal("observation processor did not report its failure")
+	}
+	select {
+	case <-scheduler.called:
+	case <-time.After(time.Second):
+		t.Fatal("observation scheduler did not report its failure")
+	}
+	require.Eventually(t, func() bool {
+		text := logs.String()
+		return strings.Contains(text, "Health observation worker step failed") &&
+			strings.Contains(text, "Health observation scheduling pass failed")
+	}, time.Second, time.Millisecond)
+	require.NoError(t, service.StopAndWait(context.Background()))
+	finalLogs := logs.String()
+	require.NotContains(t, finalLogs, "fixture-article-id")
+	require.NotContains(t, finalLogs, "synthetic-credential")
 }
 
 func TestPR5ObservationProgressCallbackPublishesOnlySanitizedDurableFields(t *testing.T) {

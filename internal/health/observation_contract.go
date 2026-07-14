@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -197,46 +198,21 @@ func observationTargetPositions(targets []observationSegmentTarget) []int64 {
 }
 
 type observationTransportResult struct {
-	MessageID string
-	Outcome   observationOutcome
-	Attempts  []observationTransportAttempt
-	Err       error
-}
-
-type correlatedObservationResults struct {
-	Outcomes         map[int64]observationOutcome
-	OmittedPositions []int64
-}
-
-func correlateObservationResults(targets []observationSegmentTarget, results []observationTransportResult) correlatedObservationResults {
-	positionsByID := make(map[string][]int64, len(targets))
-	for _, target := range targets {
-		positionsByID[target.MessageID] = append(positionsByID[target.MessageID], target.Position)
-	}
-	used := make(map[string]int, len(positionsByID))
-	out := correlatedObservationResults{Outcomes: make(map[int64]observationOutcome, len(results))}
-	for _, result := range results {
-		positions := positionsByID[result.MessageID]
-		index := used[result.MessageID]
-		if index >= len(positions) {
-			continue
-		}
-		out.Outcomes[positions[index]] = result.Outcome
-		used[result.MessageID] = index + 1
-	}
-	for _, target := range targets {
-		if _, ok := out.Outcomes[target.Position]; !ok {
-			out.OmittedPositions = append(out.OmittedPositions, target.Position)
-		}
-	}
-	return out
+	MessageID  string
+	ProviderID string
+	Outcome    observationOutcome
+	Attempts   []observationTransportAttempt
+	Err        error
 }
 
 type observationAdmission struct {
-	global      chan struct{}
-	perProvider int
-	mu          sync.Mutex
-	providers   map[string]chan struct{}
+	globalCapacity      int
+	perProviderCapacity int
+
+	mu              sync.Mutex
+	globalUsed      int
+	providerUsed    map[string]int
+	capacityChanged chan struct{}
 }
 
 func newObservationAdmission(global, perProvider int) *observationAdmission {
@@ -247,50 +223,67 @@ func newObservationAdmission(global, perProvider int) *observationAdmission {
 		perProvider = 1
 	}
 	return &observationAdmission{
-		global: make(chan struct{}, global), perProvider: perProvider,
-		providers: make(map[string]chan struct{}),
+		globalCapacity: global, perProviderCapacity: perProvider,
+		providerUsed: make(map[string]int), capacityChanged: make(chan struct{}),
 	}
 }
 
-func (a *observationAdmission) provider(providerID string) chan struct{} {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	semaphore := a.providers[providerID]
-	if semaphore == nil {
-		semaphore = make(chan struct{}, a.perProvider)
-		a.providers[providerID] = semaphore
-	}
-	return semaphore
-}
-
-func acquireSemaphore(ctx context.Context, semaphore chan struct{}) error {
-	select {
-	case semaphore <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
+var ErrObservationAdmissionCapacity = errors.New("observation admission request exceeds wire capacity")
 
 func (a *observationAdmission) Acquire(ctx context.Context, providerID string) (func(), error) {
+	return a.AcquireSlots(ctx, providerID, 1)
+}
+
+// AcquireSlots atomically reserves the maximum number of NNTP commands the
+// request can have on the wire at once. Reserving a whole request atomically
+// avoids weighted waiters deadlocking after each acquires only part of the
+// remaining provider capacity.
+func (a *observationAdmission) AcquireSlots(
+	ctx context.Context,
+	providerID string,
+	slots int,
+) (func(), error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	provider := a.provider(providerID)
-	// Provider capacity is acquired first so a same-provider waiter cannot
-	// occupy global capacity needed by another provider.
-	if err := acquireSemaphore(ctx, provider); err != nil {
-		return nil, err
+	if a == nil || slots <= 0 || slots > a.globalCapacity || slots > a.perProviderCapacity {
+		return nil, ErrObservationAdmissionCapacity
 	}
-	if err := acquireSemaphore(ctx, a.global); err != nil {
-		<-provider
-		return nil, err
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		a.mu.Lock()
+		providerAvailable := a.providerUsed[providerID]+slots <= a.perProviderCapacity
+		globalAvailable := a.globalUsed+slots <= a.globalCapacity
+		if providerAvailable && globalAvailable {
+			a.providerUsed[providerID] += slots
+			a.globalUsed += slots
+			a.mu.Unlock()
+			break
+		}
+		changed := a.capacityChanged
+		a.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-changed:
+		}
 	}
+
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			<-a.global
-			<-provider
+			a.mu.Lock()
+			a.globalUsed -= slots
+			a.providerUsed[providerID] -= slots
+			if a.providerUsed[providerID] == 0 {
+				delete(a.providerUsed, providerID)
+			}
+			close(a.capacityChanged)
+			a.capacityChanged = make(chan struct{})
+			a.mu.Unlock()
 		})
 	}, nil
 }
@@ -299,12 +292,29 @@ var ErrObservationPausedForPlayback = errors.New("observation admission paused f
 
 type observationDispatchGate struct {
 	admission        *observationAdmission
+	shared           observationSharedWireAdmission
 	playback         PlaybackActivitySource
 	pauseForPlayback bool
 }
 
+type observationSharedWireAdmission interface {
+	AcquireImportConnections(context.Context, int) (func(), int, error)
+}
+
 func newObservationDispatchGate(admission *observationAdmission, playback PlaybackActivitySource, pause bool) *observationDispatchGate {
 	return &observationDispatchGate{admission: admission, playback: playback, pauseForPlayback: pause}
+}
+
+func newObservationDispatchGateWithSharedBudget(
+	admission *observationAdmission,
+	shared observationSharedWireAdmission,
+	playback PlaybackActivitySource,
+	pause bool,
+) *observationDispatchGate {
+	return &observationDispatchGate{
+		admission: admission, shared: shared,
+		playback: playback, pauseForPlayback: pause,
+	}
 }
 
 func (g *observationDispatchGate) playbackActive() bool {
@@ -312,18 +322,69 @@ func (g *observationDispatchGate) playbackActive() bool {
 }
 
 func (g *observationDispatchGate) Acquire(ctx context.Context, providerID string) (func(), error) {
+	return g.AcquireSlots(ctx, providerID, 1)
+}
+
+func (g *observationDispatchGate) AcquireSlots(
+	ctx context.Context,
+	providerID string,
+	slots int,
+) (func(), error) {
+	release, _, err := g.AcquireWireSlots(ctx, providerID, slots)
+	return release, err
+}
+
+func (g *observationDispatchGate) AcquireWireSlots(
+	ctx context.Context,
+	providerID string,
+	maxSlots int,
+) (func(), int, error) {
 	if g.playbackActive() {
-		return nil, ErrObservationPausedForPlayback
+		return nil, 0, ErrObservationPausedForPlayback
 	}
-	release, err := g.admission.Acquire(ctx, providerID)
+	release, err := g.admission.AcquireSlots(ctx, providerID, maxSlots)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	sharedRelease := func() {}
+	granted := maxSlots
+	if g.shared != nil {
+		sharedRelease, granted, err = g.shared.AcquireImportConnections(ctx, maxSlots)
+		if err != nil {
+			release()
+			return nil, 0, err
+		}
+		if granted <= 0 || granted > maxSlots {
+			sharedRelease()
+			release()
+			return nil, 0, fmt.Errorf("shared observation admission returned an invalid grant")
+		}
 	}
 	if g.playbackActive() {
+		sharedRelease()
 		release()
-		return nil, ErrObservationPausedForPlayback
+		return nil, 0, ErrObservationPausedForPlayback
 	}
-	return release, nil
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			sharedRelease()
+			release()
+		})
+	}, granted, nil
+}
+
+func observationRequestWireSlots(request observationTransportRequest, statConcurrency int) int {
+	if request.ObservationKind != database.HealthObservationSTAT {
+		return 1
+	}
+	if statConcurrency <= 0 {
+		statConcurrency = 1
+	}
+	if len(request.Targets) == 0 {
+		return 1
+	}
+	return min(statConcurrency, len(request.Targets))
 }
 
 func nextHealthRetryAt(at time.Time, attempt int) (time.Time, bool) {
@@ -368,7 +429,8 @@ type observationRunResumeDecision struct {
 }
 
 func decideObservationRunResume(run *database.HealthRun, revision *database.HealthFileRevision) observationRunResumeDecision {
-	if run == nil || revision == nil || run.FileRevisionID != revision.ID || run.TotalSegments != revision.SegmentCount {
+	if run == nil || revision == nil || run.FileRevisionID != revision.ID ||
+		run.TotalSegments <= 0 || run.TotalSegments > revision.SegmentCount {
 		return observationRunResumeDecision{Abandon: true}
 	}
 	return observationRunResumeDecision{Compatible: true, CursorSegment: run.CursorSegment}

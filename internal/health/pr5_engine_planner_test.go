@@ -85,31 +85,73 @@ func TestPR5PlannerKeepsDuplicateMessageIDsAsDistinctPositions(t *testing.T) {
 	assert.Equal(t, "synthetic-duplicate", chunk.Targets[1].MessageID)
 }
 
-func TestPR5TransportResultsAreCorrelatedBackToDuplicatePositions(t *testing.T) {
+func TestPR5TransportResultsFanOneUniqueProofToEveryCanonicalOwner(t *testing.T) {
 	targets := []observationSegmentTarget{
 		{Position: 4, MessageID: "synthetic-duplicate"},
 		{Position: 5, MessageID: "synthetic-distinct"},
 		{Position: 6, MessageID: "synthetic-duplicate"},
 	}
-	correlated := correlateObservationResults(targets, []observationTransportResult{
-		{MessageID: "synthetic-duplicate", Outcome: observationOutcomePresent},
-		{MessageID: "synthetic-distinct", Outcome: observationOutcomeHardAbsent},
-		{MessageID: "synthetic-duplicate", Outcome: observationOutcomePresent},
+	request := observationTransportRequest{
+		ObservationKind: database.HealthObservationSTAT,
+		Targets:         targets,
+	}
+	resultMap := func(t *testing.T, results []observationTransportResult) map[int64]normalizedObservationResult {
+		t.Helper()
+		normalized, canceled := normalizeObservationBatch(request, results)
+		require.False(t, canceled)
+		require.Len(t, normalized, len(targets))
+		byPosition := make(map[int64]normalizedObservationResult, len(normalized))
+		for _, result := range normalized {
+			byPosition[result.target.Position] = result
+		}
+		return byPosition
+	}
+
+	t.Run("out of order unique results fan out", func(t *testing.T) {
+		byPosition := resultMap(t, []observationTransportResult{
+			{MessageID: "synthetic-distinct", Outcome: observationOutcomeHardAbsent},
+			{MessageID: "synthetic-duplicate", Outcome: observationOutcomePresent,
+				Attempts: []observationTransportAttempt{{Operation: "STAT", Outcome: observationOutcomePresent}}},
+		})
+		assert.Equal(t, observationOutcomePresent, byPosition[4].outcome)
+		assert.Equal(t, observationOutcomeHardAbsent, byPosition[5].outcome)
+		assert.Equal(t, observationOutcomePresent, byPosition[6].outcome)
+		require.Len(t, byPosition[4].attempts, 1)
+		require.Len(t, byPosition[6].attempts, 1)
+		assert.Equal(t, byPosition[4].attempts, byPosition[6].attempts,
+			"the same validated wire proof and attempts belong to every canonical owner")
 	})
 
-	assert.Equal(t, map[int64]observationOutcome{
-		4: observationOutcomePresent,
-		5: observationOutcomeHardAbsent,
-		6: observationOutcomePresent,
-	}, correlated.Outcomes)
-	assert.Empty(t, correlated.OmittedPositions)
-
-	incomplete := correlateObservationResults(targets, []observationTransportResult{
-		{MessageID: "synthetic-duplicate", Outcome: observationOutcomePresent},
-		{MessageID: "synthetic-distinct", Outcome: observationOutcomeHardAbsent},
+	t.Run("missing result leaves every owner incomplete", func(t *testing.T) {
+		byPosition := resultMap(t, []observationTransportResult{{
+			MessageID: "synthetic-distinct", Outcome: observationOutcomeHardAbsent,
+		}})
+		assert.Equal(t, observationOutcomeInconclusive, byPosition[4].outcome)
+		assert.Equal(t, observationOutcomeHardAbsent, byPosition[5].outcome)
+		assert.Equal(t, observationOutcomeInconclusive, byPosition[6].outcome)
 	})
-	assert.Equal(t, []int64{6}, incomplete.OmittedPositions,
-		"an omitted duplicate occurrence must remain an incomplete position, not alias the first result")
+
+	t.Run("duplicate result leaves only its owners incomplete", func(t *testing.T) {
+		byPosition := resultMap(t, []observationTransportResult{
+			{MessageID: "synthetic-duplicate", Outcome: observationOutcomePresent},
+			{MessageID: "synthetic-distinct", Outcome: observationOutcomeHardAbsent},
+			{MessageID: "synthetic-duplicate", Outcome: observationOutcomePresent},
+		})
+		assert.Equal(t, observationOutcomeInconclusive, byPosition[4].outcome)
+		assert.Equal(t, observationOutcomeHardAbsent, byPosition[5].outcome)
+		assert.Equal(t, observationOutcomeInconclusive, byPosition[6].outcome)
+	})
+
+	t.Run("unexpected result invalidates the whole mixed batch", func(t *testing.T) {
+		byPosition := resultMap(t, []observationTransportResult{
+			{MessageID: "synthetic-duplicate", Outcome: observationOutcomePresent},
+			{MessageID: "synthetic-distinct", Outcome: observationOutcomeHardAbsent},
+			{MessageID: "synthetic-unexpected", Outcome: observationOutcomePresent},
+		})
+		for _, position := range []int64{4, 5, 6} {
+			assert.Equal(t, observationOutcomeInconclusive, byPosition[position].outcome)
+		}
+	})
 }
 
 func TestPR5PlannerUsesOrderedPrimaryThenSparseFallback(t *testing.T) {

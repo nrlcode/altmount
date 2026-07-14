@@ -20,13 +20,24 @@ import (
 // observation worker needs. *database.HealthStateRepository implements it;
 // keeping the boundary here also makes worker lifecycle tests deterministic.
 type observationRunRepository interface {
-	ClaimDueHealthRun(context.Context, string, time.Duration) (*database.HealthRun, error)
+	ClaimDueObservationHealthRun(context.Context, string, time.Duration) (*database.HealthRun, error)
+	RenewHealthRunLease(context.Context, string, string, int64, time.Duration) (*database.HealthRun, error)
+	AbandonStaleObservationRun(context.Context, string, string, int64, time.Time) (bool, error)
 	GetHealthRunResumeState(context.Context, string) (*database.HealthRunResumeState, error)
+	GetHealthRunSchedule(context.Context, string) (*database.HealthRunSchedule, error)
 	GetFileRevisionForRun(context.Context, string) (*database.HealthFileRevision, error)
 	GetProviderSnapshot(context.Context, string) (*database.ProviderSnapshot, error)
+	GetHealthGapRange(context.Context, string) (*database.HealthGapRange, error)
+	ListUnresolvedSegmentPositions(context.Context, string, string, int64, int64) ([]int64, error)
+	GetCompletedImportSTATCoverage(context.Context, string, int64) (*database.CompletedImportSTATCoverage, error)
+	ClearGapRangeFromRunChunk(context.Context, string, string, int64, string, string, time.Time) (*database.HealthGapRange, error)
+	FinalizeGapRevalidation(context.Context, string, string, int64, time.Time) (*database.GapRevalidationFinalization, error)
+	FinalizeProviderActivationGap(context.Context, string, string, int64, time.Time) (bool, error)
+	FinalizeHealthPendingObservation(context.Context, string, string, int64, time.Time) (*database.HealthPendingFinalization, error)
+	FinalizeObservationHealthRun(context.Context, string, string, int64, []database.GapRangeWrite, time.Time) error
 	CommitHealthChunk(context.Context, database.HealthChunkCommit) (*database.HealthRun, error)
-	ParkHealthRun(context.Context, string, string, int64, time.Time, time.Time) error
-	CompleteHealthRun(context.Context, string, string, int64, time.Time) error
+	ParkObservationHealthRun(context.Context, string, string, int64, time.Time, time.Time) error
+	CompleteObservationHealthRun(context.Context, string, string, int64, time.Time) error
 	FailHealthRun(context.Context, string, string, int64, string, time.Time) error
 	UpsertGapRange(context.Context, database.GapRangeWrite) (*database.HealthGapRange, error)
 }
@@ -75,6 +86,7 @@ type observationWorkerConfig struct {
 	ChunkSize          int64
 	ConfirmationDelay  time.Duration
 	PlaybackRetryDelay time.Duration
+	STATConcurrency    int
 	Clock              observationClock
 }
 
@@ -94,6 +106,9 @@ func (c observationWorkerConfig) normalized() observationWorkerConfig {
 	}
 	if c.PlaybackRetryDelay <= 0 {
 		c.PlaybackRetryDelay = time.Second
+	}
+	if c.STATConcurrency <= 0 {
+		c.STATConcurrency = 1
 	}
 	if c.Clock == nil {
 		c.Clock = wallObservationClock{}
@@ -143,10 +158,12 @@ type observationTransportRequest struct {
 	Stage           string
 	ObservationKind database.HealthObservationKind
 	FreshTransport  bool
+	WireConcurrency int
 	Targets         []observationSegmentTarget
 }
 
 type observationTransportAttempt struct {
+	ProviderID      string
 	Operation       string
 	Outcome         observationOutcome
 	ResponseCode    int
@@ -169,9 +186,17 @@ type observationWork struct {
 }
 
 type observationStateAnalysis struct {
-	work    *observationWork
-	nextDue *time.Time
-	gaps    []database.GapRangeWrite
+	work                       *observationWork
+	nextDue                    *time.Time
+	gaps                       []database.GapRangeWrite
+	recoveredGapChunkID        string
+	finalizeRevalidation       bool
+	finalizeProviderActivation bool
+}
+
+type observationRunTarget struct {
+	schedule *database.HealthRunSchedule
+	gap      *database.HealthGapRange
 }
 
 // ProcessNext claims one durable run and executes at most one bounded network
@@ -188,7 +213,7 @@ func (w *observationWorker) ProcessNext(ctx context.Context) (observationWorkerS
 		return observationWorkerFailed, fmt.Errorf("observation worker dependencies are incomplete")
 	}
 
-	run, err := w.repository.ClaimDueHealthRun(ctx, w.config.Owner, w.config.LeaseTTL)
+	run, err := w.repository.ClaimDueObservationHealthRun(ctx, w.config.Owner, w.config.LeaseTTL)
 	if err != nil {
 		return observationWorkerIdle, err
 	}
@@ -199,49 +224,70 @@ func (w *observationWorker) ProcessNext(ctx context.Context) (observationWorkerS
 		return observationWorkerFailed, database.ErrStaleHealthLease
 	}
 	w.publishProgress(*run, w.config.Clock.Now())
+	abandoned, err := w.repository.AbandonStaleObservationRun(
+		ctx, run.ID, *run.LeaseOwner, run.FencingToken, w.config.Clock.Now(),
+	)
+	if err != nil {
+		return observationWorkerParked, err
+	}
+	if abandoned {
+		return observationWorkerParked, nil
+	}
 
-	state, revision, _, targets, providers, err := w.loadRun(ctx, run)
+	state, revision, _, runTarget, targets, providers, err := w.loadRun(ctx, run)
 	if err != nil {
 		return w.failRun(ctx, run, "invalid observation run", err)
 	}
 
-	analysis := analyzeObservationState(state, revision, targets, providers, w.config, w.config.Clock.Now())
+	analysis := analyzeObservationRunState(
+		state, revision, runTarget, targets, providers, w.config, w.config.Clock.Now(),
+	)
 	if analysis.work == nil {
-		return w.settleRun(ctx, run, state, analysis)
+		return w.settleRun(ctx, run, state, runTarget, analysis)
 	}
-
-	admissionStarted := w.config.Clock.Now()
-	release, err := w.gate.Acquire(ctx, analysis.work.provider.ID)
-	if err != nil {
-		if errors.Is(err, ErrObservationPausedForPlayback) {
-			due := w.config.Clock.Now().Add(w.config.PlaybackRetryDelay)
-			if parkErr := w.repository.ParkHealthRun(ctx, run.ID, *run.LeaseOwner,
-				run.FencingToken, due, w.config.Clock.Now()); parkErr != nil {
-				return observationWorkerParked, parkErr
-			}
-			return observationWorkerParked, nil
-		}
-		return observationWorkerParked, err
-	}
-	admissionWait := w.config.Clock.Now().Sub(admissionStarted)
-	defer release()
 
 	request := observationTransportRequest{
 		RunID: run.ID, Provider: analysis.work.provider, Stage: analysis.work.stage,
 		ObservationKind: analysis.work.kind, FreshTransport: analysis.work.freshTransport,
 		Targets: append([]observationSegmentTarget(nil), analysis.work.targets...),
 	}
-	results, dispatchErr := w.transport.Observe(ctx, request)
+	admissionStarted := w.config.Clock.Now()
+	release, granted, err := w.gate.AcquireWireSlots(
+		ctx,
+		analysis.work.provider.ID,
+		observationRequestWireSlots(request, w.config.STATConcurrency),
+	)
+	if err != nil {
+		if errors.Is(err, ErrObservationPausedForPlayback) {
+			now := w.config.Clock.Now()
+			due := now.Add(w.config.PlaybackRetryDelay)
+			if parkErr := w.repository.ParkObservationHealthRun(ctx, run.ID, *run.LeaseOwner,
+				run.FencingToken, due, now); parkErr != nil {
+				return observationWorkerParked, parkErr
+			}
+			w.publishTransition(*run, database.HealthRunPending, now, "")
+			return observationWorkerParked, nil
+		}
+		return observationWorkerParked, err
+	}
+	request.WireConcurrency = granted
+	admissionWait := w.config.Clock.Now().Sub(admissionStarted)
+	results, dispatchErr, renewalErr := w.observeWithLeaseHeartbeat(ctx, run, request)
 	release()
+	if renewalErr != nil {
+		return observationWorkerParked, renewalErr
+	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return observationWorkerParked, ctxErr
 	}
 	if isObservationCancellation(dispatchErr) {
-		due := w.config.Clock.Now().Add(w.config.PlaybackRetryDelay)
-		if err := w.repository.ParkHealthRun(ctx, run.ID, *run.LeaseOwner,
-			run.FencingToken, due, w.config.Clock.Now()); err != nil {
+		now := w.config.Clock.Now()
+		due := now.Add(w.config.PlaybackRetryDelay)
+		if err := w.repository.ParkObservationHealthRun(ctx, run.ID, *run.LeaseOwner,
+			run.FencingToken, due, now); err != nil {
 			return observationWorkerParked, err
 		}
+		w.publishTransition(*run, database.HealthRunPending, now, "")
 		return observationWorkerParked, nil
 	}
 	if dispatchErr != nil {
@@ -253,17 +299,28 @@ func (w *observationWorker) ProcessNext(ctx context.Context) (observationWorkerS
 
 	normalized, canceled := normalizeObservationBatch(request, results)
 	if canceled {
-		due := w.config.Clock.Now().Add(w.config.PlaybackRetryDelay)
-		if err := w.repository.ParkHealthRun(ctx, run.ID, *run.LeaseOwner,
-			run.FencingToken, due, w.config.Clock.Now()); err != nil {
+		now := w.config.Clock.Now()
+		due := now.Add(w.config.PlaybackRetryDelay)
+		if err := w.repository.ParkObservationHealthRun(ctx, run.ID, *run.LeaseOwner,
+			run.FencingToken, due, now); err != nil {
 			return observationWorkerParked, err
 		}
+		w.publishTransition(*run, database.HealthRunPending, now, "")
 		return observationWorkerParked, nil
 	}
 	commit := buildObservationCommit(*run, state, providers, *analysis.work, normalized,
 		admissionWait, w.config.Clock.Now())
 	committed, err := w.repository.CommitHealthChunk(ctx, commit)
 	if err != nil {
+		if errors.Is(err, database.ErrProviderSnapshotMismatch) {
+			_, abandonErr := w.repository.AbandonStaleObservationRun(
+				ctx, run.ID, *run.LeaseOwner, run.FencingToken, w.config.Clock.Now(),
+			)
+			if abandonErr != nil {
+				return observationWorkerParked, abandonErr
+			}
+			return observationWorkerParked, nil
+		}
 		return observationWorkerParked, err
 	}
 	w.publishProgress(*committed, w.config.Clock.Now())
@@ -275,54 +332,429 @@ func (w *observationWorker) ProcessNext(ctx context.Context) (observationWorkerS
 		}
 		return observationWorkerParked, err
 	}
-	analysis = analyzeObservationState(state, revision, targets, providers, w.config, w.config.Clock.Now())
-	return w.settleRun(ctx, committed, state, analysis)
+	analysis = analyzeObservationRunState(
+		state, revision, runTarget, targets, providers, w.config, w.config.Clock.Now(),
+	)
+	return w.settleRun(ctx, committed, state, runTarget, analysis)
+}
+
+func (w *observationWorker) observeWithLeaseHeartbeat(
+	ctx context.Context,
+	run *database.HealthRun,
+	request observationTransportRequest,
+) ([]observationTransportResult, error, error) {
+	dispatchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	renewalFailed := make(chan error, 1)
+	interval := w.config.LeaseTTL / 3
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-dispatchCtx.Done():
+				return
+			case <-ticker.C:
+				_, err := w.repository.RenewHealthRunLease(
+					dispatchCtx, run.ID, *run.LeaseOwner, run.FencingToken, w.config.LeaseTTL,
+				)
+				if err != nil {
+					select {
+					case renewalFailed <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	results, dispatchErr := w.transport.Observe(dispatchCtx, request)
+	close(done)
+	<-heartbeatDone
+	select {
+	case err := <-renewalFailed:
+		return nil, dispatchErr, err
+	default:
+		return results, dispatchErr, nil
+	}
+}
+
+func analyzeObservationRunState(
+	state *database.HealthRunResumeState,
+	revision *database.HealthFileRevision,
+	runTarget observationRunTarget,
+	targets []observationSegmentTarget,
+	providers []observationDispatchProvider,
+	config observationWorkerConfig,
+	now time.Time,
+) observationStateAnalysis {
+	if runTarget.gap != nil && strings.HasPrefix(state.Run.Trigger, "gap_revalidation_") {
+		return analyzeGapRevalidationState(state, runTarget.gap, targets, providers, config, now)
+	}
+	if runTarget.gap != nil && strings.HasPrefix(state.Run.Trigger, "provider_activation") {
+		return analyzeProviderActivationGapState(state, runTarget.gap, targets, providers, config, now)
+	}
+	if runTarget.gap == nil && strings.HasPrefix(state.Run.Trigger, "provider_activation") {
+		return analyzeProviderActivationUnresolvedState(state, targets, providers, config, now)
+	}
+	return analyzeObservationState(state, revision, targets, providers, config, now)
+}
+
+func analyzeProviderActivationGapState(
+	state *database.HealthRunResumeState,
+	gap *database.HealthGapRange,
+	targets []observationSegmentTarget,
+	providers []observationDispatchProvider,
+	config observationWorkerConfig,
+	now time.Time,
+) observationStateAnalysis {
+	for _, provider := range providers {
+		for _, target := range targets {
+			body, hasBody := latestTargetedGapSample(
+				state, provider.key(), target.Position, database.HealthObservationValidatedBody,
+			)
+			if hasBody && body.outcome == observationOutcomePresent {
+				return observationStateAnalysis{recoveredGapChunkID: body.chunkID}
+			}
+			stat, hasSTAT := latestTargetedGapSample(
+				state, provider.key(), target.Position, database.HealthObservationSTAT,
+			)
+			if hasSTAT && stat.outcome == observationOutcomePresent && !hasBody {
+				return observationStateAnalysis{work: &observationWork{
+					provider: provider, stage: "provider_activation_body",
+					kind: database.HealthObservationValidatedBody, freshTransport: true,
+					segmentStart: target.Position, segmentCount: 1,
+					targets: []observationSegmentTarget{target},
+				}}
+			}
+		}
+	}
+	history := observationHistoryFromState(state)
+	if planned, ok := nextObservationChunk(observationPlanInput{
+		FileRevisionID: state.Run.FileRevisionID, Targets: targets,
+		Providers: providers, Evidence: history.evidence,
+	}, config.ChunkSize); ok {
+		return observationStateAnalysis{work: &observationWork{
+			provider: plannedProvider(planned, providers), stage: "provider_activation_stat",
+			kind: database.HealthObservationSTAT, segmentStart: planned.SegmentStart,
+			segmentCount: planned.SegmentCount, targets: planned.Targets,
+		}}
+	}
+	if retry, due := nextObservationRetry(
+		state, history, targets, providers, config.ChunkSize, now,
+	); retry != nil {
+		return observationStateAnalysis{work: retry}
+	} else if due != nil {
+		return observationStateAnalysis{nextDue: due}
+	}
+	confirmation, due, _ := nextObservationConfirmation(
+		state, &database.HealthFileRevision{
+			ID: state.Run.FileRevisionID, CreatedAt: gap.CreatedAt,
+		}, history, targets, providers, config, now,
+	)
+	if confirmation != nil {
+		return observationStateAnalysis{work: confirmation}
+	}
+	if due != nil {
+		return observationStateAnalysis{nextDue: due}
+	}
+	return observationStateAnalysis{finalizeProviderActivation: true}
+}
+
+func analyzeProviderActivationUnresolvedState(
+	state *database.HealthRunResumeState,
+	targets []observationSegmentTarget,
+	providers []observationDispatchProvider,
+	config observationWorkerConfig,
+	now time.Time,
+) observationStateAnalysis {
+	history := observationHistoryFromState(state)
+	if planned, ok := nextObservationChunk(observationPlanInput{
+		FileRevisionID: state.Run.FileRevisionID, Targets: targets,
+		Providers: providers, Evidence: history.evidence,
+	}, config.ChunkSize); ok {
+		return observationStateAnalysis{work: &observationWork{
+			provider: plannedProvider(planned, providers), stage: "provider_activation_stat",
+			kind: database.HealthObservationSTAT, segmentStart: planned.SegmentStart,
+			segmentCount: planned.SegmentCount, targets: planned.Targets,
+		}}
+	}
+	retry, retryDue := nextObservationRetry(
+		state, history, targets, providers, config.ChunkSize, now,
+	)
+	if retry != nil {
+		return observationStateAnalysis{work: retry}
+	}
+	return observationStateAnalysis{nextDue: retryDue}
+}
+
+type targetedGapSample struct {
+	chunkID string
+	outcome observationOutcome
+	kind    database.HealthObservationKind
+}
+
+func latestTargetedGapSample(
+	state *database.HealthRunResumeState,
+	provider observationProviderKey,
+	position int64,
+	kind database.HealthObservationKind,
+) (targetedGapSample, bool) {
+	var latest targetedGapSample
+	var latestAt time.Time
+	found := false
+	for _, chunk := range state.Chunks {
+		if chunk.ProviderID != provider.ID || chunk.ProviderGeneration != provider.Generation ||
+			chunk.ProviderActivationEpoch != provider.ActivationEpoch ||
+			chunk.ObservationKind != kind || position < chunk.SegmentStart ||
+			position >= chunk.SegmentStart+chunk.SegmentCount {
+			continue
+		}
+		relative := position - chunk.SegmentStart
+		if !observationBitmapSet(chunk.TestedBitmap, relative) {
+			continue
+		}
+		if !found || !chunk.CommittedAt.Before(latestAt) {
+			latest = targetedGapSample{
+				chunkID: chunk.ID, outcome: observationChunkOutcome(chunk, relative), kind: kind,
+			}
+			latestAt = chunk.CommittedAt
+			found = true
+		}
+	}
+	return latest, found
+}
+
+func analyzeGapRevalidationState(
+	state *database.HealthRunResumeState,
+	gap *database.HealthGapRange,
+	targets []observationSegmentTarget,
+	providers []observationDispatchProvider,
+	config observationWorkerConfig,
+	now time.Time,
+) observationStateAnalysis {
+	causes := make(map[observationProviderKey]database.GapCause, len(gap.Causes))
+	for _, cause := range gap.Causes {
+		causes[observationProviderKey{
+			ID: cause.ProviderID, Generation: cause.ProviderGeneration,
+			ActivationEpoch: cause.ProviderActivationEpoch,
+		}] = cause.Cause
+	}
+	conclusive := true
+	for _, provider := range providers {
+		cause, ok := causes[provider.key()]
+		if !ok {
+			return observationStateAnalysis{finalizeRevalidation: true}
+		}
+		for _, target := range targets {
+			body, hasBody := latestTargetedGapSample(
+				state, provider.key(), target.Position, database.HealthObservationValidatedBody,
+			)
+			if hasBody {
+				switch body.outcome {
+				case observationOutcomePresent:
+					return observationStateAnalysis{recoveredGapChunkID: body.chunkID}
+				case observationOutcomeHardAbsent, observationOutcomeCorrupt:
+					continue
+				default:
+					conclusive = false
+					continue
+				}
+			}
+			if cause == database.GapCauseCorrupt {
+				return observationStateAnalysis{work: &observationWork{
+					provider: provider, stage: "gap_revalidation_body",
+					kind: database.HealthObservationValidatedBody, freshTransport: true,
+					segmentStart: target.Position, segmentCount: 1,
+					targets: []observationSegmentTarget{target},
+				}}
+			}
+			stat, hasSTAT := latestTargetedGapSample(
+				state, provider.key(), target.Position, database.HealthObservationSTAT,
+			)
+			if !hasSTAT {
+				return observationStateAnalysis{work: &observationWork{
+					provider: provider, stage: "gap_revalidation_stat",
+					kind: database.HealthObservationSTAT, segmentStart: target.Position,
+					segmentCount: 1, targets: []observationSegmentTarget{target},
+				}}
+			}
+			switch stat.outcome {
+			case observationOutcomeHardAbsent:
+				continue
+			case observationOutcomePresent:
+				return observationStateAnalysis{work: &observationWork{
+					provider: provider, stage: "gap_revalidation_body",
+					kind: database.HealthObservationValidatedBody, freshTransport: true,
+					segmentStart: target.Position, segmentCount: 1,
+					targets: []observationSegmentTarget{target},
+				}}
+			default:
+				conclusive = false
+			}
+		}
+	}
+	if retry, retryDue := nextObservationRetry(
+		state, observationHistoryFromState(state), targets, providers, config.ChunkSize, now,
+	); retry != nil {
+		return observationStateAnalysis{work: retry}
+	} else if retryDue != nil {
+		return observationStateAnalysis{nextDue: retryDue}
+	}
+	_ = conclusive // the repository derives and fences the authoritative result
+	return observationStateAnalysis{finalizeRevalidation: true}
 }
 
 func (w *observationWorker) loadRun(
 	ctx context.Context,
 	run *database.HealthRun,
 ) (*database.HealthRunResumeState, *database.HealthFileRevision, *database.ProviderSnapshot,
-	[]observationSegmentTarget, []observationDispatchProvider, error) {
+	observationRunTarget, []observationSegmentTarget, []observationDispatchProvider, error) {
 	if run.Mode != "observation" {
-		return nil, nil, nil, nil, nil, fmt.Errorf("run mode is not observation")
+		return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("run mode is not observation")
 	}
 	state, err := w.repository.GetHealthRunResumeState(ctx, run.ID)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("load committed observation state: %w", err)
+		return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("load committed observation state: %w", err)
 	}
 	if state == nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("committed observation state is missing")
+		return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("committed observation state is missing")
 	}
+	schedule, err := w.repository.GetHealthRunSchedule(ctx, run.ID)
+	if err != nil {
+		return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("load observation schedule: %w", err)
+	}
+	if schedule == nil || !schedule.Active {
+		return nil, nil, nil, observationRunTarget{}, nil, nil, database.ErrStaleHealthSchedule
+	}
+	runTarget := observationRunTarget{schedule: schedule}
 	revision, err := w.repository.GetFileRevisionForRun(ctx, run.ID)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("load observation revision: %w", err)
+		return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("load observation revision: %w", err)
 	}
 	if revision == nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("observation revision is missing")
+		return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("observation revision is missing")
 	}
 	if decision := decideObservationRunResume(run, revision); !decision.Compatible {
-		return nil, nil, nil, nil, nil, fmt.Errorf("observation revision is incompatible")
+		return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("observation revision is incompatible")
 	}
 	snapshot, err := w.repository.GetProviderSnapshot(ctx, run.ProviderSnapshotID)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("load observation provider snapshot: %w", err)
+		return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("load observation provider snapshot: %w", err)
 	}
 	if snapshot == nil || snapshot.ID != run.ProviderSnapshotID {
-		return nil, nil, nil, nil, nil, fmt.Errorf("observation provider snapshot is missing")
+		return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("observation provider snapshot is missing")
 	}
 	targets, err := w.targets.ObservationTargets(ctx, revision)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("load canonical observation targets: %w", err)
+		return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("load canonical observation targets: %w", err)
 	}
 	if err := validateObservationTargets(targets, revision.SegmentCount); err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, observationRunTarget{}, nil, nil, err
 	}
 	providers, err := observationProvidersFromSnapshot(snapshot)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, observationRunTarget{}, nil, nil, err
 	}
-	return state, revision, snapshot, targets, providers, nil
+	if schedule.TargetGapID != "" {
+		gap, err := w.repository.GetHealthGapRange(ctx, schedule.TargetGapID)
+		if err != nil {
+			return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("load scheduled observation gap: %w", err)
+		}
+		allowDormant := strings.HasPrefix(run.Trigger, "provider_activation") || run.Trigger == "manual"
+		if gap == nil || gap.FileRevisionID != revision.ID ||
+			(gap.Status != database.GapStatusActive &&
+				(!allowDormant || gap.Status != database.GapStatusDormant)) {
+			return nil, nil, nil, observationRunTarget{}, nil, nil, database.ErrStaleHealthSchedule
+		}
+		runTarget.gap = gap
+		targets = filterObservationTargetsByRange(targets, gap.StartSegment, gap.SegmentCount)
+		if len(targets) == 0 {
+			return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("scheduled observation gap is empty")
+		}
+	}
+	if schedule.TargetProviderID != "" {
+		providers = filterObservationProviders(providers, schedule)
+		if len(providers) != 1 {
+			return nil, nil, nil, observationRunTarget{}, nil, nil, database.ErrStaleHealthSchedule
+		}
+		if schedule.TargetGapID == "" {
+			positions, err := w.repository.ListUnresolvedSegmentPositions(
+				ctx, revision.ID, schedule.TargetProviderID,
+				schedule.TargetProviderGeneration, schedule.TargetProviderActivationEpoch,
+			)
+			if err != nil {
+				return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("load unresolved provider activation targets: %w", err)
+			}
+			targets = filterObservationTargetsByPositions(targets, positions)
+		}
+	}
+	if run.Trigger == "health_pending" {
+		coverage, err := w.repository.GetCompletedImportSTATCoverage(
+			ctx, revision.ID, revision.SegmentCount,
+		)
+		if err != nil {
+			return nil, nil, nil, observationRunTarget{}, nil, nil, fmt.Errorf("load health-pending import coverage: %w", err)
+		}
+		if coverage == nil || !coverage.HealthPending || len(coverage.UnresolvedPositions) == 0 {
+			return nil, nil, nil, observationRunTarget{}, nil, nil, database.ErrStaleHealthSchedule
+		}
+		targets = filterObservationTargetsByPositions(targets, coverage.UnresolvedPositions)
+	}
+	return state, revision, snapshot, runTarget, targets, providers, nil
+}
+
+func filterObservationProviders(
+	providers []observationDispatchProvider,
+	schedule *database.HealthRunSchedule,
+) []observationDispatchProvider {
+	for _, provider := range providers {
+		if provider.ID == schedule.TargetProviderID &&
+			provider.Generation == schedule.TargetProviderGeneration &&
+			provider.ActivationEpoch == schedule.TargetProviderActivationEpoch {
+			return []observationDispatchProvider{provider}
+		}
+	}
+	return nil
+}
+
+func filterObservationTargetsByRange(
+	targets []observationSegmentTarget,
+	start, count int64,
+) []observationSegmentTarget {
+	filtered := make([]observationSegmentTarget, 0, min(int64(len(targets)), count))
+	for _, target := range targets {
+		if target.Position >= start && target.Position < start+count {
+			filtered = append(filtered, target)
+		}
+	}
+	return filtered
+}
+
+func filterObservationTargetsByPositions(
+	targets []observationSegmentTarget,
+	positions []int64,
+) []observationSegmentTarget {
+	wanted := make(map[int64]struct{}, len(positions))
+	for _, position := range positions {
+		wanted[position] = struct{}{}
+	}
+	filtered := make([]observationSegmentTarget, 0, len(wanted))
+	for _, target := range targets {
+		if _, ok := wanted[target.Position]; ok {
+			filtered = append(filtered, target)
+		}
+	}
+	return filtered
 }
 
 func validateObservationTargets(targets []observationSegmentTarget, total int64) error {
@@ -393,18 +825,28 @@ func normalizeObservationBatch(
 	request observationTransportRequest,
 	results []observationTransportResult,
 ) ([]normalizedObservationResult, bool) {
+	owners := make(map[string][]observationSegmentTarget, len(request.Targets))
+	for _, target := range request.Targets {
+		owners[target.MessageID] = append(owners[target.MessageID], target)
+	}
 	byID := make(map[string][]observationTransportResult, len(results))
+	unexpected := false
 	for _, result := range results {
+		if _, expected := owners[result.MessageID]; !expected {
+			unexpected = true
+		}
 		byID[result.MessageID] = append(byID[result.MessageID], result)
 	}
 	normalized := make([]normalizedObservationResult, 0, len(request.Targets))
 	for _, target := range request.Targets {
-		queue := byID[target.MessageID]
-		result := observationTransportResult{MessageID: target.MessageID, Outcome: observationOutcomeInconclusive}
-		if len(queue) > 0 {
-			result = queue[0]
-			byID[target.MessageID] = queue[1:]
+		matches := byID[target.MessageID]
+		if unexpected || len(matches) != 1 {
+			normalized = append(normalized, normalizedObservationResult{
+				target: target, outcome: observationOutcomeInconclusive,
+			})
+			continue
 		}
+		result := matches[0]
 		outcome := normalizeObservationOutcome(result)
 		if outcome == observationOutcomeCanceled {
 			return nil, true
@@ -459,28 +901,64 @@ func isObservationCancellation(err error) bool {
 }
 
 func observationTransportResultFromNNTP(messageID string, result *nntppool.StatResult, err error) observationTransportResult {
+	return observationTransportResultFromNNTPProvider(messageID, "", result, err)
+}
+
+var errObservationProviderIdentity = errors.New("observation transport provider identity mismatch")
+
+func observationTransportResultFromNNTPProvider(
+	messageID, expectedProviderID string,
+	result *nntppool.StatResult,
+	err error,
+) observationTransportResult {
 	out := observationTransportResult{MessageID: messageID, Err: err}
 	var attempts []nntppool.AttemptEvidence
 	if result != nil {
+		out.ProviderID = result.ProviderID
 		attempts = result.Attempts
 	}
 	var transportErr *nntppool.TransportError
 	if errors.As(err, &transportErr) {
+		out.ProviderID = transportErr.ProviderID
 		attempts = transportErr.Attempts
 	}
 	for _, attempt := range attempts {
 		out.Attempts = append(out.Attempts, observationTransportAttempt{
-			Operation: string(attempt.Operation), Outcome: observationOutcomeFromNNTP(attempt.Outcome),
+			ProviderID: attempt.ProviderID,
+			Operation:  string(attempt.Operation), Outcome: observationOutcomeFromNNTP(attempt.Outcome),
 			ResponseCode: attempt.ResponseCode, BodyValidation: string(attempt.BodyValidation),
 			CauseClass: observationCauseClass(observationOutcomeFromNNTP(attempt.Outcome)),
 			PoolQueue:  attempt.PoolQueueDuration, PipelineWait: attempt.PipelineHeadWaitDuration,
 			ResponseService: attempt.ResponseServiceDuration,
 		})
 	}
+	if expectedProviderID != "" && !validObservationProviderEvidence(
+		expectedProviderID, out.ProviderID, out.Attempts,
+	) {
+		return observationTransportResult{
+			MessageID: messageID, Outcome: observationOutcomeInconclusive,
+			Err: errObservationProviderIdentity,
+		}
+	}
 	if err == nil && result != nil {
 		out.Outcome = observationOutcomePresent
 	}
 	return out
+}
+
+func validObservationProviderEvidence(
+	expected, topLevel string,
+	attempts []observationTransportAttempt,
+) bool {
+	if expected == "" || topLevel != expected {
+		return false
+	}
+	for _, attempt := range attempts {
+		if attempt.ProviderID != expected {
+			return false
+		}
+	}
+	return true
 }
 
 func sanitizeObservationAttempts(
@@ -593,6 +1071,7 @@ type observationSample struct {
 	outcome    observationOutcome
 	observedAt time.Time
 	stage      string
+	kind       database.HealthObservationKind
 }
 
 type observationHistory struct {
@@ -629,6 +1108,7 @@ func observationHistoryFromState(state *database.HealthRunResumeState) observati
 			history.evidence.record(provider, position, outcome)
 			history.samples[provider][position] = append(history.samples[provider][position], observationSample{
 				outcome: outcome, observedAt: chunk.CommittedAt.UTC(), stage: chunk.Stage,
+				kind: chunk.ObservationKind,
 			})
 		}
 	}
@@ -739,13 +1219,21 @@ func nextObservationRetry(
 			ID: retry.ProviderID, Generation: retry.ProviderGeneration,
 			ActivationEpoch: retry.ProviderActivationEpoch,
 		}
+		source, ok := chunks[retry.SourceChunkID]
+		if !ok {
+			continue
+		}
 		selected := make([]observationSegmentTarget, 0, retry.SegmentCount)
 		for _, target := range targets {
-			if target.Position < retry.SegmentStart || target.Position >= retry.SegmentStart+retry.SegmentCount ||
-				history.evidence.presentAnywhere(target.Position) {
+			if target.Position < retry.SegmentStart || target.Position >= retry.SegmentStart+retry.SegmentCount {
 				continue
 			}
-			outcome, ok := history.evidence.outcome(key, target.Position)
+			if history.evidence.presentAnywhere(target.Position) {
+				continue
+			}
+			outcome, ok := latestObservationRetryOutcome(
+				history.samples[key][target.Position], source.Stage, source.ObservationKind,
+			)
 			if ok && (outcome == observationOutcomeTemporary || outcome == observationOutcomeUnavailable ||
 				outcome == observationOutcomeInconclusive) {
 				selected = append(selected, target)
@@ -761,7 +1249,6 @@ func nextObservationRetry(
 			}
 			continue
 		}
-		source := chunks[retry.SourceChunkID]
 		kind := source.ObservationKind
 		if kind == "" {
 			kind = database.HealthObservationSTAT
@@ -789,15 +1276,35 @@ func nextObservationRetry(
 	return nil, earliest
 }
 
-func observationRetryStage(sourceStage string, attempt int) string {
-	if strings.HasPrefix(sourceStage, "observe_confirmation_") {
-		base := sourceStage
-		if index := strings.Index(base, "_retry_"); index >= 0 {
-			base = base[:index]
+func latestObservationRetryOutcome(
+	samples []observationSample,
+	sourceStage string,
+	kind database.HealthObservationKind,
+) (observationOutcome, bool) {
+	base := observationRetryBaseStage(sourceStage)
+	var latest observationSample
+	found := false
+	for _, sample := range samples {
+		if sample.kind != kind || observationRetryBaseStage(sample.stage) != base {
+			continue
 		}
-		return fmt.Sprintf("%s_retry_%d", base, attempt)
+		if !found || !sample.observedAt.Before(latest.observedAt) {
+			latest = sample
+			found = true
+		}
 	}
-	return fmt.Sprintf("observe_retry_%d", attempt)
+	return latest.outcome, found
+}
+
+func observationRetryBaseStage(stage string) string {
+	if index := strings.LastIndex(stage, "_retry_"); index >= 0 {
+		return stage[:index]
+	}
+	return stage
+}
+
+func observationRetryStage(sourceStage string, attempt int) string {
+	return fmt.Sprintf("%s_retry_%d", observationRetryBaseStage(sourceStage), attempt)
 }
 
 func nextObservationConfirmation(
@@ -810,7 +1317,7 @@ func nextObservationConfirmation(
 	now time.Time,
 ) (*observationWork, *time.Time, []database.GapRangeWrite) {
 	var earliest *time.Time
-	var gaps []database.GapRangeWrite
+	var gapCandidates []observationGapCandidate
 	for _, target := range targets {
 		if history.evidence.presentAnywhere(target.Position) {
 			continue
@@ -838,12 +1345,13 @@ func nextObservationConfirmation(
 			if createdAt.IsZero() {
 				createdAt = state.Run.CreatedAt.UTC()
 			}
-			gaps = append(gaps, database.GapRangeWrite{
-				ID:             stableObservationID("gap", revision.ID, string(kind), fmt.Sprint(target.Position)),
-				FileRevisionID: revision.ID, Kind: kind, StartSegment: target.Position,
-				SegmentCount: 1, Status: database.GapStatusActive, CreatedAt: createdAt,
-				Causes: causes,
-			})
+			gapCandidates = append(gapCandidates, observationGapCandidate{
+				wave: latest.number,
+				write: database.GapRangeWrite{
+					FileRevisionID: revision.ID, Kind: kind, StartSegment: target.Position,
+					SegmentCount: 1, Status: database.GapStatusActive, CreatedAt: createdAt,
+					Causes: causes,
+				}})
 			continue
 		}
 
@@ -857,9 +1365,19 @@ func nextObservationConfirmation(
 			continue
 		}
 		for _, provider := range providers {
-			if _, checked := latestObservationWaveSample(
+			sample, checked := latestObservationWaveSample(
 				history.samples[provider.key()][target.Position], nextWave,
-			); checked {
+			)
+			if checked && sample.kind == database.HealthObservationSTAT &&
+				sample.outcome == observationOutcomePresent {
+				return &observationWork{
+					provider: provider, stage: fmt.Sprintf("observe_confirmation_%d", nextWave),
+					kind: database.HealthObservationValidatedBody, freshTransport: true,
+					segmentStart: target.Position, segmentCount: 1,
+					targets: []observationSegmentTarget{target},
+				}, earliest, coalesceObservationGapCandidates(revision.ID, gapCandidates)
+			}
+			if checked {
 				continue
 			}
 			kind := database.HealthObservationSTAT
@@ -872,10 +1390,71 @@ func nextObservationConfirmation(
 				provider: provider, stage: fmt.Sprintf("observe_confirmation_%d", nextWave), kind: kind,
 				freshTransport: fresh, segmentStart: target.Position,
 				segmentCount: 1, targets: []observationSegmentTarget{target},
-			}, earliest, gaps
+			}, earliest, coalesceObservationGapCandidates(revision.ID, gapCandidates)
 		}
 	}
-	return nil, earliest, gaps
+	return nil, earliest, coalesceObservationGapCandidates(revision.ID, gapCandidates)
+}
+
+type observationGapCandidate struct {
+	write database.GapRangeWrite
+	wave  int
+}
+
+func coalesceObservationGapCandidates(
+	revisionID string,
+	candidates []observationGapCandidate,
+) []database.GapRangeWrite {
+	if len(candidates) == 0 {
+		return nil
+	}
+	sorted := append([]observationGapCandidate(nil), candidates...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].write.StartSegment != sorted[j].write.StartSegment {
+			return sorted[i].write.StartSegment < sorted[j].write.StartSegment
+		}
+		return sorted[i].write.Kind < sorted[j].write.Kind
+	})
+	coalesced := make([]observationGapCandidate, 0, len(sorted))
+	for _, candidate := range sorted {
+		if len(coalesced) > 0 {
+			previous := &coalesced[len(coalesced)-1]
+			if previous.write.StartSegment+previous.write.SegmentCount == candidate.write.StartSegment &&
+				previous.write.Kind == candidate.write.Kind && previous.wave == candidate.wave &&
+				previous.write.CreatedAt.Equal(candidate.write.CreatedAt) &&
+				equalObservationGapCauses(previous.write.Causes, candidate.write.Causes) {
+				previous.write.SegmentCount += candidate.write.SegmentCount
+				continue
+			}
+		}
+		coalesced = append(coalesced, candidate)
+	}
+	gaps := make([]database.GapRangeWrite, len(coalesced))
+	for i := range coalesced {
+		gaps[i] = coalesced[i].write
+		gaps[i].ID = stableObservationID(
+			"gap", revisionID, string(gaps[i].Kind),
+			fmt.Sprint(gaps[i].StartSegment), fmt.Sprint(gaps[i].SegmentCount),
+		)
+	}
+	return gaps
+}
+
+func equalObservationGapCauses(first, second []database.GapProviderCause) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for i := range first {
+		if first[i].ProviderID != second[i].ProviderID ||
+			first[i].ProviderGeneration != second[i].ProviderGeneration ||
+			first[i].ProviderActivationEpoch != second[i].ProviderActivationEpoch ||
+			first[i].Cause != second[i].Cause ||
+			first[i].ConfirmationCount != second[i].ConfirmationCount ||
+			!first[i].ConfirmedAt.Equal(second[i].ConfirmedAt) {
+			return false
+		}
+	}
+	return true
 }
 
 type completedObservationWave struct {
@@ -965,12 +1544,7 @@ func coherentObservationWavePair(
 	if second.number != first.number+1 || second.startedAt.Before(first.completedAt.Add(delay)) {
 		return false
 	}
-	for _, provider := range providers {
-		if first.causes[provider.key()] != second.causes[provider.key()] {
-			return false
-		}
-	}
-	return true
+	return len(first.causes) == len(providers) && len(second.causes) == len(providers)
 }
 
 func observationGapCauses(
@@ -1007,7 +1581,8 @@ func buildObservationCommit(
 		ProviderID: work.provider.ID, ProviderGeneration: work.provider.Generation,
 		ProviderActivationEpoch: work.provider.ActivationEpoch,
 		Stage:                   work.stage, ObservationKind: work.kind,
-		SegmentStart: work.segmentStart, SegmentCount: work.segmentCount,
+		FreshTransport: work.freshTransport,
+		SegmentStart:   work.segmentStart, SegmentCount: work.segmentCount,
 		TestedBitmap: make([]byte, bitmapBytes), PresentBitmap: make([]byte, bitmapBytes),
 		AbsentBitmap: make([]byte, bitmapBytes), CorruptBitmap: make([]byte, bitmapBytes),
 		TemporaryBitmap: make([]byte, bitmapBytes), InconclusiveBitmap: make([]byte, bitmapBytes),
@@ -1118,6 +1693,7 @@ func observationRetryAfterCommit(
 	}
 	retryKey := stableObservationID("retry", runID, work.provider.ID,
 		fmt.Sprint(work.provider.Generation), fmt.Sprint(work.provider.ActivationEpoch),
+		string(work.kind), observationRetryBaseStage(work.stage),
 		fmt.Sprint(work.segmentStart), fmt.Sprint(work.segmentCount))
 	attempt := 0
 	if work.retry != nil {
@@ -1140,37 +1716,125 @@ func (w *observationWorker) settleRun(
 	ctx context.Context,
 	run *database.HealthRun,
 	state *database.HealthRunResumeState,
+	runTarget observationRunTarget,
 	analysis observationStateAnalysis,
 ) (observationWorkerStep, error) {
+	if analysis.recoveredGapChunkID != "" {
+		if runTarget.gap == nil {
+			return observationWorkerFailed, fmt.Errorf("gap recovery has no target")
+		}
+		now := w.config.Clock.Now()
+		if _, err := w.repository.ClearGapRangeFromRunChunk(
+			ctx, run.ID, *run.LeaseOwner, run.FencingToken,
+			runTarget.gap.ID, analysis.recoveredGapChunkID, now,
+		); err != nil {
+			return observationWorkerParked, err
+		}
+		w.publishTransition(*run, database.HealthRunCompleted, now, "")
+		return observationWorkerCompleted, nil
+	}
+	if analysis.finalizeRevalidation {
+		finalized, err := w.repository.FinalizeGapRevalidation(
+			ctx, run.ID, *run.LeaseOwner, run.FencingToken, w.config.Clock.Now(),
+		)
+		if err != nil {
+			return observationWorkerFailed, err
+		}
+		if finalized.Advanced {
+			w.publishTransition(*run, database.HealthRunCompleted, w.config.Clock.Now(), "")
+			return observationWorkerCompleted, nil
+		}
+		w.publishTransition(*run, database.HealthRunFailed, w.config.Clock.Now(), "inconclusive revalidation")
+		return observationWorkerFailed, nil
+	}
+	if analysis.finalizeProviderActivation {
+		conclusive, err := w.repository.FinalizeProviderActivationGap(
+			ctx, run.ID, *run.LeaseOwner, run.FencingToken, w.config.Clock.Now(),
+		)
+		if err != nil {
+			return observationWorkerFailed, err
+		}
+		if conclusive {
+			w.publishTransition(*run, database.HealthRunCompleted, w.config.Clock.Now(), "")
+			return observationWorkerCompleted, nil
+		}
+		w.publishTransition(*run, database.HealthRunFailed, w.config.Clock.Now(), "inconclusive provider observation")
+		return observationWorkerFailed, nil
+	}
+	now := w.config.Clock.Now()
+	if analysis.work == nil && analysis.nextDue == nil && run.Trigger != "health_pending" &&
+		runTarget.gap == nil && runTarget.schedule != nil &&
+		runTarget.schedule.TargetProviderID == "" && runTarget.schedule.TargetGapID == "" {
+		if err := w.repository.FinalizeObservationHealthRun(
+			ctx, run.ID, *run.LeaseOwner, run.FencingToken, analysis.gaps, now,
+		); err != nil {
+			return observationWorkerParked, err
+		}
+		w.publishTransition(state.Run, database.HealthRunCompleted, now, "")
+		return observationWorkerCompleted, nil
+	}
 	for _, gap := range analysis.gaps {
+		gap.RunID = run.ID
+		gap.LeaseOwner = *run.LeaseOwner
+		gap.FencingToken = run.FencingToken
+		if runTarget.gap != nil && strings.HasPrefix(run.Trigger, "provider_activation") {
+			gap.ID = runTarget.gap.ID
+			gap.CreatedAt = runTarget.gap.CreatedAt
+			merged := append([]database.GapProviderCause(nil), runTarget.gap.Causes...)
+			for _, candidate := range gap.Causes {
+				found := false
+				for _, existing := range merged {
+					if existing.ProviderID == candidate.ProviderID &&
+						existing.ProviderGeneration == candidate.ProviderGeneration &&
+						existing.ProviderActivationEpoch == candidate.ProviderActivationEpoch {
+						found = true
+						break
+					}
+				}
+				if !found {
+					merged = append(merged, candidate)
+				}
+			}
+			gap.Causes = merged
+		}
 		if _, err := w.repository.UpsertGapRange(ctx, gap); err != nil {
 			return observationWorkerParked, err
 		}
 	}
-	now := w.config.Clock.Now()
 	if analysis.work != nil {
-		if err := w.repository.ParkHealthRun(ctx, run.ID, *run.LeaseOwner,
+		if err := w.repository.ParkObservationHealthRun(ctx, run.ID, *run.LeaseOwner,
 			run.FencingToken, now, now); err != nil {
 			return observationWorkerParked, err
 		}
+		w.publishTransition(*run, database.HealthRunPending, now, "")
 		return observationWorkerParked, nil
 	}
 	if analysis.nextDue != nil {
-		if err := w.repository.ParkHealthRun(ctx, run.ID, *run.LeaseOwner,
+		if err := w.repository.ParkObservationHealthRun(ctx, run.ID, *run.LeaseOwner,
 			run.FencingToken, *analysis.nextDue, now); err != nil {
 			return observationWorkerParked, err
 		}
+		w.publishTransition(*run, database.HealthRunPending, now, "")
 		return observationWorkerParked, nil
 	}
-	if err := w.repository.CompleteHealthRun(ctx, run.ID, *run.LeaseOwner, run.FencingToken, now); err != nil {
+	if run.Trigger == "health_pending" {
+		finalized, err := w.repository.FinalizeHealthPendingObservation(
+			ctx, run.ID, *run.LeaseOwner, run.FencingToken, now,
+		)
+		if err != nil {
+			return observationWorkerFailed, err
+		}
+		if finalized.Settled {
+			w.publishTransition(*run, database.HealthRunCompleted, now, "")
+			return observationWorkerCompleted, nil
+		}
+		w.publishTransition(*run, database.HealthRunFailed, now, "inconclusive health pending observation")
+		return observationWorkerFailed, nil
+	}
+	if err := w.repository.CompleteObservationHealthRun(ctx, run.ID, *run.LeaseOwner, run.FencingToken, now); err != nil {
 		return observationWorkerCompleted, err
 	}
-	completed := state.Run
-	completed.Status = database.HealthRunCompleted
-	completed.LeaseOwner = nil
-	completed.LeaseExpiresAt = nil
-	completed.UpdatedAt = now
-	w.publishProgress(completed, now)
+	w.publishTransition(state.Run, database.HealthRunCompleted, now, "")
 	return observationWorkerCompleted, nil
 }
 
@@ -1212,7 +1876,31 @@ func (w *observationWorker) publishProgress(run database.HealthRun, at time.Time
 	if elapsed := at.Sub(start); elapsed > 0 && run.ProviderChecks > 0 {
 		event.ChecksPerSecond = float64(run.ProviderChecks) / elapsed.Seconds()
 		remaining := max(run.TotalSegments-run.ResolvedSegments, 0)
-		event.EstimatedCompletionDelay = time.Duration(float64(remaining) / event.ChecksPerSecond * float64(time.Second))
+		if run.Status == database.HealthRunRunning {
+			event.EstimatedCompletionDelay = time.Duration(float64(remaining) / event.ChecksPerSecond * float64(time.Second))
+		}
 	}
 	w.progress.PublishObservationProgress(event)
+}
+
+func (w *observationWorker) publishTransition(
+	run database.HealthRun,
+	status database.HealthRunStatus,
+	at time.Time,
+	lastError string,
+) {
+	run.Status = status
+	run.LeaseOwner = nil
+	run.LeaseExpiresAt = nil
+	run.UpdatedAt = at.UTC()
+	run.LastError = lastError
+	if status == database.HealthRunCompleted {
+		run.ResolvedSegments = run.TotalSegments
+	}
+	if status == database.HealthRunCompleted || status == database.HealthRunFailed ||
+		status == database.HealthRunCanceled {
+		completedAt := at.UTC()
+		run.CompletedAt = &completedAt
+	}
+	w.publishProgress(run, at)
 }

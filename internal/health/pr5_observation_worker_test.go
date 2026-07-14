@@ -1,6 +1,7 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
@@ -15,15 +16,143 @@ import (
 )
 
 type pr5ObservationWorkerRepository struct {
-	mu       sync.Mutex
-	now      func() time.Time
-	run      database.HealthRun
-	revision database.HealthFileRevision
-	snapshot database.ProviderSnapshot
-	state    database.HealthRunResumeState
-	due      time.Time
-	commits  []database.HealthChunkCommit
-	gaps     []database.GapRangeWrite
+	mu           sync.Mutex
+	now          func() time.Time
+	run          database.HealthRun
+	revision     database.HealthFileRevision
+	snapshot     database.ProviderSnapshot
+	schedule     database.HealthRunSchedule
+	gap          *database.HealthGapRange
+	coverage     *database.CompletedImportSTATCoverage
+	state        database.HealthRunResumeState
+	due          time.Time
+	commits      []database.HealthChunkCommit
+	gaps         []database.GapRangeWrite
+	clearedGapID string
+}
+
+func (r *pr5ObservationWorkerRepository) FinalizeObservationHealthRun(
+	_ context.Context,
+	runID, owner string,
+	token int64,
+	gaps []database.GapRangeWrite,
+	at time.Time,
+) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if runID != r.run.ID || r.run.Status != database.HealthRunRunning ||
+		r.run.LeaseOwner == nil || *r.run.LeaseOwner != owner || r.run.FencingToken != token {
+		return database.ErrStaleHealthLease
+	}
+	r.gaps = append(r.gaps, gaps...)
+	r.run.Status = database.HealthRunCompleted
+	r.run.LeaseOwner = nil
+	r.run.LeaseExpiresAt = nil
+	r.run.UpdatedAt = at
+	r.state.Run = r.run
+	return nil
+}
+
+func (r *pr5ObservationWorkerRepository) ClearGapRangeFromRunChunk(
+	_ context.Context,
+	runID, owner string,
+	token int64,
+	gapID, _ string,
+	clearedAt time.Time,
+) (*database.HealthGapRange, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.gap == nil || r.gap.ID != gapID {
+		return nil, database.ErrStaleHealthSchedule
+	}
+	r.clearedGapID = gapID
+	r.gap.Status = database.GapStatusCleared
+	r.gap.ClearedAt = &clearedAt
+	if r.run.ID != runID || r.run.LeaseOwner == nil || *r.run.LeaseOwner != owner ||
+		r.run.FencingToken != token {
+		return nil, database.ErrStaleHealthLease
+	}
+	r.run.Status = database.HealthRunCompleted
+	r.run.LeaseOwner = nil
+	r.run.LeaseExpiresAt = nil
+	r.run.UpdatedAt = clearedAt
+	r.state.Run = r.run
+	copy := *r.gap
+	return &copy, nil
+}
+
+func (r *pr5ObservationWorkerRepository) FinalizeGapRevalidation(
+	_ context.Context,
+	runID, owner string,
+	token int64,
+	at time.Time,
+) (*database.GapRevalidationFinalization, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if runID != r.run.ID || r.run.LeaseOwner == nil || *r.run.LeaseOwner != owner ||
+		r.run.FencingToken != token || r.gap == nil {
+		return nil, database.ErrStaleHealthLease
+	}
+	r.run.Status = database.HealthRunCompleted
+	r.run.LeaseOwner = nil
+	r.run.LeaseExpiresAt = nil
+	r.run.UpdatedAt = at
+	r.state.Run = r.run
+	copy := *r.gap
+	return &database.GapRevalidationFinalization{Gap: copy, Advanced: true}, nil
+}
+
+func (r *pr5ObservationWorkerRepository) FinalizeProviderActivationGap(
+	_ context.Context,
+	runID, owner string,
+	token int64,
+	at time.Time,
+) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if runID != r.run.ID || r.run.LeaseOwner == nil || *r.run.LeaseOwner != owner ||
+		r.run.FencingToken != token {
+		return false, database.ErrStaleHealthLease
+	}
+	r.run.Status = database.HealthRunCompleted
+	r.run.LeaseOwner = nil
+	r.run.LeaseExpiresAt = nil
+	r.run.UpdatedAt = at
+	r.state.Run = r.run
+	return true, nil
+}
+
+func (r *pr5ObservationWorkerRepository) FinalizeHealthPendingObservation(
+	_ context.Context,
+	runID, owner string,
+	token int64,
+	at time.Time,
+) (*database.HealthPendingFinalization, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if runID != r.run.ID || r.run.LeaseOwner == nil || *r.run.LeaseOwner != owner ||
+		r.run.FencingToken != token {
+		return nil, database.ErrStaleHealthLease
+	}
+	r.run.Status = database.HealthRunCompleted
+	r.run.LeaseOwner = nil
+	r.run.LeaseExpiresAt = nil
+	r.run.UpdatedAt = at
+	r.state.Run = r.run
+	return &database.HealthPendingFinalization{Settled: true, Recovered: true}, nil
+}
+
+func (r *pr5ObservationWorkerRepository) GetCompletedImportSTATCoverage(
+	_ context.Context,
+	revisionID string,
+	_ int64,
+) (*database.CompletedImportSTATCoverage, error) {
+	if r.coverage == nil || revisionID != r.revision.ID {
+		return nil, nil
+	}
+	copy := *r.coverage
+	copy.UnresolvedPositions = append([]int64(nil), r.coverage.UnresolvedPositions...)
+	return &copy, nil
 }
 
 func newPR5ObservationWorkerRepository(clock *pr5FakeClock, total int64, providers ...database.ProviderSnapshotEntry) *pr5ObservationWorkerRepository {
@@ -42,13 +171,50 @@ func newPR5ObservationWorkerRepository(clock *pr5FakeClock, total int64, provide
 	repo := &pr5ObservationWorkerRepository{
 		now: clock.Now, run: run, revision: revision,
 		snapshot: database.ProviderSnapshot{ID: run.ProviderSnapshotID, CreatedAt: now, Entries: providers},
+		schedule: database.HealthRunSchedule{RunID: run.ID, DedupeKey: "synthetic", Active: true, NotBefore: now},
 		due:      now,
 	}
 	repo.state.Run = run
 	return repo
 }
 
-func (r *pr5ObservationWorkerRepository) ClaimDueHealthRun(_ context.Context, owner string, ttl time.Duration) (*database.HealthRun, error) {
+func (r *pr5ObservationWorkerRepository) GetHealthRunSchedule(_ context.Context, runID string) (*database.HealthRunSchedule, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if runID != r.run.ID {
+		return nil, nil
+	}
+	copy := r.schedule
+	return &copy, nil
+}
+
+func (r *pr5ObservationWorkerRepository) GetHealthGapRange(_ context.Context, gapID string) (*database.HealthGapRange, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.gap == nil || r.gap.ID != gapID {
+		return nil, nil
+	}
+	copy := *r.gap
+	copy.Causes = append([]database.GapProviderCause(nil), r.gap.Causes...)
+	return &copy, nil
+}
+
+func (r *pr5ObservationWorkerRepository) ListUnresolvedSegmentPositions(
+	_ context.Context,
+	revisionID, providerID string,
+	generation, activationEpoch int64,
+) ([]int64, error) {
+	if revisionID != r.revision.ID || providerID == "" || generation <= 0 || activationEpoch <= 0 {
+		return nil, nil
+	}
+	positions := make([]int64, r.revision.SegmentCount)
+	for i := range positions {
+		positions[i] = int64(i)
+	}
+	return positions, nil
+}
+
+func (r *pr5ObservationWorkerRepository) ClaimDueObservationHealthRun(_ context.Context, owner string, ttl time.Duration) (*database.HealthRun, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.run.Status != database.HealthRunPending || r.now().Before(r.due) {
@@ -63,6 +229,34 @@ func (r *pr5ObservationWorkerRepository) ClaimDueHealthRun(_ context.Context, ow
 	r.state.Run = r.run
 	copy := r.run
 	return &copy, nil
+}
+
+func (r *pr5ObservationWorkerRepository) RenewHealthRunLease(
+	_ context.Context,
+	runID, owner string,
+	token int64,
+	ttl time.Duration,
+) (*database.HealthRun, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.run.ID != runID || r.run.LeaseOwner == nil ||
+		*r.run.LeaseOwner != owner || r.run.FencingToken != token {
+		return nil, database.ErrStaleHealthLease
+	}
+	expires := r.now().Add(ttl)
+	r.run.LeaseExpiresAt = &expires
+	copy := r.run
+	return &copy, nil
+}
+
+func (r *pr5ObservationWorkerRepository) AbandonStaleObservationRun(
+	context.Context,
+	string,
+	string,
+	int64,
+	time.Time,
+) (bool, error) {
+	return false, nil
 }
 
 func (r *pr5ObservationWorkerRepository) GetHealthRunResumeState(_ context.Context, runID string) (*database.HealthRunResumeState, error) {
@@ -167,7 +361,7 @@ func (r *pr5ObservationWorkerRepository) CommitHealthChunk(_ context.Context, co
 	return &copy, nil
 }
 
-func (r *pr5ObservationWorkerRepository) ParkHealthRun(_ context.Context, runID, owner string, token int64, due, at time.Time) error {
+func (r *pr5ObservationWorkerRepository) ParkObservationHealthRun(_ context.Context, runID, owner string, token int64, due, at time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if runID != r.run.ID || r.run.Status != database.HealthRunRunning ||
@@ -183,7 +377,7 @@ func (r *pr5ObservationWorkerRepository) ParkHealthRun(_ context.Context, runID,
 	return nil
 }
 
-func (r *pr5ObservationWorkerRepository) CompleteHealthRun(_ context.Context, runID, owner string, token int64, at time.Time) error {
+func (r *pr5ObservationWorkerRepository) CompleteObservationHealthRun(_ context.Context, runID, owner string, token int64, at time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if runID != r.run.ID || r.run.Status != database.HealthRunRunning ||
@@ -615,6 +809,56 @@ func TestPR5ObservationWorkerRequiresTwoAllProviderAbsenceWaves(t *testing.T) {
 	assert.Len(t, transport.snapshotCalls(), 4)
 }
 
+func TestPR5ObservationWorkerCoalescesLargeContiguousConfirmedSpan(t *testing.T) {
+	clock := &pr5FakeClock{now: time.Unix(1_801_004_200, 0).UTC()}
+	provider := pr5ObservationProviders()[0]
+	const total = 256
+	repo := newPR5ObservationWorkerRepository(clock, total, provider)
+	bitmap := bytes.Repeat([]byte{0xff}, total/8)
+	firstWave := clock.Now().Add(-20 * time.Minute)
+	secondWave := clock.Now().Add(-10 * time.Minute)
+	repo.state.Chunks = append(repo.state.Chunks,
+		database.HealthRunChunkState{
+			ID: "contiguous-wave-one", RunID: repo.run.ID,
+			ProviderID: provider.ProviderID, ProviderGeneration: provider.ProviderGeneration,
+			ProviderActivationEpoch: provider.ProviderActivationEpoch,
+			Stage:                   "observe_initial", ObservationKind: database.HealthObservationSTAT,
+			SegmentStart: 0, SegmentCount: total, TestedBitmap: append([]byte(nil), bitmap...),
+			AbsentBitmap: append([]byte(nil), bitmap...), PresentBitmap: make([]byte, total/8),
+			CorruptBitmap: make([]byte, total/8), TemporaryBitmap: make([]byte, total/8),
+			InconclusiveBitmap: make([]byte, total/8), ResolvedBitmap: append([]byte(nil), bitmap...),
+			CommittedAt: firstWave,
+		},
+		database.HealthRunChunkState{
+			ID: "contiguous-wave-two", RunID: repo.run.ID,
+			ProviderID: provider.ProviderID, ProviderGeneration: provider.ProviderGeneration,
+			ProviderActivationEpoch: provider.ProviderActivationEpoch,
+			Stage:                   "observe_confirmation_2", ObservationKind: database.HealthObservationSTAT,
+			SegmentStart: 0, SegmentCount: total, TestedBitmap: append([]byte(nil), bitmap...),
+			AbsentBitmap: append([]byte(nil), bitmap...), PresentBitmap: make([]byte, total/8),
+			CorruptBitmap: make([]byte, total/8), TemporaryBitmap: make([]byte, total/8),
+			InconclusiveBitmap: make([]byte, total/8), ResolvedBitmap: append([]byte(nil), bitmap...),
+			CommittedAt: secondWave,
+		},
+	)
+	dispatch := []observationDispatchProvider{{
+		ID: provider.ProviderID, Generation: provider.ProviderGeneration,
+		ActivationEpoch: provider.ProviderActivationEpoch, Role: provider.Role, Order: provider.Order,
+	}}
+	analysis := analyzeObservationState(
+		&repo.state, &repo.revision, pr5ObservationTargets(total), dispatch,
+		observationWorkerConfig{ChunkSize: 32, ConfirmationDelay: 10 * time.Minute}, clock.Now(),
+	)
+	require.Nil(t, analysis.work)
+	require.Len(t, analysis.gaps, 1,
+		"adjacent positions with the same confirmation wave and causes should publish one range")
+	assert.Equal(t, int64(0), analysis.gaps[0].StartSegment)
+	assert.Equal(t, int64(total), analysis.gaps[0].SegmentCount)
+	assert.Equal(t, database.GapKindConfirmedAbsent, analysis.gaps[0].Kind)
+	require.Len(t, analysis.gaps[0].Causes, 1)
+	assert.Equal(t, 2, analysis.gaps[0].Causes[0].ConfirmationCount)
+}
+
 func TestPR5ObservationWorkerDoesNotMixAsynchronousProviderConfirmations(t *testing.T) {
 	clock := &pr5FakeClock{now: time.Unix(1_801_004_500, 0).UTC()}
 	providers := pr5ObservationProviders()[:2]
@@ -791,6 +1035,107 @@ func TestPR5ObservationWorkerProgressIsCommittedAndObservationOnly(t *testing.T)
 	assert.Empty(t, repo.gaps)
 	assert.Equal(t, observationEffects{PersistEvidence: true}, observationSideEffects(database.GapKindProvisional, true),
 		"the worker's observation mode cannot pad, repair, or delete content")
+}
+
+func TestPR5ObservationWorkerPublishesEverySettledTransition(t *testing.T) {
+	tests := []struct {
+		name       string
+		prepare    func(*pr5ObservationWorkerRepository, *database.HealthRun, time.Time) (observationRunTarget, observationStateAnalysis)
+		wantStatus database.HealthRunStatus
+	}{
+		{
+			name: "gap recovery",
+			prepare: func(repo *pr5ObservationWorkerRepository, _ *database.HealthRun, now time.Time) (observationRunTarget, observationStateAnalysis) {
+				repo.gap = &database.HealthGapRange{ID: "gap-recovery", FileRevisionID: repo.revision.ID, Status: database.GapStatusActive, CreatedAt: now}
+				return observationRunTarget{gap: repo.gap}, observationStateAnalysis{recoveredGapChunkID: "chunk-recovery"}
+			},
+			wantStatus: database.HealthRunCompleted,
+		},
+		{
+			name: "gap revalidation",
+			prepare: func(repo *pr5ObservationWorkerRepository, _ *database.HealthRun, now time.Time) (observationRunTarget, observationStateAnalysis) {
+				repo.gap = &database.HealthGapRange{ID: "gap-revalidation", FileRevisionID: repo.revision.ID, Status: database.GapStatusActive, CreatedAt: now}
+				return observationRunTarget{gap: repo.gap}, observationStateAnalysis{finalizeRevalidation: true}
+			},
+			wantStatus: database.HealthRunCompleted,
+		},
+		{
+			name: "provider activation",
+			prepare: func(_ *pr5ObservationWorkerRepository, _ *database.HealthRun, _ time.Time) (observationRunTarget, observationStateAnalysis) {
+				return observationRunTarget{}, observationStateAnalysis{finalizeProviderActivation: true}
+			},
+			wantStatus: database.HealthRunCompleted,
+		},
+		{
+			name: "health pending",
+			prepare: func(_ *pr5ObservationWorkerRepository, run *database.HealthRun, _ time.Time) (observationRunTarget, observationStateAnalysis) {
+				run.Trigger = "health_pending"
+				return observationRunTarget{}, observationStateAnalysis{}
+			},
+			wantStatus: database.HealthRunCompleted,
+		},
+		{
+			name: "ordinary finalization",
+			prepare: func(_ *pr5ObservationWorkerRepository, _ *database.HealthRun, _ time.Time) (observationRunTarget, observationStateAnalysis) {
+				return observationRunTarget{schedule: &database.HealthRunSchedule{}}, observationStateAnalysis{}
+			},
+			wantStatus: database.HealthRunCompleted,
+		},
+		{
+			name: "target without a gap",
+			prepare: func(_ *pr5ObservationWorkerRepository, _ *database.HealthRun, _ time.Time) (observationRunTarget, observationStateAnalysis) {
+				return observationRunTarget{schedule: &database.HealthRunSchedule{
+					TargetProviderID: "provider-with-no-gap",
+				}}, observationStateAnalysis{}
+			},
+			wantStatus: database.HealthRunCompleted,
+		},
+		{
+			name: "retry park",
+			prepare: func(_ *pr5ObservationWorkerRepository, _ *database.HealthRun, now time.Time) (observationRunTarget, observationStateAnalysis) {
+				due := now.Add(time.Minute)
+				return observationRunTarget{}, observationStateAnalysis{nextDue: &due}
+			},
+			wantStatus: database.HealthRunPending,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := &pr5FakeClock{now: time.Unix(1_801_006_500, 0).UTC()}
+			repo := newPR5ObservationWorkerRepository(clock, 1, pr5ObservationProviders()[0])
+			owner := "synthetic-worker"
+			repo.run.Status = database.HealthRunRunning
+			repo.run.LeaseOwner = &owner
+			repo.run.FencingToken = 1
+			repo.run.TotalSegments = 8
+			repo.run.ResolvedSegments = 3
+			expires := clock.Now().Add(time.Minute)
+			repo.run.LeaseExpiresAt = &expires
+			repo.state.Run = repo.run
+			target, analysis := test.prepare(repo, &repo.run, clock.Now())
+			repo.state.Run = repo.run
+			progress := &pr5ObservationProgressRecorder{}
+			worker := &observationWorker{
+				repository: repo, progress: progress,
+				config: observationWorkerConfig{Clock: clock}.normalized(),
+			}
+
+			_, err := worker.settleRun(context.Background(), &repo.run, &repo.state, target, analysis)
+			require.NoError(t, err)
+			require.NotEmpty(t, progress.events)
+			last := progress.events[len(progress.events)-1]
+			assert.Equal(t, test.wantStatus, last.Status)
+			if test.wantStatus == database.HealthRunCompleted {
+				assert.Equal(t, int64(8), last.TotalSegments)
+				assert.Equal(t, last.TotalSegments, last.ResolvedSegments,
+					"a completed progress event must agree with durable 100%% settlement")
+			} else {
+				assert.Equal(t, int64(3), last.ResolvedSegments,
+					"a parked transition must retain partial progress")
+			}
+		})
+	}
 }
 
 func TestPR5ObservationWorkerCommitsThroughSQLiteRepository(t *testing.T) {
