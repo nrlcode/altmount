@@ -361,7 +361,7 @@ func TestPR4ChunkCommitIsFencedAtomicAndIdempotent(t *testing.T) {
 	require.Error(t, err, "ordinary run deletion must not cascade away durable observations")
 
 	conflict := fresh
-	conflict.ResolvedDelta = 4
+	conflict.ResolvedDelta = 2
 	_, err = f.repo.CommitHealthChunk(ctx, conflict)
 	require.ErrorIs(t, err, ErrHealthChunkConflict)
 }
