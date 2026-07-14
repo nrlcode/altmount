@@ -30,18 +30,27 @@ func TestPR3ConcurrentDuplicateRemovePreservesOtherActiveStream(t *testing.T) {
 		<-release
 	})
 
+	done := make(chan struct{}, 2)
 	var wg sync.WaitGroup
 	for range 2 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			tracker.Remove(victim)
+			done <- struct{}{}
 		}()
 	}
 
 	<-entered
-	<-entered
-	close(release)
+	select {
+	case <-entered:
+		// The old split Load/Delete path lets both removers claim the entry.
+		close(release)
+	case <-done:
+		// An atomic claim lets the losing remover return without invoking the
+		// victim's cancel function. Release the sole winning remover.
+		close(release)
+	}
 	wg.Wait()
 
 	require.Equal(t, 1, tracker.ActiveStreams(),
