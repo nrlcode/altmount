@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -36,6 +37,10 @@ func TestPR4FileRevisionIdentityIsStructuralAndReusable(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, first.ID, same.ID, "same canonical layout must retain revision identity")
+	_, err = repo.EnsureFileRevision(ctx, FileRevisionSpec{
+		FilePath: "library/movie.mkv", LayoutFingerprint: "sha256:layout-a", VirtualSize: 1001, SegmentCount: 10,
+	})
+	require.Error(t, err, "a retained fingerprint cannot be rebound to different layout dimensions")
 
 	replaced, err := repo.EnsureFileRevision(ctx, FileRevisionSpec{
 		FilePath: "library/movie.mkv", LayoutFingerprint: "sha256:layout-b", VirtualSize: 1000, SegmentCount: 10,
@@ -55,6 +60,19 @@ func TestPR4FileRevisionIdentityIsStructuralAndReusable(t *testing.T) {
 	for _, revision := range revisions {
 		assert.Equal(t, revision.ID == first.ID, revision.Active)
 	}
+}
+
+func TestPR4ProviderRegistryAllowsAnonymousAccountIdentity(t *testing.T) {
+	_, repo := newPR4Repository(t)
+	providers, err := repo.ReconcileProviders(context.Background(), []ProviderSpec{
+		{DisplayName: "Anonymous", Endpoint: "anonymous.example.invalid", Port: 119, Account: "", Role: ProviderRolePrimary, Order: 0},
+	})
+	require.NoError(t, err)
+	require.Len(t, providers, 1)
+	generations, err := repo.ListProviderGenerations(context.Background(), providers[0].ID)
+	require.NoError(t, err)
+	require.Len(t, generations, 1)
+	assert.Empty(t, generations[0].Account)
 }
 
 func TestPR4ProviderRegistryRetainsIdentityAndGenerations(t *testing.T) {
@@ -225,6 +243,15 @@ func TestPR4ChunkCommitIsFencedAtomicAndIdempotent(t *testing.T) {
 		assert.Equalf(t, want, got, "unexpected idempotency count for %s", table)
 	}
 
+	logicalConflict := commit
+	logicalConflict.ChunkID = "chunk-same-logical-range"
+	logicalConflict.Attempts[0].IdempotencyKey = "different-attempt-key"
+	logicalConflict.Confirmations[0].IdempotencyKey = "different-confirmation-key"
+	logicalConflict.Retry.RetryKey = "different-retry-key"
+	_, err = f.repo.CommitHealthChunk(ctx, logicalConflict)
+	require.ErrorIs(t, err, ErrHealthChunkConflict,
+		"one logical run/provider/stage/range must have one stable chunk identity")
+
 	lease2, err := f.repo.AcquireRunLease(ctx, f.run.ID, "worker-two", f.now.Add(2*time.Minute), time.Minute)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), lease2.FencingToken)
@@ -239,11 +266,55 @@ func TestPR4ChunkCommitIsFencedAtomicAndIdempotent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(6), completed.ResolvedSegments)
 	assert.Equal(t, int64(8), completed.CursorSegment)
+	_, err = f.db.Connection().Exec(`DELETE FROM health_runs WHERE id = ?`, f.run.ID)
+	require.Error(t, err, "ordinary run deletion must not cascade away durable observations")
 
 	conflict := fresh
 	conflict.ResolvedDelta = 4
 	_, err = f.repo.CommitHealthChunk(ctx, conflict)
 	require.ErrorIs(t, err, ErrHealthChunkConflict)
+}
+
+func TestPR4CommitUsesDispatchSnapshotProviderGeneration(t *testing.T) {
+	f := newPR4RunFixture(t)
+	ctx := context.Background()
+	_, err := f.repo.ReconcileProviders(ctx, []ProviderSpec{
+		{StableID: f.providerID, DisplayName: "A changed", Endpoint: "provider-a-new.invalid", Port: 119, Account: "a", Role: ProviderRolePrimary, Order: 0},
+	})
+	require.NoError(t, err)
+	lease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "worker", f.now, 2*time.Minute)
+	require.NoError(t, err)
+
+	wrongGeneration := pr4Commit(f, "wrong-generation", lease.FencingToken, "worker", 0)
+	wrongGeneration.ProviderGeneration = 2
+	_, err = f.repo.CommitHealthChunk(ctx, wrongGeneration)
+	require.ErrorIs(t, err, ErrProviderSnapshotMismatch)
+
+	rightGeneration := pr4Commit(f, "snapshot-generation", lease.FencingToken, "worker", 0)
+	_, err = f.repo.CommitHealthChunk(ctx, rightGeneration)
+	require.NoError(t, err)
+}
+
+func TestPR4ConflictingAttemptIdempotencyKeyRollsBackChunk(t *testing.T) {
+	f := newPR4RunFixture(t)
+	ctx := context.Background()
+	lease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "worker", f.now, 2*time.Minute)
+	require.NoError(t, err)
+	first := pr4Commit(f, "evidence-first", lease.FencingToken, "worker", 0)
+	first.Attempts[0].IdempotencyKey = "stable-attempt-key"
+	_, err = f.repo.CommitHealthChunk(ctx, first)
+	require.NoError(t, err)
+
+	second := pr4Commit(f, "evidence-conflict", lease.FencingToken, "worker", 4)
+	second.Attempts[0].IdempotencyKey = "stable-attempt-key"
+	second.Attempts[0].Outcome = "temporary_failure"
+	second.CommittedAt = f.now.Add(time.Minute + time.Second)
+	_, err = f.repo.CommitHealthChunk(ctx, second)
+	require.ErrorIs(t, err, ErrHealthChunkConflict)
+
+	var chunks int
+	require.NoError(t, f.db.Connection().QueryRow(`SELECT COUNT(*) FROM health_run_chunks`).Scan(&chunks))
+	assert.Equal(t, 1, chunks, "conflicting evidence must roll back its enclosing chunk")
 }
 
 func TestPR4ConcurrentChunkReplayAdvancesProgressOnce(t *testing.T) {
@@ -319,8 +390,15 @@ func TestPR4GapCausesAndSyntheticCacheStateAreDurable(t *testing.T) {
 		ByteStart: 200, ByteEnd: 299, EmittedAt: f.now.Add(time.Minute),
 	})
 	require.NoError(t, err)
-	assert.Equal(t, CacheRecoveryPending, state.Status)
-	assert.Equal(t, int64(1), state.ContentRevision)
+	assert.Equal(t, CacheRecoverySynthetic, state.Status,
+		"emitted bytes taint cache state but do not imply that source data recovered")
+	assert.Zero(t, state.ContentRevision)
+
+	state, err = f.repo.MarkSyntheticRangeRecovered(ctx, "synthetic-1", f.now.Add(2*time.Minute))
+	require.NoError(t, err)
+	assert.Equal(t, CacheRecoveryPending, state.Status,
+		"validated recovery, not synthetic emission, creates cache_recovery_pending")
+	assert.Zero(t, state.ContentRevision, "PR8 advances content revision during serialized invalidation")
 
 	retained, err := f.repo.GetCacheRecoveryState(ctx, revision.ID)
 	require.NoError(t, err)
@@ -346,4 +424,71 @@ func TestPR4InvalidCommitDoesNotBecomeProgress(t *testing.T) {
 	run, getErr := f.repo.GetHealthRun(ctx, f.run.ID)
 	require.NoError(t, getErr)
 	assert.Zero(t, run.ResolvedSegments)
+
+	commit = pr4Commit(f, "incomplete-outcome", lease.FencingToken, "worker", 0)
+	commit.InconclusiveBitmap = []byte{0}
+	commit.TemporaryBitmap = []byte{0}
+	commit.TestedBitmap = []byte{0b00001111}
+	commit.PresentBitmap = []byte{0b00000011}
+	commit.AbsentBitmap = []byte{0b00000100}
+	_, err = f.repo.CommitHealthChunk(ctx, commit)
+	require.Error(t, err, "every tested position must have an explicit outcome")
+}
+
+func TestPR4PostgresRepositoryFencingAndIdempotency(t *testing.T) {
+	dsn := os.Getenv("ALTMOUNT_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("ALTMOUNT_TEST_POSTGRES_DSN is not configured")
+	}
+	db, err := NewDB(Config{Type: "postgres", DSN: dsn})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	repo := NewHealthStateRepository(db.Connection(), DialectPostgres)
+	ctx := context.Background()
+	suffix := uuid.NewString()
+	revision, err := repo.EnsureFileRevision(ctx, FileRevisionSpec{
+		FilePath: "postgres/" + suffix + ".mkv", LayoutFingerprint: "sha256:" + suffix,
+		VirtualSize: 800, SegmentCount: 8,
+	})
+	require.NoError(t, err)
+	providers, err := repo.ReconcileProviders(ctx, []ProviderSpec{
+		{StableID: "postgres-provider-" + suffix, DisplayName: "Postgres provider", Endpoint: "postgres-provider.invalid", Port: 119, Account: suffix, Role: ProviderRolePrimary, Order: 0},
+	})
+	require.NoError(t, err)
+	now := time.Unix(1_700_100_000, 0).UTC()
+	snapshot, err := repo.CaptureActiveProviderSnapshot(ctx, now)
+	require.NoError(t, err)
+	run, err := repo.CreateHealthRun(ctx, HealthRunSpec{
+		ID: "postgres-run-" + suffix, FileRevisionID: revision.ID, ProviderSnapshotID: snapshot.ID,
+		Trigger: "manual", Mode: "observation", TotalSegments: 8, CreatedAt: now,
+	})
+	require.NoError(t, err)
+	f := pr4Fixture{repo: repo, db: db, run: run, providerID: providers[0].ID, now: now}
+	lease1, err := repo.AcquireRunLease(ctx, run.ID, "postgres-worker-one", now, time.Minute)
+	require.NoError(t, err)
+	commit := pr4Commit(f, "postgres-chunk-"+suffix, lease1.FencingToken, "postgres-worker-one", 0)
+	after, err := repo.CommitHealthChunk(ctx, commit)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), after.ResolvedSegments)
+	afterReplay, err := repo.CommitHealthChunk(ctx, commit)
+	require.NoError(t, err)
+	assert.Equal(t, after.ResolvedSegments, afterReplay.ResolvedSegments)
+
+	lease2, err := repo.AcquireRunLease(ctx, run.ID, "postgres-worker-two", now.Add(2*time.Minute), time.Minute)
+	require.NoError(t, err)
+	stale := pr4Commit(f, "postgres-stale-"+suffix, lease1.FencingToken, "postgres-worker-one", 4)
+	stale.CommittedAt = now.Add(2 * time.Minute)
+	_, err = repo.CommitHealthChunk(ctx, stale)
+	require.ErrorIs(t, err, ErrStaleHealthLease)
+	fresh := pr4Commit(f, "postgres-fresh-"+suffix, lease2.FencingToken, "postgres-worker-two", 4)
+	fresh.CommittedAt = now.Add(2*time.Minute + time.Second)
+	completed, err := repo.CommitHealthChunk(ctx, fresh)
+	require.NoError(t, err)
+	assert.Equal(t, int64(6), completed.ResolvedSegments)
+
+	var chunks int
+	require.NoError(t, db.Connection().QueryRow(
+		`SELECT COUNT(*) FROM health_run_chunks WHERE run_id = $1`, run.ID,
+	).Scan(&chunks))
+	assert.Equal(t, 2, chunks)
 }
