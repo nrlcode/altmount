@@ -52,6 +52,9 @@ func (f pr5ConfirmationWaveFixture) commitWaveRun(
 	t.Helper()
 	run, lease := f.createWaveRun(t, runID, at)
 	f.commitWaveStage(t, run, lease, "confirmation_stat", providerIDs, positions, at)
+	require.NoError(t, f.repo.CompleteHealthRun(
+		context.Background(), run.ID, *lease.LeaseOwner, lease.FencingToken, at,
+	))
 }
 
 func (f pr5ConfirmationWaveFixture) createWaveRun(

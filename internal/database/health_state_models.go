@@ -197,6 +197,7 @@ type HealthChunkCommit struct {
 	ProviderActivationEpoch int64
 	Stage                   string
 	ObservationKind         HealthObservationKind
+	FreshTransport          bool
 	SegmentStart            int64
 	SegmentCount            int64
 	TestedBitmap            []byte
@@ -254,20 +255,73 @@ type GapRangeWrite struct {
 	ConfirmedAt    *time.Time
 	ClearedAt      *time.Time
 	Causes         []GapProviderCause
+	RunID          string
+	LeaseOwner     string
+	FencingToken   int64
 }
 
 type HealthGapRange struct {
-	ID             string
-	FileRevisionID string
-	Kind           GapKind
-	StartSegment   int64
-	SegmentCount   int64
-	Episode        int64
-	Status         GapStatus
-	CreatedAt      time.Time
-	ConfirmedAt    *time.Time
-	ClearedAt      *time.Time
-	Causes         []GapProviderCause
+	ID                 string
+	FileRevisionID     string
+	Kind               GapKind
+	StartSegment       int64
+	SegmentCount       int64
+	Episode            int64
+	Status             GapStatus
+	CreatedAt          time.Time
+	ConfirmedAt        *time.Time
+	ClearedAt          *time.Time
+	RevalidationStep   int
+	NextRevalidationAt *time.Time
+	LastRevalidationAt *time.Time
+	Causes             []GapProviderCause
+}
+
+// ImportActivationRollback identifies one exact candidate/prior revision swap
+// without carrying metadata bytes, article identities, or provider secrets.
+// FilePath is the virtual library path needed by the filesystem journal.
+type ImportActivationRollback struct {
+	QueueItemID                int64
+	FilePath                   string
+	CandidateRevisionID        string
+	CandidateLayoutFingerprint string
+	PriorRevisionID            string
+	PriorLayoutFingerprint     string
+}
+
+// InactiveImportCandidate identifies an admitted queue-owned revision that
+// has not crossed DB activation. It carries only structural recovery identity;
+// private metadata bytes and StoreRef paths remain in the filesystem journal.
+type InactiveImportCandidate struct {
+	QueueItemID         int64
+	FilePath            string
+	CandidateRevisionID string
+	LayoutFingerprint   string
+}
+
+// GapRevalidationWork is one absolute aging milestone for a confirmed gap.
+// Step is the number of conclusive milestones already completed.
+type GapRevalidationWork struct {
+	Gap           HealthGapRange
+	TotalSegments int64
+	Step          int
+	NotBefore     time.Time
+}
+
+type GapRevalidationFinalization struct {
+	Gap      HealthGapRange
+	Advanced bool
+	Dormant  bool
+}
+
+// ProviderActivationWork identifies one restart-discoverable sparse sweep.
+// GapID is set for known-gap work; otherwise the worker derives only globally
+// unresolved positions not yet tested by Provider.
+type ProviderActivationWork struct {
+	RevisionID    string
+	TotalSegments int64
+	Provider      ProviderSnapshotEntry
+	GapID         string
 }
 
 type SyntheticOutputWrite struct {

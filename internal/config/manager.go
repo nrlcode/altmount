@@ -1368,6 +1368,15 @@ func (m *Manager) ValidateConfigUpdate(newConfig *Config) error {
 	if err := newConfig.Validate(); err != nil {
 		return err
 	}
+	// Startup validation intentionally accepts legacy empty provider IDs so
+	// PR5 can backfill them from the durable registry before pool creation.
+	// Once the process is running, every update must retain an explicit ID or
+	// callbacks could rebuild nntppool with endpoint/account-derived evidence.
+	for index := range newConfig.Providers {
+		if strings.TrimSpace(newConfig.Providers[index].ID) == "" {
+			return fmt.Errorf("provider %d: durable id is required for configuration updates", index)
+		}
+	}
 
 	// Get current config for comparison
 	m.mutex.RLock()

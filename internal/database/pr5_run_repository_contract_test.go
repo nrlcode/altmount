@@ -60,7 +60,7 @@ func (f pr5ScheduleFixture) scheduleSpec(id, dedupe string, priority HealthRunPr
 		Run: HealthRunSpec{
 			ID: id, FileRevisionID: f.revision.ID, ProviderSnapshotID: f.snapshot.ID,
 			Trigger: "provider_activation", Mode: "observation",
-			TotalSegments: f.total, CreatedAt: f.now,
+			TotalSegments: f.gap.SegmentCount, CreatedAt: f.now,
 		},
 		DedupeKey:                     dedupe,
 		Priority:                      priority,
@@ -95,6 +95,10 @@ func TestPR5ScheduledRunPersistsTargetAndPromotesOneActiveDedupe(t *testing.T) {
 	assert.Equal(t, f.provider.CurrentGeneration, schedule.TargetProviderGeneration)
 	assert.Equal(t, f.provider.ActivationEpoch, schedule.TargetProviderActivationEpoch)
 	assert.Equal(t, f.gap.ID, schedule.TargetGapID)
+	activeRun, err := restarted.GetActiveScheduledHealthRun(ctx, dedupe)
+	require.NoError(t, err)
+	require.NotNil(t, activeRun)
+	assert.Equal(t, createdRun.ID, activeRun.ID)
 
 	promotedRun, promotedCreated, err := restarted.EnsureScheduledHealthRun(ctx,
 		f.scheduleSpec("must-not-create-a-duplicate", dedupe, HealthRunPriorityHigh, f.now.Add(-time.Minute)))
@@ -206,6 +210,62 @@ func TestPR5DueClaimLeaseLifecycleAndPauseAreFenced(t *testing.T) {
 		"synthetic terminal reason", f.clock.now)
 	require.ErrorIs(t, err, ErrStaleHealthLease,
 		"a terminal transition cannot be overwritten by a late lifecycle call")
+}
+
+func TestPR5ConcurrentWorkersSerializeClaimsPerActiveRevision(t *testing.T) {
+	runPR5ConcurrentSameRevisionClaims(t, DialectSQLite)
+}
+
+func TestPR5DirectLeaseAcquisitionCannotBypassActiveRevisionOwner(t *testing.T) {
+	runPR5DirectSameRevisionLeaseFence(t, DialectSQLite)
+}
+
+func TestPR5FileObservationControlSelectsCurrentRunAndNeverImport(t *testing.T) {
+	f := newPR5ScheduleFixture(t)
+	ctx := context.Background()
+	ensure := func(id, trigger string, priority HealthRunPriority) *HealthRun {
+		t.Helper()
+		run, _, err := f.repo.EnsureScheduledHealthRun(ctx, ScheduledHealthRunSpec{
+			Run: HealthRunSpec{
+				ID: id, FileRevisionID: f.revision.ID, ProviderSnapshotID: f.snapshot.ID,
+				Trigger: trigger, Mode: "observation", TotalSegments: f.total,
+				CreatedAt: f.now,
+			},
+			DedupeKey: id, Priority: priority, NotBefore: f.now,
+		})
+		require.NoError(t, err)
+		return run
+	}
+	importRun := ensure("file-control-import", "import", HealthRunPriorityHigh)
+	ordinary := ensure("file-control-ordinary", "ordinary", HealthRunPriorityNormal)
+	manual := ensure("file-control-manual", "manual", HealthRunPriorityHigh)
+	ordinaryLease, err := f.repo.AcquireRunLease(ctx, ordinary.ID, "file-control-worker", time.Minute)
+	require.NoError(t, err)
+
+	selected, err := f.repo.GetActiveObservationHealthRunForFile(ctx, f.revision.FileHealthID)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, ordinaryLease.ID, selected.ID,
+		"the current running observation owns control ahead of queued manual work")
+	require.NoError(t, f.repo.RequestRunCancel(ctx, selected.ID, f.now.Add(time.Second)))
+
+	selected, err = f.repo.GetActiveObservationHealthRunForFile(ctx, f.revision.FileHealthID)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	assert.Equal(t, manual.ID, selected.ID)
+	require.NoError(t, f.repo.RequestRunCancel(ctx, selected.ID, f.now.Add(2*time.Second)))
+
+	selected, err = f.repo.GetActiveObservationHealthRunForFile(ctx, f.revision.FileHealthID)
+	require.NoError(t, err)
+	assert.Nil(t, selected, "an active import run is never exposed to file observation cancellation")
+	retainedImport, err := f.repo.GetHealthRun(ctx, importRun.ID)
+	require.NoError(t, err)
+	require.NotNil(t, retainedImport)
+	assert.Equal(t, HealthRunPending, retainedImport.Status)
+	importSchedule, err := f.repo.GetHealthRunSchedule(ctx, importRun.ID)
+	require.NoError(t, err)
+	require.NotNil(t, importSchedule)
+	assert.True(t, importSchedule.Active)
 }
 
 func TestPR5FailedRunIsTerminalAndReleasesItsLease(t *testing.T) {

@@ -22,7 +22,8 @@ func pr5AuditPresentCommit(
 		FencingToken: lease.FencingToken, ProviderID: f.providerID,
 		ProviderGeneration: 1, ProviderActivationEpoch: 1,
 		Stage: stage, ObservationKind: kind,
-		SegmentStart: position, SegmentCount: 1,
+		FreshTransport: kind == HealthObservationValidatedBody,
+		SegmentStart:   position, SegmentCount: 1,
 		TestedBitmap: []byte{1}, PresentBitmap: []byte{1},
 		AbsentBitmap: []byte{0}, CorruptBitmap: []byte{0},
 		TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
@@ -55,6 +56,40 @@ func pr5AuditAbsentCommit(
 			Cause: GapCauseAbsent, ObservedAt: at,
 		}},
 	}
+}
+
+func requirePR5StaleTargetRunIsDurablyTerminal(
+	t *testing.T,
+	f pr5ScheduleFixture,
+	runID string,
+	at time.Time,
+) {
+	t.Helper()
+	restarted := NewHealthStateRepository(f.db.Connection(), DialectSQLite)
+	restarted.now = f.clock.Now
+	run, err := restarted.GetHealthRun(context.Background(), runID)
+	require.NoError(t, err)
+	require.NotNil(t, run)
+	assert.Equal(t, HealthRunCanceled, run.Status)
+	assert.Nil(t, run.LeaseOwner)
+	assert.Nil(t, run.LeaseExpiresAt)
+	assert.True(t, run.CancelRequested)
+	assert.Equal(t, "stale health target", run.LastError)
+	require.NotNil(t, run.CompletedAt)
+	assert.Equal(t, at.UTC(), run.CompletedAt.UTC())
+
+	runs, err := restarted.ListHealthRuns(context.Background(), 500)
+	require.NoError(t, err)
+	found := false
+	for _, listed := range runs {
+		if listed.ID == runID {
+			found = true
+			assert.Equal(t, HealthRunCanceled, listed.Status)
+			assert.Equal(t, "stale health target", listed.LastError)
+			require.NotNil(t, listed.CompletedAt)
+		}
+	}
+	assert.True(t, found, "terminal stale-target history remains visible after restart")
 }
 
 func TestPR5ResolvedProgressUnionsPositionsAcrossProviderStages(t *testing.T) {
@@ -420,6 +455,9 @@ func TestPR5ActivationEpochSurvivesResumeAndKeysGapCauses(t *testing.T) {
 	require.Len(t, resume.Coverage, 1)
 	assert.Equal(t, int64(1), resume.Chunks[0].ProviderActivationEpoch)
 	assert.Equal(t, int64(1), resume.Coverage[0].ProviderActivationEpoch)
+	require.NoError(t, f.repo.CompleteHealthRun(
+		ctx, f.run.ID, "activation-one-worker", lease.FencingToken, f.now,
+	))
 
 	gapWrite := GapRangeWrite{
 		ID: "activation-keyed-gap", FileRevisionID: f.run.FileRevisionID,
@@ -544,6 +582,9 @@ func TestPR5GapConfirmationCountUsesTimeSeparatedDurableEvents(t *testing.T) {
 		commit := pr5AuditAbsentCommit(f, run, lease, id, stage, 1, 1, at)
 		_, commitErr := f.repo.CommitHealthChunk(ctx, commit)
 		require.NoError(t, commitErr)
+		require.NoError(t, f.repo.CompleteHealthRun(
+			ctx, run.ID, *lease.LeaseOwner, lease.FencingToken, at,
+		))
 	}
 	firstAt := f.now.Add(time.Minute)
 	commitAt("time-separated-first", "time_separated_first", firstAt)
@@ -606,6 +647,7 @@ func TestPR5ClearedGapScheduleIsRetiredBeforeClaim(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, schedule)
 	assert.False(t, schedule.Active)
+	requirePR5StaleTargetRunIsDurablyTerminal(t, f, run.ID, f.now.Add(2*time.Second))
 }
 
 func TestPR5SupersededProviderActivationScheduleIsRetiredBeforeClaim(t *testing.T) {
@@ -634,6 +676,7 @@ func TestPR5SupersededProviderActivationScheduleIsRetiredBeforeClaim(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, schedule)
 	assert.False(t, schedule.Active)
+	requirePR5StaleTargetRunIsDurablyTerminal(t, f, run.ID, due)
 }
 
 func TestPR5FutureEvidenceAndFreeFormFailureDetailsAreSafe(t *testing.T) {
@@ -659,7 +702,7 @@ func TestPR5FutureEvidenceAndFreeFormFailureDetailsAreSafe(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, lease)
 		const sensitiveSentinel = "synthetic-raw-article-token-must-not-persist"
-		err = f.repo.FailHealthRun(
+		_ = f.repo.FailHealthRun(
 			ctx, lease.ID, "sanitized-failure-worker", lease.FencingToken,
 			"transport failure: "+sensitiveSentinel, f.now.Add(time.Second))
 		// Rejecting free-form details is acceptable; accepting them requires

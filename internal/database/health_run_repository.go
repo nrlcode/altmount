@@ -129,86 +129,256 @@ func (r *HealthStateRepository) HasReusableCompletedImportSTATCoverage(
 	revisionID string,
 	totalSegments int64,
 ) (bool, error) {
+	coverage, err := r.GetCompletedImportSTATCoverage(ctx, revisionID, totalSegments)
+	if err != nil || coverage == nil {
+		return false, err
+	}
+	return coverage.Reusable, nil
+}
+
+func (r *HealthStateRepository) GetCompletedImportSTATCoverage(
+	ctx context.Context,
+	revisionID string,
+	totalSegments int64,
+) (*CompletedImportSTATCoverage, error) {
 	if strings.TrimSpace(revisionID) == "" || totalSegments <= 0 {
-		return false, nil
+		return nil, nil
 	}
 
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT r.id, r.provider_snapshot_id
+		SELECT validation.id, r.id, r.provider_snapshot_id, validation.phase,
+		       validation.unresolved_segments, validation.unresolved_bitmap
 		FROM health_import_validations validation
 		JOIN health_runs r ON r.id = validation.run_id
 		JOIN health_file_revisions revision ON revision.id = r.file_revision_id
 		WHERE validation.file_revision_id = ?
-		  AND validation.phase = 'accepted'
+		  AND validation.phase IN ('accepted', 'health_pending')
 		  AND r.trigger = 'import' AND r.mode = 'observation'
 		  AND r.status = 'completed' AND r.total_segments = ?
 		  AND revision.active = TRUE
+		  AND (validation.phase <> 'accepted' OR validation.coverage_reused_at IS NULL)
+		  AND (validation.phase <> 'accepted' OR NOT EXISTS (
+		    SELECT 1 FROM health_runs newer
+		    WHERE newer.file_revision_id = r.file_revision_id
+		      AND newer.mode = 'observation' AND newer.trigger <> 'import'
+		      AND newer.created_at >= r.completed_at
+		  ))
+		  AND (validation.phase <> 'health_pending' OR validation.health_pending_settled_at IS NULL)
 		ORDER BY r.completed_at DESC, r.id DESC
 	`, revisionID, totalSegments)
 	if err != nil {
-		return false, fmt.Errorf("list reusable import runs: %w", err)
+		return nil, fmt.Errorf("list completed import coverage: %w", err)
 	}
 	type candidate struct {
-		runID      string
-		snapshotID string
+		validationID     string
+		runID            string
+		snapshotID       string
+		phase            ImportValidationPhase
+		unresolvedCount  int64
+		unresolvedBitmap []byte
 	}
 	var candidates []candidate
 	for rows.Next() {
 		var value candidate
-		if err := rows.Scan(&value.runID, &value.snapshotID); err != nil {
+		if err := rows.Scan(
+			&value.validationID, &value.runID, &value.snapshotID, &value.phase,
+			&value.unresolvedCount, &value.unresolvedBitmap,
+		); err != nil {
 			rows.Close()
-			return false, fmt.Errorf("scan reusable import run: %w", err)
+			return nil, fmt.Errorf("scan completed import coverage: %w", err)
 		}
 		candidates = append(candidates, value)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return false, fmt.Errorf("iterate reusable import runs: %w", err)
+		return nil, fmt.Errorf("iterate completed import coverage: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return false, fmt.Errorf("close reusable import runs: %w", err)
+		return nil, fmt.Errorf("close completed import coverage: %w", err)
 	}
 
 	for _, value := range candidates {
-		currentSnapshot, err := r.providerSnapshotMatchesCurrent(ctx, value.snapshotID)
+		currentSnapshot, err := r.providerSnapshotMembershipMatchesCurrent(ctx, value.snapshotID)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		if !currentSnapshot {
 			continue
 		}
 		complete, err := r.importRunHasFullSTATCoverage(ctx, value.runID, totalSegments)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		if complete {
-			return true, nil
+		if !complete {
+			continue
+		}
+		coverage := &CompletedImportSTATCoverage{
+			ValidationID: value.validationID, RunID: value.runID, ProviderSnapshotID: value.snapshotID,
+		}
+		switch value.phase {
+		case ImportValidationPhaseAccepted:
+			coverage.Reusable = true
+			return coverage, nil
+		case ImportValidationPhaseHealthPending:
+			if len(value.unresolvedBitmap) != int((totalSegments+7)/8) {
+				return nil, fmt.Errorf("health-pending unresolved bitmap is malformed")
+			}
+			for position := int64(0); position < totalSegments; position++ {
+				if bitmapSet(value.unresolvedBitmap, position) {
+					coverage.UnresolvedPositions = append(coverage.UnresolvedPositions, position)
+				}
+			}
+			if int64(len(coverage.UnresolvedPositions)) != value.unresolvedCount ||
+				value.unresolvedCount <= 0 {
+				return nil, fmt.Errorf("health-pending unresolved evidence is inconsistent")
+			}
+			coverage.HealthPending = true
+			return coverage, nil
 		}
 	}
-	return false, nil
+	return nil, nil
 }
 
-func (r *HealthStateRepository) providerSnapshotMatchesCurrent(ctx context.Context, snapshotID string) (bool, error) {
-	var activeCount, snapshotCount, matchingCount int
-	err := r.db.QueryRowContext(ctx, `
-		SELECT
-			(SELECT COUNT(*) FROM health_providers WHERE active = TRUE),
-			(SELECT COUNT(*) FROM health_provider_snapshot_entries WHERE snapshot_id = ?),
-			(SELECT COUNT(*)
-			 FROM health_provider_snapshot_entries entry
-			 JOIN health_providers provider
-			   ON provider.id = entry.provider_id
-			  AND provider.active = TRUE
-			  AND provider.current_generation = entry.provider_generation
-			  AND provider.activation_epoch = entry.provider_activation_epoch
-			  AND provider.role = entry.role
-			  AND provider.configured_order = entry.configured_order
-			 WHERE entry.snapshot_id = ?)
-	`, snapshotID, snapshotID).Scan(&activeCount, &snapshotCount, &matchingCount)
-	if err != nil {
-		return false, fmt.Errorf("compare import provider snapshot: %w", err)
+// ConsumeReusableCompletedImportSTATCoverage claims the accepted import pass
+// exactly once. It suppresses only the immediate duplicate sweep; later
+// ordinary cadences must perform fresh observation work, including after a
+// restart.
+func (r *HealthStateRepository) ConsumeReusableCompletedImportSTATCoverage(
+	ctx context.Context,
+	revisionID string,
+	totalSegments int64,
+	at time.Time,
+) (*CompletedImportSTATCoverage, error) {
+	return r.consumeReusableCompletedImportSTATCoverage(
+		ctx, revisionID, totalSegments, at, nil,
+	)
+}
+
+type reusableImportCoverageDeferral struct {
+	filePath    string
+	nextCheckAt time.Time
+}
+
+// ConsumeReusableCompletedImportSTATCoverageAndDeferHealth atomically claims
+// the accepted import pass and moves the next ordinary observation time. A
+// missing or mismatched active file-health identity rolls the claim back, so a
+// scheduler failure cannot permanently burn the one-shot reuse marker.
+func (r *HealthStateRepository) ConsumeReusableCompletedImportSTATCoverageAndDeferHealth(
+	ctx context.Context,
+	revisionID string,
+	totalSegments int64,
+	filePath string,
+	nextCheckAt time.Time,
+	at time.Time,
+) (*CompletedImportSTATCoverage, error) {
+	filePath = normalizeHealthPath(filePath)
+	if filePath == "" || nextCheckAt.IsZero() {
+		return nil, fmt.Errorf("file path and next health check time are required")
 	}
-	return activeCount > 0 && activeCount == snapshotCount && snapshotCount == matchingCount, nil
+	return r.consumeReusableCompletedImportSTATCoverage(
+		ctx, revisionID, totalSegments, at,
+		&reusableImportCoverageDeferral{
+			filePath: filePath, nextCheckAt: nextCheckAt.UTC(),
+		},
+	)
+}
+
+func (r *HealthStateRepository) consumeReusableCompletedImportSTATCoverage(
+	ctx context.Context,
+	revisionID string,
+	totalSegments int64,
+	at time.Time,
+	deferral *reusableImportCoverageDeferral,
+) (*CompletedImportSTATCoverage, error) {
+	if at.IsZero() {
+		at = r.now().UTC()
+	} else {
+		at = at.UTC()
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		coverage, err := r.GetCompletedImportSTATCoverage(ctx, revisionID, totalSegments)
+		if err != nil || coverage == nil || !coverage.Reusable {
+			return nil, err
+		}
+		claimed := false
+		err = r.withTransaction(ctx, func(tx *dialectAwareTx) error {
+			var snapshotID string
+			err := tx.QueryRowContext(ctx, `
+				SELECT run.provider_snapshot_id
+				FROM health_import_validations validation
+				JOIN health_runs run ON run.id = validation.run_id
+				JOIN health_file_revisions revision ON revision.id = validation.file_revision_id
+				WHERE validation.id = ? AND validation.file_revision_id = ?
+				  AND validation.phase = 'accepted' AND validation.coverage_reused_at IS NULL
+				  AND run.status = 'completed' AND run.trigger = 'import'
+				  AND run.mode = 'observation' AND run.total_segments = ?
+				  AND revision.active = TRUE
+				  AND NOT EXISTS (
+				    SELECT 1 FROM health_runs newer
+				    WHERE newer.file_revision_id = run.file_revision_id
+				      AND newer.mode = 'observation' AND newer.trigger <> 'import'
+				      AND newer.created_at >= run.completed_at
+				  )
+			`, coverage.ValidationID, revisionID, totalSegments).Scan(&snapshotID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("lock reusable import coverage: %w", err)
+			}
+			current, err := providerSnapshotMembershipMatchesCurrentTx(ctx, tx, snapshotID)
+			if err != nil {
+				return err
+			}
+			if !current {
+				return nil
+			}
+			updated, err := tx.ExecContext(ctx, `
+				UPDATE health_import_validations SET coverage_reused_at = ?, updated_at = CASE
+				  WHEN updated_at > ? THEN updated_at ELSE ? END
+				WHERE id = ? AND coverage_reused_at IS NULL AND phase = 'accepted'
+			`, at, at, at, coverage.ValidationID)
+			if err != nil {
+				return fmt.Errorf("consume reusable import coverage: %w", err)
+			}
+			rows, err := updated.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("read reusable import coverage consumption: %w", err)
+			}
+			claimed = rows == 1
+			if !claimed || deferral == nil {
+				return nil
+			}
+			deferred, err := tx.ExecContext(ctx, `
+				UPDATE file_health
+				SET scheduled_check_at = ?,
+				    updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
+				WHERE file_path = ?
+				  AND id = (
+				    SELECT file_health_id FROM health_file_revisions
+				    WHERE id = ? AND active = TRUE
+				  )
+			`, deferral.nextCheckAt, at, at, deferral.filePath, revisionID)
+			if err != nil {
+				return fmt.Errorf("defer health after reusable import coverage: %w", err)
+			}
+			deferredRows, err := deferred.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("read reusable import coverage health deferral: %w", err)
+			}
+			if deferredRows != 1 {
+				return fmt.Errorf("active file health identity does not match reusable import coverage")
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if claimed {
+			return coverage, nil
+		}
+	}
+	return nil, nil
 }
 
 func (r *HealthStateRepository) importRunHasFullSTATCoverage(
@@ -268,6 +438,13 @@ func (r *HealthStateRepository) AcquireRunLease(ctx context.Context, runID, owne
 		  AND status IN ('pending', 'running', 'paused')
 		  AND pause_requested = FALSE AND cancel_requested = FALSE
 		  AND (lease_owner IS NULL OR lease_expires_at <= ? OR lease_owner = ?)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM health_runs active_run
+		    WHERE active_run.file_revision_id = health_runs.file_revision_id
+		      AND active_run.id <> health_runs.id AND active_run.status = 'running'
+		      AND active_run.lease_owner IS NOT NULL
+		      AND active_run.lease_expires_at > ?
+		  )
 		RETURNING id, file_revision_id, provider_snapshot_id, trigger, mode, status,
 		          lease_owner, lease_expires_at, fencing_token, total_segments,
 		          resolved_segments, provider_checks, missing_candidates, inconclusive_count,
@@ -276,7 +453,26 @@ func (r *HealthStateRepository) AcquireRunLease(ctx context.Context, runID, owne
 		          COALESCE(last_error, '')
 	`
 	var run HealthRun
-	err := scanHealthRun(r.db.QueryRowContext(ctx, query, owner, expires, at, at, runID, at, owner), &run)
+	var err error
+	if r.dialect.IsPostgres() {
+		err = r.withTransaction(ctx, func(tx *dialectAwareTx) error {
+			var revisionID string
+			if err := tx.QueryRowContext(ctx, `
+				SELECT revision.id
+				FROM health_file_revisions revision
+				JOIN health_runs run ON run.file_revision_id = revision.id
+				WHERE run.id = ?
+				FOR UPDATE OF revision
+			`, runID).Scan(&revisionID); err != nil {
+				return err
+			}
+			return scanHealthRun(tx.QueryRowContext(ctx, query,
+				owner, expires, at, at, runID, at, owner, at), &run)
+		})
+	} else {
+		err = scanHealthRun(r.db.QueryRowContext(ctx, query,
+			owner, expires, at, at, runID, at, owner, at), &run)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrStaleHealthLease
 	}
@@ -311,6 +507,9 @@ func validateHealthChunk(commit HealthChunkCommit) error {
 	}
 	if commit.ObservationKind != HealthObservationSTAT && commit.ObservationKind != HealthObservationValidatedBody {
 		return fmt.Errorf("invalid health observation kind %q", commit.ObservationKind)
+	}
+	if commit.FreshTransport && commit.ObservationKind != HealthObservationValidatedBody {
+		return fmt.Errorf("fresh transport is meaningful only for validated BODY observations")
 	}
 	if !validDurableHealthKey(commit.ChunkID) || !validDurableHealthClass(commit.Stage, true) {
 		return fmt.Errorf("chunk identity or stage is not safe durable health metadata")
@@ -532,14 +731,17 @@ func (r *HealthStateRepository) CommitHealthChunk(ctx context.Context, commit He
 			return ErrStaleHealthLease
 		}
 		var lockedRevision string
+		var revisionSegments int64
 		if err := tx.QueryRowContext(ctx, `
-			UPDATE health_file_revisions SET active = active WHERE id = ? RETURNING id
-		`, revisionID).Scan(&lockedRevision); err != nil {
+			UPDATE health_file_revisions SET active = active WHERE id = ?
+			RETURNING id, segment_count
+		`, revisionID).Scan(&lockedRevision, &revisionSegments); err != nil {
 			return fmt.Errorf("lock health file revision for observation commit: %w", err)
 		}
-		if commit.SegmentCount > totalSegments || commit.SegmentStart > totalSegments-commit.SegmentCount ||
-			commit.CursorSegment > totalSegments {
-			return fmt.Errorf("chunk range or cursor exceeds run total")
+		if commit.SegmentCount > revisionSegments ||
+			commit.SegmentStart > revisionSegments-commit.SegmentCount ||
+			commit.CursorSegment > revisionSegments {
+			return fmt.Errorf("chunk range or cursor exceeds file revision bounds")
 		}
 		var snapshotActivationEpoch int64
 		err = tx.QueryRowContext(ctx, `
@@ -556,6 +758,11 @@ func (r *HealthStateRepository) CommitHealthChunk(ctx context.Context, commit He
 			commit.ProviderActivationEpoch = snapshotActivationEpoch
 		} else if commit.ProviderActivationEpoch != snapshotActivationEpoch {
 			return ErrProviderSnapshotMismatch
+		}
+		if err := validateLiveHealthScheduleTarget(
+			ctx, tx, commit, revisionID,
+		); err != nil {
+			return err
 		}
 		digest, err := healthChunkDigest(commit)
 		if err != nil {
@@ -605,15 +812,15 @@ func (r *HealthStateRepository) CommitHealthChunk(ctx context.Context, commit He
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO health_run_chunks
 				(id, run_id, provider_id, provider_generation, provider_activation_epoch,
-				 stage, observation_kind, segment_start,
+				 stage, observation_kind, fresh_transport, segment_start,
 				 segment_count, tested_bitmap, present_bitmap, absent_bitmap, corrupt_bitmap,
 				 temporary_bitmap, inconclusive_bitmap, resolved_bitmap, retry_state, commit_digest,
 				 fencing_token, resolved_delta, provider_checks_delta, missing_candidates_delta,
 				 inconclusive_delta, committed_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, commit.ChunkID, commit.RunID, commit.ProviderID, commit.ProviderGeneration,
 			commit.ProviderActivationEpoch, commit.Stage, commit.ObservationKind,
-			commit.SegmentStart, commit.SegmentCount, commit.TestedBitmap,
+			commit.FreshTransport, commit.SegmentStart, commit.SegmentCount, commit.TestedBitmap,
 			commit.PresentBitmap, commit.AbsentBitmap, commit.CorruptBitmap,
 			commit.TemporaryBitmap, commit.InconclusiveBitmap, commit.ResolvedBitmap, retryJSON, digest,
 			commit.FencingToken, resolvedDelta, commit.ProviderChecksDelta,
@@ -690,6 +897,82 @@ func (r *HealthStateRepository) CommitHealthChunk(ctx context.Context, commit He
 		return nil, err
 	}
 	return &result, nil
+}
+
+func validateLiveHealthScheduleTarget(
+	ctx context.Context,
+	tx *dialectAwareTx,
+	commit HealthChunkCommit,
+	revisionID string,
+) error {
+	var active bool
+	var targetProviderID, targetGapID sql.NullString
+	var targetGeneration, targetActivationEpoch sql.NullInt64
+	var trigger string
+	err := tx.QueryRowContext(ctx, `
+		SELECT s.active, s.target_provider_id, s.target_provider_generation,
+		       s.target_provider_activation_epoch, s.target_gap_id, r.trigger
+		FROM health_run_schedule s
+		JOIN health_runs r ON r.id = s.run_id
+		WHERE s.run_id = ?
+	`, commit.RunID).Scan(
+		&active, &targetProviderID, &targetGeneration,
+		&targetActivationEpoch, &targetGapID, &trigger,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Import admission and the PR4 compatibility APIs create explicitly
+		// leased runs without scheduler metadata.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("verify health run schedule: %w", err)
+	}
+	if !active {
+		return ErrStaleHealthSchedule
+	}
+	if targetProviderID.Valid {
+		if commit.ProviderID != targetProviderID.String ||
+			commit.ProviderGeneration != targetGeneration.Int64 ||
+			commit.ProviderActivationEpoch != targetActivationEpoch.Int64 {
+			return ErrStaleHealthSchedule
+		}
+		var current int
+		err := tx.QueryRowContext(ctx, `
+			SELECT 1 FROM health_providers
+			WHERE id = ? AND active = TRUE AND current_generation = ?
+			  AND activation_epoch = ?
+		`, targetProviderID.String, targetGeneration.Int64,
+			targetActivationEpoch.Int64).Scan(&current)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrStaleHealthSchedule
+		}
+		if err != nil {
+			return fmt.Errorf("verify current scheduled provider activation: %w", err)
+		}
+	}
+	if targetGapID.Valid {
+		var gapRevisionID string
+		var start, count int64
+		var status GapStatus
+		err := tx.QueryRowContext(ctx, `
+			SELECT file_revision_id, start_segment, segment_count, status
+			FROM health_gap_ranges WHERE id = ?
+		`, targetGapID.String).Scan(&gapRevisionID, &start, &count, &status)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrStaleHealthSchedule
+		}
+		if err != nil {
+			return fmt.Errorf("verify scheduled gap target: %w", err)
+		}
+		allowDormant := strings.HasPrefix(trigger, "provider_activation") || trigger == "manual"
+		if gapRevisionID != revisionID ||
+			(status != GapStatusActive && (!allowDormant || status != GapStatusDormant)) ||
+			commit.SegmentStart < start ||
+			commit.SegmentStart+commit.SegmentCount > start+count {
+			return ErrStaleHealthSchedule
+		}
+	}
+	return nil
 }
 
 // countNewResolvedPositions computes the positional union under the run-row
@@ -1016,19 +1299,49 @@ func sameOptionalTime(existing *time.Time, desired time.Time) bool {
 }
 
 func (r *HealthStateRepository) RequestRunPause(ctx context.Context, runID string, requested bool, at time.Time) error {
-	result, err := r.db.ExecContext(ctx, `UPDATE health_runs SET pause_requested = ?, updated_at = ? WHERE id = ?`, requested, at.UTC(), runID)
-	if err != nil {
-		return fmt.Errorf("request run pause: %w", err)
-	}
-	if rows, _ := result.RowsAffected(); rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return r.withTransaction(ctx, func(tx *dialectAwareTx) error {
+		var trigger string
+		if err := tx.QueryRowContext(ctx, `
+			UPDATE health_runs SET updated_at = updated_at
+			WHERE id = ? RETURNING trigger
+		`, runID).Scan(&trigger); errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		} else if err != nil {
+			return fmt.Errorf("lock health run control target: %w", err)
+		}
+		if trigger == "import" {
+			return ErrImportRunControl
+		}
+		result, err := tx.ExecContext(ctx, `
+			UPDATE health_runs SET pause_requested = ?, updated_at = ? WHERE id = ?
+		`, requested, at.UTC(), runID)
+		if err != nil {
+			return fmt.Errorf("request run pause: %w", err)
+		}
+		if rows, err := result.RowsAffected(); err != nil {
+			return fmt.Errorf("read health run pause result: %w", err)
+		} else if rows != 1 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
 }
 
 func (r *HealthStateRepository) RequestRunCancel(ctx context.Context, runID string, at time.Time) error {
 	at = at.UTC()
 	return r.withTransaction(ctx, func(tx *dialectAwareTx) error {
+		var trigger string
+		if err := tx.QueryRowContext(ctx, `
+			UPDATE health_runs SET updated_at = updated_at
+			WHERE id = ? RETURNING trigger
+		`, runID).Scan(&trigger); errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		} else if err != nil {
+			return fmt.Errorf("lock health run cancel target: %w", err)
+		}
+		if trigger == "import" {
+			return ErrImportRunControl
+		}
 		result, err := tx.ExecContext(ctx, `
 			UPDATE health_runs
 			SET cancel_requested = TRUE, status = 'canceled', lease_owner = NULL,

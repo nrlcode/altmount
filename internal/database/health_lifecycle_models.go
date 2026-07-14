@@ -51,6 +51,7 @@ type HealthRunChunkState struct {
 	ProviderActivationEpoch int64
 	Stage                   string
 	ObservationKind         HealthObservationKind
+	FreshTransport          bool
 	SegmentStart            int64
 	SegmentCount            int64
 	TestedBitmap            []byte
@@ -165,4 +166,21 @@ type ImportValidation struct {
 	SecondPassComplete  bool
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
+}
+
+// CompletedImportSTATCoverage distinguishes clean reusable import coverage
+// from a tolerant import whose exact unresolved positions need immediate
+// background confirmation.
+type CompletedImportSTATCoverage struct {
+	ValidationID        string
+	RunID               string
+	ProviderSnapshotID  string
+	Reusable            bool
+	HealthPending       bool
+	UnresolvedPositions []int64
+}
+
+type HealthPendingFinalization struct {
+	Settled   bool
+	Recovered bool
 }

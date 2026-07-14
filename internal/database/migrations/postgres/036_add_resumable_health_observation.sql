@@ -27,7 +27,8 @@ ALTER TABLE health_runs ADD COLUMN last_error TEXT DEFAULT NULL;
 ALTER TABLE health_run_chunks
     ADD COLUMN provider_activation_epoch BIGINT NOT NULL DEFAULT 1
         CHECK(provider_activation_epoch >= 1),
-    ADD COLUMN resolved_bitmap BYTEA NOT NULL DEFAULT '\x'::bytea;
+    ADD COLUMN resolved_bitmap BYTEA NOT NULL DEFAULT '\x'::bytea,
+    ADD COLUMN fresh_transport BOOLEAN NOT NULL DEFAULT FALSE;
 UPDATE health_run_chunks
 SET resolved_bitmap = decode(
     repeat('00', ((segment_count + 7) / 8)::INTEGER), 'hex'
@@ -97,6 +98,19 @@ CREATE UNIQUE INDEX idx_health_gap_ranges_one_active_exact
     ON health_gap_ranges(file_revision_id, kind, start_segment, segment_count)
     WHERE status = 'active';
 
+ALTER TABLE health_gap_ranges
+    ADD COLUMN revalidation_step INTEGER NOT NULL DEFAULT 0
+        CHECK(revalidation_step >= 0 AND revalidation_step <= 4),
+    ADD COLUMN next_revalidation_at TIMESTAMPTZ DEFAULT NULL,
+    ADD COLUMN last_revalidation_at TIMESTAMPTZ DEFAULT NULL;
+UPDATE health_gap_ranges
+SET next_revalidation_at = confirmed_at + INTERVAL '1 day'
+WHERE status = 'active'
+  AND kind IN ('confirmed_absent', 'confirmed_unusable')
+  AND confirmed_at IS NOT NULL;
+CREATE INDEX idx_health_gap_revalidation_due
+    ON health_gap_ranges(status, next_revalidation_at, revalidation_step);
+
 ALTER TABLE health_gap_provider_causes
     ADD COLUMN provider_activation_epoch BIGINT NOT NULL DEFAULT 1
         CHECK(provider_activation_epoch >= 1),
@@ -131,6 +145,11 @@ CREATE UNIQUE INDEX idx_health_run_schedule_active_dedupe
     ON health_run_schedule(dedupe_key) WHERE active = TRUE;
 CREATE INDEX idx_health_run_schedule_due
     ON health_run_schedule(active, not_before, priority DESC, created_at);
+CREATE INDEX idx_health_run_schedule_activation_target
+    ON health_run_schedule(
+        target_provider_id, target_provider_generation,
+        target_provider_activation_epoch, target_gap_id
+    );
 
 CREATE TABLE health_import_validations (
     id TEXT NOT NULL PRIMARY KEY,
@@ -147,6 +166,8 @@ CREATE TABLE health_import_validations (
     unresolved_bitmap BYTEA NOT NULL DEFAULT '\x'::bytea,
     initial_pass_complete BOOLEAN NOT NULL DEFAULT FALSE,
     second_pass_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    coverage_reused_at TIMESTAMPTZ DEFAULT NULL,
+    health_pending_settled_at TIMESTAMPTZ DEFAULT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     UNIQUE(queue_item_id, file_revision_id),
@@ -158,11 +179,45 @@ CREATE UNIQUE INDEX idx_health_import_validations_run
 CREATE INDEX idx_health_import_validations_confirmation_due
     ON health_import_validations(phase, confirmation_due_at);
 
+CREATE TABLE health_import_activation_journal (
+    queue_item_id BIGINT NOT NULL REFERENCES import_queue(id) ON DELETE CASCADE,
+    candidate_revision_id TEXT NOT NULL REFERENCES health_file_revisions(id),
+    file_health_id BIGINT NOT NULL REFERENCES file_health(id),
+    prior_revision_id TEXT DEFAULT NULL REFERENCES health_file_revisions(id),
+    prior_status TEXT NOT NULL,
+    prior_scheduled_check_at TIMESTAMPTZ DEFAULT NULL,
+    prior_priority INTEGER NOT NULL,
+    prior_retry_count INTEGER NOT NULL CHECK(prior_retry_count >= 0),
+    prior_repair_retry_count INTEGER NOT NULL CHECK(prior_repair_retry_count >= 0),
+    candidate_scheduled_check_at TIMESTAMPTZ NOT NULL,
+    candidate_priority INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN (
+        'active', 'committed', 'cleanup_pending', 'cleanup_completed', 'compensated'
+    )),
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    resolved_at TIMESTAMPTZ DEFAULT NULL,
+    PRIMARY KEY(queue_item_id, candidate_revision_id),
+    UNIQUE(queue_item_id, file_health_id)
+);
+CREATE INDEX idx_health_import_activation_journal_state
+    ON health_import_activation_journal(queue_item_id, state, updated_at);
+
+CREATE TABLE nzb_store_ref_operations (
+    operation_key TEXT NOT NULL PRIMARY KEY,
+    store_path_hash TEXT NOT NULL,
+    delta INTEGER NOT NULL CHECK(delta IN (-1, 1)),
+    resulting_ref_count BIGINT NOT NULL CHECK(resulting_ref_count >= 0),
+    applied_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE OR REPLACE FUNCTION health_clear_durable_state_before_file_delete()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
+    DELETE FROM health_import_activation_journal
+      WHERE file_health_id = OLD.id;
     DELETE FROM health_import_validations
       WHERE file_revision_id IN (SELECT id FROM health_file_revisions WHERE file_health_id = OLD.id);
     DELETE FROM health_run_schedule
@@ -207,6 +262,8 @@ $$;
 -- +goose Down
 -- +goose StatementBegin
 
+DROP TABLE nzb_store_ref_operations;
+DROP TABLE health_import_activation_journal;
 DROP TABLE health_import_validations;
 DROP TABLE health_run_schedule;
 
@@ -304,7 +361,12 @@ ALTER TABLE health_gap_provider_causes
     ADD PRIMARY KEY(gap_id, provider_id, provider_generation);
 
 DROP INDEX idx_health_gap_ranges_one_active_exact;
+DROP INDEX idx_health_gap_revalidation_due;
 ALTER TABLE health_gap_ranges DROP CONSTRAINT health_gap_ranges_episode_key;
+ALTER TABLE health_gap_ranges
+    DROP COLUMN revalidation_step,
+    DROP COLUMN next_revalidation_at,
+    DROP COLUMN last_revalidation_at;
 ALTER TABLE health_gap_ranges DROP COLUMN episode;
 ALTER TABLE health_gap_ranges
     ADD CONSTRAINT health_gap_ranges_exact_key
@@ -351,6 +413,7 @@ CREATE INDEX idx_health_attempt_evidence_lookup
 ALTER TABLE health_confirmation_events DROP COLUMN provider_activation_epoch;
 ALTER TABLE health_retry_states DROP COLUMN provider_activation_epoch;
 ALTER TABLE health_run_chunks
+    DROP COLUMN fresh_transport,
     DROP COLUMN resolved_bitmap,
     DROP COLUMN provider_activation_epoch;
 

@@ -14,7 +14,9 @@ import (
 
 var pr5Tables = []string{
 	"health_import_validations",
+	"health_import_activation_journal",
 	"health_run_schedule",
+	"nzb_store_ref_operations",
 }
 
 func requirePR5Schema(t *testing.T, db *sql.DB, dialect Dialect) {
@@ -23,6 +25,9 @@ func requirePR5Schema(t *testing.T, db *sql.DB, dialect Dialect) {
 		assert.Truef(t, pr4TableExists(t, db, dialect, table), "missing PR5 table %s", table)
 	}
 	requiredColumns := map[string][]string{
+		"health_run_chunks": {
+			"fresh_transport",
+		},
 		"health_providers": {
 			"activation_epoch", "activated_at",
 		},
@@ -30,7 +35,7 @@ func requirePR5Schema(t *testing.T, db *sql.DB, dialect Dialect) {
 			"provider_activation_epoch",
 		},
 		"health_gap_ranges": {
-			"episode",
+			"episode", "revalidation_step", "next_revalidation_at", "last_revalidation_at",
 		},
 		"health_run_schedule": {
 			"run_id", "dedupe_key", "active", "target_provider_id",
@@ -40,7 +45,17 @@ func requirePR5Schema(t *testing.T, db *sql.DB, dialect Dialect) {
 		"health_import_validations": {
 			"id", "queue_item_id", "file_revision_id", "run_id", "phase",
 			"damage_policy", "confirmation_due_at", "unresolved_segments",
-			"created_at", "updated_at",
+			"coverage_reused_at", "health_pending_settled_at", "created_at", "updated_at",
+		},
+		"health_import_activation_journal": {
+			"queue_item_id", "candidate_revision_id", "file_health_id",
+			"prior_revision_id", "prior_status", "prior_scheduled_check_at",
+			"prior_priority", "prior_retry_count", "prior_repair_retry_count",
+			"candidate_scheduled_check_at", "candidate_priority", "state",
+			"created_at", "updated_at", "resolved_at",
+		},
+		"nzb_store_ref_operations": {
+			"operation_key", "store_path_hash", "delta", "resulting_ref_count", "applied_at",
 		},
 	}
 	for table, want := range requiredColumns {

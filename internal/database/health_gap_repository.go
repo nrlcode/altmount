@@ -36,6 +36,10 @@ func validateGapWrite(gap GapRangeWrite) error {
 			return fmt.Errorf("invalid provider gap cause")
 		}
 	}
+	fenced := gap.RunID != "" || gap.LeaseOwner != "" || gap.FencingToken != 0
+	if fenced && (gap.RunID == "" || gap.LeaseOwner == "" || gap.FencingToken <= 0) {
+		return fmt.Errorf("gap run fence must supply run, owner, and fencing token together")
+	}
 	return nil
 }
 
@@ -49,6 +53,42 @@ func (r *HealthStateRepository) UpsertGapRange(ctx context.Context, write GapRan
 	write.CreatedAt = write.CreatedAt.UTC()
 	var gap HealthGapRange
 	err := r.withTransaction(ctx, func(tx *dialectAwareTx) error {
+		if write.RunID != "" {
+			var revisionID, snapshotID string
+			var leaseExpiresAt time.Time
+			err := tx.QueryRowContext(ctx, `
+				UPDATE health_runs SET updated_at = updated_at
+				WHERE id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?
+				RETURNING file_revision_id, provider_snapshot_id, lease_expires_at
+			`, write.RunID, write.LeaseOwner, write.FencingToken).Scan(
+				&revisionID, &snapshotID, &leaseExpiresAt,
+			)
+			if errors.Is(err, sql.ErrNoRows) || (err == nil && !leaseExpiresAt.After(r.now().UTC())) {
+				return ErrStaleHealthLease
+			}
+			if err != nil {
+				return fmt.Errorf("verify gap observation run fence: %w", err)
+			}
+			if revisionID != write.FileRevisionID {
+				return ErrStaleHealthSchedule
+			}
+			current, err := providerSnapshotMembershipMatchesCurrentTx(ctx, tx, snapshotID)
+			if err != nil {
+				return err
+			}
+			if !current {
+				return ErrProviderSnapshotMismatch
+			}
+			var active bool
+			if err := tx.QueryRowContext(ctx, `
+				UPDATE health_run_schedule SET active = active
+				WHERE run_id = ? RETURNING active
+			`, write.RunID).Scan(&active); errors.Is(err, sql.ErrNoRows) || (err == nil && !active) {
+				return ErrStaleHealthSchedule
+			} else if err != nil {
+				return fmt.Errorf("verify gap observation schedule: %w", err)
+			}
+		}
 		var revisionSegments int64
 		if err := tx.QueryRowContext(ctx, `
 			UPDATE health_file_revisions SET active = active WHERE id = ?
@@ -103,16 +143,25 @@ func (r *HealthStateRepository) UpsertGapRange(ctx context.Context, write GapRan
 			return fmt.Errorf("read health gap identity: %w", err)
 		}
 
+		var nextRevalidationAt any
+		if write.ConfirmedAt != nil &&
+			(write.Kind == GapKindConfirmedAbsent || write.Kind == GapKindConfirmedUnusable) {
+			nextRevalidationAt = write.ConfirmedAt.UTC().Add(24 * time.Hour)
+		}
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO health_gap_ranges
 				(id, file_revision_id, kind, start_segment, segment_count, episode, status,
-				 created_at, confirmed_at, cleared_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				 created_at, confirmed_at, cleared_at, revalidation_step,
+				 next_revalidation_at, last_revalidation_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)
 			ON CONFLICT(id) DO UPDATE SET
 				confirmed_at = COALESCE(health_gap_ranges.confirmed_at, excluded.confirmed_at),
+				next_revalidation_at = COALESCE(
+					health_gap_ranges.next_revalidation_at, excluded.next_revalidation_at),
 				cleared_at = health_gap_ranges.cleared_at
 		`, write.ID, write.FileRevisionID, write.Kind, write.StartSegment,
-			write.SegmentCount, episode, write.Status, write.CreatedAt, write.ConfirmedAt, write.ClearedAt)
+			write.SegmentCount, episode, write.Status, write.CreatedAt, write.ConfirmedAt,
+			write.ClearedAt, nextRevalidationAt)
 		if err != nil {
 			return fmt.Errorf("upsert health gap range: %w", err)
 		}
@@ -164,11 +213,13 @@ func (r *HealthStateRepository) UpsertGapRange(ctx context.Context, write GapRan
 		}
 		if err := tx.QueryRowContext(ctx, `
 			SELECT id, file_revision_id, kind, start_segment, segment_count, episode, status,
-			       created_at, confirmed_at, cleared_at
+			       created_at, confirmed_at, cleared_at, revalidation_step,
+			       next_revalidation_at, last_revalidation_at
 			FROM health_gap_ranges WHERE id = ?
 		`, write.ID).Scan(&gap.ID, &gap.FileRevisionID, &gap.Kind, &gap.StartSegment,
 			&gap.SegmentCount, &gap.Episode, &gap.Status, &gap.CreatedAt,
-			&gap.ConfirmedAt, &gap.ClearedAt); err != nil {
+			&gap.ConfirmedAt, &gap.ClearedAt, &gap.RevalidationStep,
+			&gap.NextRevalidationAt, &gap.LastRevalidationAt); err != nil {
 			return fmt.Errorf("read persisted health gap: %w", err)
 		}
 		rows, err := tx.QueryContext(ctx, `
@@ -199,6 +250,145 @@ func (r *HealthStateRepository) UpsertGapRange(ctx context.Context, write GapRan
 		return nil, err
 	}
 	return &gap, nil
+}
+
+func scanHealthGapRange(row rowScanner, gap *HealthGapRange) error {
+	return row.Scan(
+		&gap.ID, &gap.FileRevisionID, &gap.Kind, &gap.StartSegment,
+		&gap.SegmentCount, &gap.Episode, &gap.Status, &gap.CreatedAt,
+		&gap.ConfirmedAt, &gap.ClearedAt, &gap.RevalidationStep,
+		&gap.NextRevalidationAt, &gap.LastRevalidationAt,
+	)
+}
+
+const healthGapRangeSelect = `
+	SELECT id, file_revision_id, kind, start_segment, segment_count, episode,
+	       status, created_at, confirmed_at, cleared_at, revalidation_step,
+	       next_revalidation_at, last_revalidation_at
+	FROM health_gap_ranges
+`
+
+func (r *HealthStateRepository) GetHealthGapRange(ctx context.Context, gapID string) (*HealthGapRange, error) {
+	var gap HealthGapRange
+	err := scanHealthGapRange(r.db.QueryRowContext(ctx,
+		healthGapRangeSelect+` WHERE id = ?`, gapID), &gap)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get health gap range: %w", err)
+	}
+	causes, err := r.listGapProviderCauses(ctx, gap.ID)
+	if err != nil {
+		return nil, err
+	}
+	gap.Causes = causes
+	return &gap, nil
+}
+
+func (r *HealthStateRepository) ListDueGapRevalidations(
+	ctx context.Context,
+	now time.Time,
+	limit int,
+) ([]GapRevalidationWork, error) {
+	if limit <= 0 {
+		limit = 32
+	}
+	rows, err := r.db.QueryContext(ctx, healthGapRangeSelect+`
+		WHERE status = 'active'
+		  AND kind IN ('confirmed_absent', 'confirmed_unusable')
+		  AND revalidation_step < 4
+		  AND next_revalidation_at IS NOT NULL
+		  AND next_revalidation_at <= ?
+		  AND (SELECT COUNT(*) FROM health_providers WHERE active = TRUE) > 0
+		  AND (SELECT COUNT(*) FROM health_providers WHERE active = TRUE) = (
+		    SELECT COUNT(*)
+		    FROM health_gap_provider_causes cause
+		    JOIN health_providers provider
+		      ON provider.id = cause.provider_id AND provider.active = TRUE
+		     AND provider.current_generation = cause.provider_generation
+		     AND provider.activation_epoch = cause.provider_activation_epoch
+		    WHERE cause.gap_id = health_gap_ranges.id
+		  )
+		ORDER BY next_revalidation_at, id
+		LIMIT ?
+	`, now.UTC(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("list due gap revalidations: %w", err)
+	}
+	var gaps []HealthGapRange
+	for rows.Next() {
+		var gap HealthGapRange
+		if err := scanHealthGapRange(rows, &gap); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan due gap revalidation: %w", err)
+		}
+		if gap.NextRevalidationAt == nil {
+			continue
+		}
+		gaps = append(gaps, gap)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close due gap revalidations: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate due gap revalidations: %w", err)
+	}
+	var work []GapRevalidationWork
+	for _, gap := range gaps {
+		causes, err := r.listGapProviderCauses(ctx, gap.ID)
+		if err != nil {
+			return nil, err
+		}
+		gap.Causes = causes
+		var revisionSegments int64
+		if err := r.db.QueryRowContext(ctx, `
+			SELECT segment_count FROM health_file_revisions WHERE id = ? AND active = TRUE
+		`, gap.FileRevisionID).Scan(&revisionSegments); err != nil {
+			return nil, fmt.Errorf("read due gap revision bounds: %w", err)
+		}
+		if gap.StartSegment > revisionSegments-gap.SegmentCount {
+			return nil, fmt.Errorf("due gap exceeds active revision bounds")
+		}
+		work = append(work, GapRevalidationWork{
+			Gap: gap, TotalSegments: gap.SegmentCount,
+			Step: gap.RevalidationStep, NotBefore: gap.NextRevalidationAt.UTC(),
+		})
+	}
+	return work, nil
+}
+
+func (r *HealthStateRepository) listGapProviderCauses(
+	ctx context.Context,
+	gapID string,
+) ([]GapProviderCause, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT provider_id, provider_generation, provider_activation_epoch,
+		       cause, confirmation_count, confirmed_at
+		FROM health_gap_provider_causes
+		WHERE gap_id = ?
+		ORDER BY provider_id, provider_generation, provider_activation_epoch
+	`, gapID)
+	if err != nil {
+		return nil, fmt.Errorf("list health gap provider causes: %w", err)
+	}
+	defer rows.Close()
+	var causes []GapProviderCause
+	for rows.Next() {
+		var cause GapProviderCause
+		var confirmedAt *time.Time
+		if err := rows.Scan(
+			&cause.ProviderID, &cause.ProviderGeneration, &cause.ProviderActivationEpoch,
+			&cause.Cause, &cause.ConfirmationCount, &confirmedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan health gap provider cause: %w", err)
+		}
+		if confirmedAt != nil {
+			cause.ConfirmedAt = confirmedAt.UTC()
+		}
+		causes = append(causes, cause)
+	}
+	return causes, rows.Err()
 }
 
 // authoritativeGapProviderCauses ignores caller counts/timestamps and derives
@@ -292,12 +482,19 @@ type gapConfirmationWaveKey struct {
 
 type gapConfirmationWaveEvidence struct {
 	key      gapConfirmationWaveKey
-	evidence map[gapConfirmationTuple]time.Time
+	evidence map[gapConfirmationTuple]gapConfirmationObservation
 }
 
 type qualifiedGapConfirmationWave struct {
 	key         gapConfirmationWaveKey
+	startedAt   time.Time
 	completedAt time.Time
+	causes      map[importProviderKey]GapCause
+}
+
+type gapConfirmationObservation struct {
+	cause      GapCause
+	observedAt time.Time
 }
 
 func deriveTimeSeparatedGapCauses(
@@ -309,12 +506,12 @@ func deriveTimeSeparatedGapCauses(
 	if len(write.Causes) == 0 {
 		return nil, nil, nil
 	}
-	requested := make(map[importProviderKey]GapCause, len(write.Causes))
+	requested := make(map[importProviderKey]struct{}, len(write.Causes))
 	for _, cause := range write.Causes {
 		requested[importProviderKey{
 			ID: cause.ProviderID, Generation: cause.ProviderGeneration,
 			ActivationEpoch: cause.ProviderActivationEpoch,
-		}] = cause.Cause
+		}] = struct{}{}
 	}
 
 	rows, err := tx.QueryContext(ctx, `
@@ -349,21 +546,21 @@ func deriveTimeSeparatedGapCauses(
 		provider := importProviderKey{
 			ID: providerID, Generation: generation, ActivationEpoch: activationEpoch,
 		}
-		if requestedCause, ok := requested[provider]; !ok || requestedCause != cause {
+		if _, ok := requested[provider]; !ok {
 			continue
 		}
 		waveKey := gapConfirmationWaveKey{runID: runID, stage: stage}
 		wave := byWave[waveKey]
 		if wave == nil {
 			wave = &gapConfirmationWaveEvidence{
-				key: waveKey, evidence: make(map[gapConfirmationTuple]time.Time),
+				key: waveKey, evidence: make(map[gapConfirmationTuple]gapConfirmationObservation),
 			}
 			byWave[waveKey] = wave
 		}
 		tuple := gapConfirmationTuple{provider: provider, position: position}
 		observedAt = observedAt.UTC()
-		if retained, ok := wave.evidence[tuple]; !ok || observedAt.Before(retained) {
-			wave.evidence[tuple] = observedAt
+		if retained, ok := wave.evidence[tuple]; !ok || observedAt.After(retained.observedAt) {
+			wave.evidence[tuple] = gapConfirmationObservation{cause: cause, observedAt: observedAt}
 		}
 	}
 	if err := rows.Close(); err != nil {
@@ -375,33 +572,52 @@ func deriveTimeSeparatedGapCauses(
 
 	waves := make([]qualifiedGapConfirmationWave, 0, len(byWave))
 	for _, wave := range byWave {
+		var startedAt time.Time
 		var completedAt time.Time
+		causes := make(map[importProviderKey]GapCause, len(requested))
 		complete := true
+		hasCorrupt := false
 		for provider := range requested {
+			providerCause := GapCauseAbsent
 			for position := write.StartSegment; position < write.StartSegment+write.SegmentCount; position++ {
-				observedAt, ok := wave.evidence[gapConfirmationTuple{
+				observation, ok := wave.evidence[gapConfirmationTuple{
 					provider: provider, position: position,
 				}]
 				if !ok {
 					complete = false
 					break
 				}
-				if observedAt.After(completedAt) {
-					completedAt = observedAt
+				if startedAt.IsZero() || observation.observedAt.Before(startedAt) {
+					startedAt = observation.observedAt
+				}
+				if observation.observedAt.After(completedAt) {
+					completedAt = observation.observedAt
+				}
+				if observation.cause == GapCauseCorrupt {
+					providerCause = GapCauseCorrupt
+					hasCorrupt = true
 				}
 			}
 			if !complete {
 				break
 			}
+			causes[provider] = providerCause
+		}
+		if complete && write.Kind == GapKindConfirmedAbsent && hasCorrupt {
+			complete = false
+		}
+		if complete && write.Kind == GapKindConfirmedUnusable && !hasCorrupt {
+			complete = false
 		}
 		if complete {
 			waves = append(waves, qualifiedGapConfirmationWave{
-				key: wave.key, completedAt: completedAt,
+				key: wave.key, startedAt: startedAt, completedAt: completedAt, causes: causes,
 			})
 		}
 	}
 	if len(waves) == 0 {
-		return nil, nil, fmt.Errorf("provider gap causes lack a complete activation-scoped all-requested-provider confirmation wave")
+		return nil, nil, fmt.Errorf("%w: provider causes lack a complete activation-scoped all-requested-provider wave",
+			errIncompleteGapConfirmationEvidence)
 	}
 	sort.Slice(waves, func(i, j int) bool {
 		if waves[i].completedAt.Equal(waves[j].completedAt) {
@@ -416,13 +632,19 @@ func deriveTimeSeparatedGapCauses(
 	qualified := make([]qualifiedGapConfirmationWave, 0, len(waves))
 	for _, wave := range waves {
 		if len(qualified) == 0 ||
-			!wave.completedAt.Before(qualified[len(qualified)-1].completedAt.Add(minimumConfirmationSeparation)) {
+			!wave.startedAt.Before(qualified[len(qualified)-1].completedAt.Add(minimumConfirmationSeparation)) {
 			qualified = append(qualified, wave)
 		}
 	}
 	confirmedAt := qualified[len(qualified)-1].completedAt
 	derived := make([]GapProviderCause, 0, len(write.Causes))
+	latestCauses := qualified[len(qualified)-1].causes
 	for _, cause := range write.Causes {
+		provider := importProviderKey{
+			ID: cause.ProviderID, Generation: cause.ProviderGeneration,
+			ActivationEpoch: cause.ProviderActivationEpoch,
+		}
+		cause.Cause = latestCauses[provider]
 		cause.ConfirmationCount = len(qualified)
 		cause.ConfirmedAt = confirmedAt
 		derived = append(derived, cause)
@@ -439,6 +661,33 @@ func (r *HealthStateRepository) ClearGapRangeFromChunk(
 	chunkID string,
 	clearedAt time.Time,
 ) (*HealthGapRange, error) {
+	return r.clearGapRangeFromChunk(ctx, "", "", 0, gapID, chunkID, clearedAt)
+}
+
+// ClearGapRangeFromRunChunk clears/splits a targeted gap and completes the
+// owning observation run in the same lease-fenced transaction.
+func (r *HealthStateRepository) ClearGapRangeFromRunChunk(
+	ctx context.Context,
+	runID, owner string,
+	fencingToken int64,
+	gapID, chunkID string,
+	clearedAt time.Time,
+) (*HealthGapRange, error) {
+	if runID == "" || owner == "" || fencingToken <= 0 {
+		return nil, fmt.Errorf("gap recovery run fence is required")
+	}
+	return r.clearGapRangeFromChunk(
+		ctx, runID, owner, fencingToken, gapID, chunkID, clearedAt,
+	)
+}
+
+func (r *HealthStateRepository) clearGapRangeFromChunk(
+	ctx context.Context,
+	runID, owner string,
+	fencingToken int64,
+	gapID, chunkID string,
+	clearedAt time.Time,
+) (*HealthGapRange, error) {
 	if gapID == "" || chunkID == "" || clearedAt.IsZero() {
 		return nil, fmt.Errorf("gap, source chunk, and clear time are required")
 	}
@@ -448,23 +697,66 @@ func (r *HealthStateRepository) ClearGapRangeFromChunk(
 	}
 	var gap HealthGapRange
 	err := r.withTransaction(ctx, func(tx *dialectAwareTx) error {
+		var fencedRevisionID, snapshotID string
+		var leaseExpiresAt time.Time
+		if runID != "" {
+			err := tx.QueryRowContext(ctx, `
+				UPDATE health_runs SET updated_at = updated_at
+				WHERE id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?
+				RETURNING file_revision_id, provider_snapshot_id, lease_expires_at
+			`, runID, owner, fencingToken).Scan(
+				&fencedRevisionID, &snapshotID, &leaseExpiresAt,
+			)
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrStaleHealthLease
+			}
+			if err != nil {
+				return fmt.Errorf("verify gap recovery run fence: %w", err)
+			}
+			if !leaseExpiresAt.After(r.now().UTC()) {
+				return ErrStaleHealthLease
+			}
+			current, err := providerSnapshotMembershipMatchesCurrentTx(ctx, tx, snapshotID)
+			if err != nil {
+				return err
+			}
+			if !current {
+				return ErrProviderSnapshotMismatch
+			}
+			var active bool
+			var targetGapID *string
+			if err := tx.QueryRowContext(ctx, `
+				UPDATE health_run_schedule SET active = active
+				WHERE run_id = ? RETURNING active, target_gap_id
+			`, runID).Scan(&active, &targetGapID); err != nil {
+				return fmt.Errorf("verify gap recovery schedule: %w", err)
+			}
+			if !active || targetGapID == nil || *targetGapID != gapID {
+				return ErrStaleHealthSchedule
+			}
+		}
 		var revisionID string
 		if err := tx.QueryRowContext(ctx, `
 			UPDATE health_gap_ranges SET status = status
 			WHERE id = ?
 			RETURNING id, file_revision_id, kind, start_segment, segment_count, episode,
-			          status, created_at, confirmed_at, cleared_at
+			          status, created_at, confirmed_at, cleared_at, revalidation_step,
+			          next_revalidation_at, last_revalidation_at
 		`, gapID).Scan(&gap.ID, &revisionID, &gap.Kind, &gap.StartSegment,
 			&gap.SegmentCount, &gap.Episode, &gap.Status, &gap.CreatedAt,
-			&gap.ConfirmedAt, &gap.ClearedAt); err != nil {
+			&gap.ConfirmedAt, &gap.ClearedAt, &gap.RevalidationStep,
+			&gap.NextRevalidationAt, &gap.LastRevalidationAt); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("health gap does not exist")
 			}
 			return fmt.Errorf("read health gap for clearing: %w", err)
 		}
 		gap.FileRevisionID = revisionID
-		if gap.Status != GapStatusActive {
-			return fmt.Errorf("only an active health gap can be cleared")
+		if runID != "" && fencedRevisionID != revisionID {
+			return ErrStaleHealthSchedule
+		}
+		if gap.Status != GapStatusActive && gap.Status != GapStatusDormant {
+			return fmt.Errorf("only an active or dormant health gap can be cleared")
 		}
 
 		rows, err := tx.QueryContext(ctx, `
@@ -497,17 +789,19 @@ func (r *HealthStateRepository) ClearGapRangeFromChunk(
 			return fmt.Errorf("iterate health gap causes for recovery: %w", err)
 		}
 
+		var sourceRunID string
 		var observationKind HealthObservationKind
+		var freshTransport bool
 		var chunkStart, chunkCount int64
 		var tested, present []byte
 		var observedAt time.Time
 		if err := tx.QueryRowContext(ctx, `
-			SELECT c.observation_kind, c.segment_start, c.segment_count,
+			SELECT c.run_id, c.observation_kind, c.fresh_transport, c.segment_start, c.segment_count,
 			       c.tested_bitmap, c.present_bitmap, c.committed_at
 			FROM health_run_chunks c
 			JOIN health_runs r ON r.id = c.run_id
 			WHERE c.id = ? AND r.file_revision_id = ?
-		`, chunkID, revisionID).Scan(&observationKind, &chunkStart, &chunkCount,
+		`, chunkID, revisionID).Scan(&sourceRunID, &observationKind, &freshTransport, &chunkStart, &chunkCount,
 			&tested, &present, &observedAt); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("source chunk does not belong to the gap revision")
@@ -516,6 +810,12 @@ func (r *HealthStateRepository) ClearGapRangeFromChunk(
 		}
 		if observationKind != HealthObservationValidatedBody {
 			return fmt.Errorf("only validated BODY presence can clear a health gap")
+		}
+		if runID != "" && sourceRunID != runID {
+			return ErrStaleHealthSchedule
+		}
+		if !freshTransport {
+			return fmt.Errorf("gap recovery requires a fresh validated BODY transport")
 		}
 		if clearedAt.Before(observedAt) {
 			return fmt.Errorf("gap clear time precedes its validated BODY evidence")
@@ -541,15 +841,37 @@ func (r *HealthStateRepository) ClearGapRangeFromChunk(
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE health_gap_ranges
 			SET status = 'cleared', cleared_at = ?
-			WHERE id = ? AND status = 'active'
+			WHERE id = ? AND status IN ('active', 'dormant')
 		`, clearedAt, gapID); err != nil {
 			return fmt.Errorf("clear health gap episode: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `
+		retiredRows, err := tx.QueryContext(ctx, `
 			UPDATE health_run_schedule SET active = FALSE, updated_at = ?
 			WHERE target_gap_id = ? AND active = TRUE
-		`, clearedAt, gapID); err != nil {
+			RETURNING run_id
+		`, clearedAt, gapID)
+		if err != nil {
 			return fmt.Errorf("retire recovered gap schedule: %w", err)
+		}
+		var retiredRunIDs []string
+		for retiredRows.Next() {
+			var retiredRunID string
+			if err := retiredRows.Scan(&retiredRunID); err != nil {
+				retiredRows.Close()
+				return fmt.Errorf("scan recovered gap schedule: %w", err)
+			}
+			retiredRunIDs = append(retiredRunIDs, retiredRunID)
+		}
+		if err := retiredRows.Close(); err != nil {
+			return fmt.Errorf("close recovered gap schedules: %w", err)
+		}
+		if err := retiredRows.Err(); err != nil {
+			return fmt.Errorf("iterate recovered gap schedules: %w", err)
+		}
+		if err := terminalizeStaleTargetedHealthRunsTx(
+			ctx, tx, retiredRunIDs, runID, clearedAt,
+		); err != nil {
+			return err
 		}
 
 		for offset := int64(0); offset < gap.SegmentCount; {
@@ -573,6 +895,24 @@ func (r *HealthStateRepository) ClearGapRangeFromChunk(
 			SELECT status, cleared_at FROM health_gap_ranges WHERE id = ?
 		`, gapID).Scan(&gap.Status, &gap.ClearedAt); err != nil {
 			return fmt.Errorf("read cleared health gap: %w", err)
+		}
+		if runID != "" {
+			completed, err := tx.ExecContext(ctx, `
+				UPDATE health_runs
+				SET status = 'completed', resolved_segments = total_segments,
+				    lease_owner = NULL, lease_expires_at = NULL,
+				    last_error = NULL, updated_at = ?, completed_at = ?
+				WHERE id = ? AND status = 'running' AND lease_owner = ? AND fencing_token = ?
+				  AND lease_expires_at > ? AND cancel_requested = FALSE
+			`, clearedAt, clearedAt, runID, owner, fencingToken, r.now().UTC())
+			if err != nil {
+				return fmt.Errorf("complete gap recovery run: %w", err)
+			}
+			if rows, err := completed.RowsAffected(); err != nil {
+				return fmt.Errorf("read gap recovery completion result: %w", err)
+			} else if rows != 1 {
+				return ErrStaleHealthLease
+			}
 		}
 		return nil
 	})
@@ -600,10 +940,12 @@ func insertRecoveredGapRemainder(
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO health_gap_ranges
 			(id, file_revision_id, kind, start_segment, segment_count, episode,
-			 status, created_at, confirmed_at, cleared_at)
-		VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL)
+			 status, created_at, confirmed_at, cleared_at, revalidation_step,
+			 next_revalidation_at, last_revalidation_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
 	`, remainderID, parent.FileRevisionID, parent.Kind, start, count, episode,
-		parent.CreatedAt, parent.ConfirmedAt); err != nil {
+		parent.Status, parent.CreatedAt, parent.ConfirmedAt, parent.RevalidationStep,
+		parent.NextRevalidationAt, parent.LastRevalidationAt); err != nil {
 		return fmt.Errorf("persist recovered gap remainder: %w", err)
 	}
 	for _, cause := range parent.Causes {

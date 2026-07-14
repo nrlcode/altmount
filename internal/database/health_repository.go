@@ -119,7 +119,7 @@ func (r *HealthRepository) UpdateFileHealthScheduled(ctx context.Context, filePa
 const fileHealthSelectColumns = `
 	SELECT id, file_path, library_path, status, last_checked, last_error, retry_count, max_retries,
 	       repair_retry_count, max_repair_retries, source_nzb_path,
-	       error_details, created_at, updated_at, release_date, priority,
+	       error_details, created_at, updated_at, release_date, scheduled_check_at, priority,
 		   streaming_failure_count, is_masked
 	, metadata, indexer, download_id
 	FROM file_health
@@ -140,7 +140,8 @@ func scanFileHealth(s rowScanner) (*FileHealth, error) {
 		&health.LastError, &health.RetryCount, &health.MaxRetries,
 		&health.RepairRetryCount, &health.MaxRepairRetries,
 		&health.SourceNzbPath, &health.ErrorDetails,
-		&health.CreatedAt, &health.UpdatedAt, &health.ReleaseDate, &health.Priority,
+		&health.CreatedAt, &health.UpdatedAt, &health.ReleaseDate,
+		&health.ScheduledCheckAt, &health.Priority,
 		&health.StreamingFailureCount, &health.IsMasked,
 		&health.Metadata, &health.Indexer, &health.DownloadID,
 	)
@@ -304,6 +305,105 @@ func (r *HealthRepository) GetUnhealthyFiles(ctx context.Context, limit int, str
 		return nil, fmt.Errorf("failed to iterate unhealthy files: %w", err)
 	}
 
+	return files, nil
+}
+
+// ListDueObservationFiles is the non-authoritative PR5 discovery queue. Unlike
+// the legacy repair/check query, observation eligibility is never filtered by
+// health status, retry exhaustion, repair state, or import strategy. A missing
+// schedule is due unless a completed durable observation is still fresh; an
+// explicit active manual run temporarily owns the file. Retained rows without
+// either a published revision or discovery metadata are history, not work.
+func (r *HealthRepository) ListDueObservationFiles(
+	ctx context.Context,
+	dueAt time.Time,
+	freshSince time.Time,
+	limit int,
+) ([]*FileHealth, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("positive observation file limit is required")
+	}
+	if dueAt.IsZero() {
+		dueAt = time.Now().UTC()
+	} else {
+		dueAt = dueAt.UTC()
+	}
+	if freshSince.IsZero() {
+		freshSince = dueAt
+	} else {
+		freshSince = freshSince.UTC()
+	}
+
+	dueExpression := "file_health.scheduled_check_at <= ?"
+	freshExpression := "run.completed_at > ?"
+	if !r.dialect.IsPostgres() {
+		dueExpression = "datetime(file_health.scheduled_check_at) <= datetime(?)"
+		freshExpression = "datetime(run.completed_at) > datetime(?)"
+	}
+	query := fileHealthSelectColumns + fmt.Sprintf(`
+		WHERE (
+		  EXISTS (
+		    SELECT 1 FROM health_file_revisions revision
+		    WHERE revision.file_health_id = file_health.id AND revision.active = TRUE
+		  )
+		  OR NULLIF(TRIM(file_health.source_nzb_path), '') IS NOT NULL
+		  OR file_health.release_date IS NOT NULL
+		  OR NULLIF(TRIM(file_health.library_path), '') IS NOT NULL
+		  OR file_health.metadata IS NOT NULL
+		)
+		AND (
+		  (file_health.scheduled_check_at IS NOT NULL AND %s)
+		  OR (
+		    file_health.scheduled_check_at IS NULL
+		    AND NOT EXISTS (
+		      SELECT 1
+		      FROM health_runs run
+		      JOIN health_file_revisions revision ON revision.id = run.file_revision_id
+		      WHERE revision.file_health_id = file_health.id
+		        AND revision.active = TRUE
+		        AND run.mode = 'observation' AND run.trigger <> 'import'
+		        AND run.status = 'completed' AND %s
+		    )
+		  )
+		)
+		AND NOT EXISTS (
+		  SELECT 1
+		  FROM health_run_schedule schedule
+		  JOIN health_runs run ON run.id = schedule.run_id
+		  JOIN health_file_revisions revision ON revision.id = run.file_revision_id
+		  WHERE revision.file_health_id = file_health.id
+		    AND revision.active = TRUE AND schedule.active = TRUE
+		    AND run.trigger = 'manual'
+		)
+		ORDER BY file_health.priority DESC,
+		         CASE WHEN file_health.scheduled_check_at IS NULL THEN 0 ELSE 1 END,
+		         file_health.scheduled_check_at ASC,
+		         file_health.id ASC
+		LIMIT ?
+	`, dueExpression, freshExpression)
+	dueArg := any(dueAt)
+	freshArg := any(freshSince)
+	if !r.dialect.IsPostgres() {
+		dueArg = dueAt.Format("2006-01-02 15:04:05")
+		freshArg = freshSince.Format("2006-01-02 15:04:05")
+	}
+	rows, err := r.db.QueryContext(ctx, query, dueArg, freshArg, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list files due for observation: %w", err)
+	}
+	defer rows.Close()
+
+	files := make([]*FileHealth, 0, limit)
+	for rows.Next() {
+		file, err := scanFileHealth(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan file due for observation: %w", err)
+		}
+		files = append(files, file)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate files due for observation: %w", err)
+	}
 	return files, nil
 }
 
@@ -1292,6 +1392,41 @@ func (r *HealthRepository) DeferScheduledHealthCheck(ctx context.Context, filePa
 	return nil
 }
 
+// DeferObservationDiscoveryFailure applies a short, non-destructive backoff
+// after metadata/revision preparation fails. The due-at predicate prevents an
+// older scheduler pass from overwriting a newer schedule decision, and no
+// health, retry, repair, or error field is projected from discovery failure.
+func (r *HealthRepository) DeferObservationDiscoveryFailure(
+	ctx context.Context,
+	fileHealthID int64,
+	dueAt time.Time,
+	retryAt time.Time,
+) error {
+	if fileHealthID <= 0 || dueAt.IsZero() || retryAt.IsZero() || !retryAt.After(dueAt) {
+		return fmt.Errorf("positive file ID and ordered discovery backoff times are required")
+	}
+	dueAt = dueAt.UTC()
+	retryAt = retryAt.UTC()
+	dueExpression := "scheduled_check_at <= ?"
+	if !r.dialect.IsPostgres() {
+		dueExpression = "datetime(scheduled_check_at) <= datetime(?)"
+	}
+	query := fmt.Sprintf(`
+		UPDATE file_health
+		SET scheduled_check_at = ?, updated_at = ?
+		WHERE id = ?
+		  AND (scheduled_check_at IS NULL OR %s)
+	`, dueExpression)
+	result, err := r.db.ExecContext(ctx, query, retryAt, dueAt, fileHealthID, dueAt)
+	if err != nil {
+		return fmt.Errorf("defer observation discovery failure: %w", err)
+	}
+	if _, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("read observation discovery deferral result: %w", err)
+	}
+	return nil
+}
+
 // MarkAsHealthy marks a file as healthy and clears all retry/error state
 func (r *HealthRepository) MarkAsHealthy(ctx context.Context, filePath string, nextCheckTime time.Time) error {
 	query := `
@@ -1651,6 +1786,82 @@ type AutomaticHealthCheckRecord struct {
 	Status           HealthStatus
 	MaxRetries       int
 	MaxRepairRetries int
+}
+
+// BatchUpsertObservationDiscoveries records files found by the PR5 observation
+// discovery pass without claiming that a provider check occurred. New files are
+// pending and scheduled for real work; rediscovery only refreshes descriptive
+// metadata and configured retry ceilings. In particular, it must not overwrite
+// health state, prior attempt evidence, retry counters, or an existing schedule.
+func (r *HealthRepository) BatchUpsertObservationDiscoveries(ctx context.Context, records []AutomaticHealthCheckRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	// Validate the entire request before writing any batch so an invalid record
+	// cannot leave a partially applied discovery pass.
+	for i, record := range records {
+		if normalizeHealthPath(record.FilePath) == "" {
+			return fmt.Errorf("observation discovery record %d has an empty file path", i)
+		}
+		if record.ScheduledCheckAt == nil {
+			return fmt.Errorf("observation discovery record %d has no scheduled check", i)
+		}
+	}
+
+	// Seven bind parameters per record keeps each SQLite statement below the
+	// conventional 999-parameter limit.
+	const batchSize = 140
+	for i := 0; i < len(records); i += batchSize {
+		end := min(i+batchSize, len(records))
+		if err := r.batchUpsertObservationDiscoveries(ctx, records[i:end]); err != nil {
+			return fmt.Errorf("failed to upsert observation discovery batch starting at index %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func (r *HealthRepository) batchUpsertObservationDiscoveries(ctx context.Context, records []AutomaticHealthCheckRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	valueStrings := make([]string, len(records))
+	args := make([]any, 0, len(records)*7)
+	for i, record := range records {
+		valueStrings[i] = "(?, ?, 'pending', NULL, 0, ?, 0, ?, ?, ?, ?, datetime('now'), datetime('now'))"
+		var releaseDateStr any
+		if record.ReleaseDate != nil {
+			releaseDateStr = record.ReleaseDate.UTC().Format("2006-01-02 15:04:05")
+		}
+		scheduledCheckAtStr := record.ScheduledCheckAt.UTC().Format("2006-01-02 15:04:05")
+		args = append(args,
+			normalizeHealthPath(record.FilePath), record.LibraryPath,
+			record.MaxRetries, record.MaxRepairRetries, record.SourceNzbPath,
+			releaseDateStr, scheduledCheckAtStr,
+		)
+	}
+
+	query := fmt.Sprintf(`
+		INSERT INTO file_health (
+			file_path, library_path, status, last_checked, retry_count, max_retries,
+			repair_retry_count, max_repair_retries, source_nzb_path,
+			release_date, scheduled_check_at, created_at, updated_at
+		)
+		VALUES %s
+		ON CONFLICT(file_path) DO UPDATE SET
+			library_path = COALESCE(excluded.library_path, library_path),
+			source_nzb_path = COALESCE(excluded.source_nzb_path, source_nzb_path),
+			release_date = COALESCE(excluded.release_date, release_date),
+			max_retries = excluded.max_retries,
+			max_repair_retries = excluded.max_repair_retries,
+			updated_at = datetime('now')
+	`, strings.Join(valueStrings, ","))
+
+	if _, err := r.db.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("failed to batch upsert observation discoveries: %w", err)
+	}
+	return nil
 }
 
 // BatchAddAutomaticHealthChecks inserts multiple automatic health checks efficiently

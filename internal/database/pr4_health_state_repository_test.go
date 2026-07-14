@@ -443,8 +443,6 @@ func TestPR4OlderCrossRunObservationCannotOverwriteNewerProviderState(t *testing
 	require.NoError(t, err)
 	newerLease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "newer-worker", 10*time.Minute)
 	require.NoError(t, err)
-	olderLease, err := f.repo.AcquireRunLease(ctx, otherRun.ID, "older-worker", 10*time.Minute)
-	require.NoError(t, err)
 
 	newer := HealthChunkCommit{
 		ChunkID: "newer-corrupt", RunID: f.run.ID, LeaseOwner: "newer-worker", FencingToken: newerLease.FencingToken,
@@ -457,6 +455,11 @@ func TestPR4OlderCrossRunObservationCannotOverwriteNewerProviderState(t *testing
 		CommittedAt: f.now.Add(2 * time.Minute),
 	}
 	_, err = f.repo.CommitHealthChunk(ctx, newer)
+	require.NoError(t, err)
+	require.NoError(t, f.repo.CompleteHealthRun(
+		ctx, f.run.ID, "newer-worker", newerLease.FencingToken, newer.CommittedAt,
+	))
+	olderLease, err := f.repo.AcquireRunLease(ctx, otherRun.ID, "older-worker", 10*time.Minute)
 	require.NoError(t, err)
 
 	older := HealthChunkCommit{
@@ -492,8 +495,6 @@ func TestPR4OlderNegativeCannotReappearAfterNewerValidatedBody(t *testing.T) {
 	require.NoError(t, err)
 	newerLease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "newer-worker", 10*time.Minute)
 	require.NoError(t, err)
-	olderLease, err := f.repo.AcquireRunLease(ctx, otherRun.ID, "older-worker", 10*time.Minute)
-	require.NoError(t, err)
 
 	newer := HealthChunkCommit{
 		ChunkID: "newer-valid-body", RunID: f.run.ID, LeaseOwner: "newer-worker", FencingToken: newerLease.FencingToken,
@@ -506,6 +507,11 @@ func TestPR4OlderNegativeCannotReappearAfterNewerValidatedBody(t *testing.T) {
 		CommittedAt: f.now.Add(2 * time.Minute),
 	}
 	_, err = f.repo.CommitHealthChunk(ctx, newer)
+	require.NoError(t, err)
+	require.NoError(t, f.repo.CompleteHealthRun(
+		ctx, f.run.ID, "newer-worker", newerLease.FencingToken, newer.CommittedAt,
+	))
+	olderLease, err := f.repo.AcquireRunLease(ctx, otherRun.ID, "older-worker", 10*time.Minute)
 	require.NoError(t, err)
 
 	older := HealthChunkCommit{
@@ -779,6 +785,9 @@ func TestPR4GapCausesAndSyntheticCacheStateAreDurable(t *testing.T) {
 			},
 		})
 		require.NoError(t, commitErr)
+		require.NoError(t, f.repo.CompleteHealthRun(
+			ctx, run.ID, *lease.LeaseOwner, lease.FencingToken, at,
+		))
 	}
 	commitCorruptWave("durable-corrupt-gap-first", "durable_corrupt_first", f.now)
 	commitCorruptWave("durable-corrupt-gap-second", "durable_corrupt_second", f.now.Add(10*time.Minute))

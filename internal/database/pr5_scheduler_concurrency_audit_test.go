@@ -75,7 +75,8 @@ func newPR5SchedulerConcurrencyFixture(
 	t.Cleanup(func() {
 		q := newDialectAwareDB(db.Connection(), dialect)
 		_, cleanupErr := q.ExecContext(context.Background(),
-			`DELETE FROM file_health WHERE file_path = ?`, filePath)
+			`DELETE FROM file_health WHERE file_path = ? OR file_path LIKE ?`,
+			filePath, filePath+"-%")
 		assert.NoError(t, cleanupErr)
 		_, cleanupErr = q.ExecContext(context.Background(),
 			`DELETE FROM health_provider_snapshots WHERE id = ?`, snapshotID)
@@ -275,13 +276,26 @@ func runPR5ConcurrentDistinctDueClaims(t *testing.T, dialect Dialect) {
 	const workers = 6
 	ctx := context.Background()
 	for i := 0; i < workers; i++ {
+		revision := fixture.revision
+		if i > 0 {
+			var err error
+			revision, err = fixture.repo.EnsureFileRevision(ctx, FileRevisionSpec{
+				FilePath:          fmt.Sprintf("%s-%02d", fixture.filePath, i),
+				LayoutFingerprint: fmt.Sprintf("sha256:pr5-claim-%s-%02d", fixture.token, i),
+				VirtualSize:       3200, SegmentCount: 32,
+			})
+			require.NoError(t, err)
+		}
+		spec := fixture.scheduleSpec(
+			fmt.Sprintf("pr5-claim-%s-%02d", fixture.token, i),
+			fmt.Sprintf("pr5-claim-dedupe-%s-%02d", fixture.token, i),
+			"concurrent_claim_audit",
+			HealthRunPriorityNormal,
+		)
+		spec.Run.FileRevisionID = revision.ID
+		spec.Run.TotalSegments = revision.SegmentCount
 		_, created, err := fixture.repo.EnsureScheduledHealthRun(ctx,
-			fixture.scheduleSpec(
-				fmt.Sprintf("pr5-claim-%s-%02d", fixture.token, i),
-				fmt.Sprintf("pr5-claim-dedupe-%s-%02d", fixture.token, i),
-				"concurrent_claim_audit",
-				HealthRunPriorityNormal,
-			))
+			spec)
 		require.NoError(t, err)
 		require.True(t, created)
 	}
@@ -326,4 +340,101 @@ func TestPR5SQLiteConcurrentWorkersClaimDistinctDueRuns(t *testing.T) {
 
 func TestPR5PostgresConcurrentWorkersClaimDistinctDueRuns(t *testing.T) {
 	runPR5ConcurrentDistinctDueClaims(t, DialectPostgres)
+}
+
+func runPR5ConcurrentSameRevisionClaims(t *testing.T, dialect Dialect) {
+	t.Helper()
+	fixture := newPR5SchedulerConcurrencyFixture(t, dialect)
+	ctx := context.Background()
+	for _, suffix := range []string{"first", "second"} {
+		id := "same-revision-" + fixture.token + "-" + suffix
+		_, created, err := fixture.repo.EnsureScheduledHealthRun(
+			ctx, fixture.scheduleSpec(id, id, "ordinary", HealthRunPriorityNormal),
+		)
+		require.NoError(t, err)
+		require.True(t, created)
+	}
+
+	type claimResult struct {
+		owner string
+		run   *HealthRun
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan claimResult, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for _, suffix := range []string{"a", "b"} {
+		owner := "same-revision-worker-" + fixture.token + "-" + suffix
+		go func() {
+			ready.Done()
+			<-start
+			run, err := fixture.repo.ClaimDueObservationHealthRun(ctx, owner, time.Minute)
+			results <- claimResult{owner: owner, run: run, err: err}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	claimed := make([]claimResult, 0, 1)
+	for range 2 {
+		result := <-results
+		require.NoError(t, result.err)
+		if result.run != nil {
+			claimed = append(claimed, result)
+		}
+	}
+	require.Len(t, claimed, 1,
+		"separate workers must not lease two schedules for one active revision")
+	require.NoError(t, fixture.repo.CompleteHealthRun(
+		ctx, claimed[0].run.ID, claimed[0].owner,
+		claimed[0].run.FencingToken, fixture.now,
+	))
+	next, err := fixture.repo.ClaimDueObservationHealthRun(
+		ctx, "same-revision-worker-"+fixture.token+"-c", time.Minute,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, next,
+		"the pending sibling becomes claimable after the active run retires")
+	assert.NotEqual(t, claimed[0].run.ID, next.ID)
+}
+
+func TestPR5PostgresConcurrentWorkersSerializeClaimsPerActiveRevision(t *testing.T) {
+	runPR5ConcurrentSameRevisionClaims(t, DialectPostgres)
+}
+
+func runPR5DirectSameRevisionLeaseFence(t *testing.T, dialect Dialect) {
+	t.Helper()
+	fixture := newPR5SchedulerConcurrencyFixture(t, dialect)
+	ctx := context.Background()
+	create := func(suffix string) *HealthRun {
+		t.Helper()
+		run, err := fixture.repo.CreateHealthRun(ctx, HealthRunSpec{
+			ID:             "direct-revision-" + fixture.token + "-" + suffix,
+			FileRevisionID: fixture.revision.ID, ProviderSnapshotID: fixture.snapshotID,
+			Trigger: "import", Mode: "observation",
+			TotalSegments: fixture.revision.SegmentCount, CreatedAt: fixture.now,
+		})
+		require.NoError(t, err)
+		return run
+	}
+	first := create("owner")
+	second := create("contender")
+	owner := "direct-owner-" + fixture.token
+	contender := "direct-contender-" + fixture.token
+	lease, err := fixture.repo.AcquireRunLease(ctx, first.ID, owner, time.Minute)
+	require.NoError(t, err)
+	_, err = fixture.repo.AcquireRunLease(ctx, second.ID, contender, time.Minute)
+	require.ErrorIs(t, err, ErrStaleHealthLease,
+		"direct import admission must honor the same active-revision claim fence")
+	require.NoError(t, fixture.repo.CompleteHealthRun(
+		ctx, lease.ID, owner, lease.FencingToken, fixture.now,
+	))
+	next, err := fixture.repo.AcquireRunLease(ctx, second.ID, contender, time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, next)
+	assert.Equal(t, second.ID, next.ID)
+}
+
+func TestPR5PostgresDirectLeaseAcquisitionCannotBypassActiveRevisionOwner(t *testing.T) {
+	runPR5DirectSameRevisionLeaseFence(t, DialectPostgres)
 }
