@@ -246,6 +246,178 @@ func runPR5Migration036GapCauseActivationBackfill(
 	cleanupPR5MigrationAuditFixture(t, ctx, db, dialect, fixture)
 }
 
+func insertPR5EpochOneObservationHistory(
+	t *testing.T,
+	ctx context.Context,
+	db *sql.DB,
+	dialect Dialect,
+	fixture pr5MigrationAuditFixture,
+) {
+	t.Helper()
+	q := newDialectAwareDB(db, dialect)
+	snapshotID := fixture.providerID + "-snapshot"
+	runID := fixture.providerID + "-run"
+	chunkID := fixture.providerID + "-chunk"
+
+	_, err := q.ExecContext(ctx, `
+		UPDATE health_providers
+		SET active = TRUE, activation_epoch = 1, activated_at = ?
+		WHERE id = ?
+	`, fixture.createdAt, fixture.providerID)
+	require.NoError(t, err)
+	_, err = q.ExecContext(ctx, `
+		INSERT INTO health_provider_snapshots (id, created_at) VALUES (?, ?)
+	`, snapshotID, fixture.createdAt)
+	require.NoError(t, err)
+	_, err = q.ExecContext(ctx, `
+		INSERT INTO health_provider_snapshot_entries
+			(snapshot_id, provider_id, provider_generation,
+			 provider_activation_epoch, role, configured_order)
+		VALUES (?, ?, 1, 1, 'primary', 0)
+	`, snapshotID, fixture.providerID)
+	require.NoError(t, err)
+	_, err = q.ExecContext(ctx, `
+		INSERT INTO health_runs
+			(id, file_revision_id, provider_snapshot_id, trigger, mode, status,
+			 total_segments, created_at, updated_at)
+		VALUES (?, ?, ?, 'migration_audit', 'observation', 'completed', 10, ?, ?)
+	`, runID, fixture.revisionID, snapshotID, fixture.createdAt, fixture.createdAt)
+	require.NoError(t, err)
+	_, err = q.ExecContext(ctx, `
+		INSERT INTO health_run_chunks
+			(id, run_id, provider_id, provider_generation, provider_activation_epoch,
+			 stage, observation_kind, segment_start, segment_count,
+			 tested_bitmap, present_bitmap, absent_bitmap, corrupt_bitmap,
+			 temporary_bitmap, inconclusive_bitmap, resolved_bitmap,
+			 commit_digest, fencing_token, committed_at)
+		VALUES (?, ?, ?, 1, 1, 'provider_scan', 'stat', 2, 1,
+			 ?, ?, ?, ?, ?, ?, ?, 'migration-audit-digest', 1, ?)
+	`, chunkID, runID, fixture.providerID,
+		[]byte{1}, []byte{0}, []byte{1}, []byte{0}, []byte{0}, []byte{0}, []byte{1},
+		fixture.createdAt)
+	require.NoError(t, err)
+	_, err = q.ExecContext(ctx, `
+		INSERT INTO health_provider_coverage
+			(id, file_revision_id, provider_id, provider_generation,
+			 provider_activation_epoch, observation_kind, segment_start,
+			 segment_count, tested_bitmap, present_bitmap, resolved_bitmap,
+			 source_chunk_id, observed_at)
+		VALUES (?, ?, ?, 1, 1, 'stat', 2, 1, ?, ?, ?, ?, ?)
+	`, fixture.providerID+"-coverage", fixture.revisionID, fixture.providerID,
+		[]byte{1}, []byte{0}, []byte{1}, chunkID, fixture.createdAt)
+	require.NoError(t, err)
+	_, err = q.ExecContext(ctx, `
+		INSERT INTO health_segment_exceptions
+			(file_revision_id, provider_id, provider_generation,
+			 provider_activation_epoch, segment_index, outcome,
+			 source_chunk_id, observed_at)
+		VALUES (?, ?, 1, 1, 2, 'hard_absence', ?, ?)
+	`, fixture.revisionID, fixture.providerID, chunkID, fixture.createdAt)
+	require.NoError(t, err)
+	_, err = q.ExecContext(ctx, `
+		INSERT INTO health_confirmation_events
+			(idempotency_key, source_chunk_id, file_revision_id, provider_id,
+			 provider_generation, provider_activation_epoch, segment_index,
+			 cause, observed_at)
+		VALUES (?, ?, ?, ?, 1, 1, 2, 'absent', ?)
+	`, fixture.providerID+"-confirmation", chunkID, fixture.revisionID,
+		fixture.providerID, fixture.createdAt)
+	require.NoError(t, err)
+
+	_, err = q.ExecContext(ctx, `
+		UPDATE health_providers
+		SET activation_epoch = 2, activated_at = ?
+		WHERE id = ?
+	`, fixture.createdAt.Add(time.Hour), fixture.providerID)
+	require.NoError(t, err)
+}
+
+func runPR5Migration036ActivationEpochRoundTrip(
+	t *testing.T,
+	db *sql.DB,
+	dialect Dialect,
+) {
+	t.Helper()
+	ctx := context.Background()
+	directory := setPR5GooseDialect(t, dialect)
+	fixture := newPR5MigrationAuditFixture()
+
+	require.NoError(t, goose.DownToContext(ctx, db, directory, 35))
+	insertPopulatedPR4MigrationFixture(t, ctx, db, dialect, &fixture)
+	require.NoError(t, goose.UpContext(ctx, db, directory))
+	insertPR5EpochOneObservationHistory(t, ctx, db, dialect, fixture)
+
+	// The PR4 schema cannot represent activation epochs. A downgrade must leave
+	// retained epoch-one history structurally older than the provider identity
+	// that becomes current after the subsequent PR5 upgrade.
+	require.NoError(t, goose.DownToContext(ctx, db, directory, 35))
+	require.NoError(t, goose.UpContext(ctx, db, directory))
+
+	q := newDialectAwareDB(db, dialect)
+	var currentGeneration, currentActivationEpoch int64
+	require.NoError(t, q.QueryRowContext(ctx, `
+		SELECT current_generation, activation_epoch
+		FROM health_providers WHERE id = ?
+	`, fixture.providerID).Scan(&currentGeneration, &currentActivationEpoch))
+	assert.Equal(t, int64(2), currentGeneration,
+		"downgrading an epoch-two provider must conservatively advance its representable identity")
+	assert.Equal(t, int64(1), currentActivationEpoch,
+		"a re-upgrade begins the replacement generation at its first activation epoch")
+
+	rows, err := q.QueryContext(ctx, `
+		SELECT evidence.kind, COUNT(*),
+		       SUM(CASE
+		           WHEN evidence.provider_generation = provider.current_generation
+		            AND evidence.provider_activation_epoch = provider.activation_epoch
+		           THEN 1 ELSE 0 END)
+		FROM (
+			SELECT 'coverage' AS kind, provider_id, provider_generation,
+			       provider_activation_epoch
+			FROM health_provider_coverage
+			UNION ALL
+			SELECT 'absence', provider_id, provider_generation,
+			       provider_activation_epoch
+			FROM health_segment_exceptions
+			UNION ALL
+			SELECT 'confirmation', provider_id, provider_generation,
+			       provider_activation_epoch
+			FROM health_confirmation_events
+			UNION ALL
+			SELECT 'gap_cause', provider_id, provider_generation,
+			       provider_activation_epoch
+			FROM health_gap_provider_causes
+		) evidence
+		JOIN health_providers provider ON provider.id = evidence.provider_id
+		WHERE evidence.provider_id = ?
+		GROUP BY evidence.kind
+	`, fixture.providerID)
+	require.NoError(t, err)
+	defer rows.Close()
+	seenKinds := make(map[string]struct{})
+	for rows.Next() {
+		var kind string
+		var retained, current int
+		require.NoError(t, rows.Scan(&kind, &retained, &current))
+		seenKinds[kind] = struct{}{}
+		assert.Equal(t, 1, retained, kind+" epoch-one history should remain auditable")
+		assert.Zero(t, current, kind+" epoch-one history must not become current again")
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, map[string]struct{}{
+		"coverage": {}, "absence": {}, "confirmation": {}, "gap_cause": {},
+	}, seenKinds)
+
+	_, err = q.ExecContext(ctx, `
+		DELETE FROM health_provider_snapshot_entries WHERE provider_id = ?
+	`, fixture.providerID)
+	require.NoError(t, err)
+	cleanupPR5MigrationAuditFixture(t, ctx, db, dialect, fixture)
+	_, err = q.ExecContext(ctx, `
+		DELETE FROM health_provider_snapshots WHERE id = ?
+	`, fixture.providerID+"-snapshot")
+	require.NoError(t, err)
+}
+
 func TestPR5SQLiteMigration036PreservesUnrecoveredSyntheticHistoryAcrossEpisodes(t *testing.T) {
 	db, err := NewDB(Config{
 		Type:         "sqlite",
@@ -286,6 +458,27 @@ func TestPR5PostgresMigration036BackfillsGapCauseActivationIdentity(t *testing.T
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	runPR5Migration036GapCauseActivationBackfill(t, db.Connection(), DialectPostgres)
+}
+
+func TestPR5SQLiteMigration036RoundTripDoesNotReactivateOlderProviderEvidence(t *testing.T) {
+	db, err := NewDB(Config{
+		Type:         "sqlite",
+		DatabasePath: filepath.Join(t.TempDir(), "migration-036-epoch-roundtrip.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	runPR5Migration036ActivationEpochRoundTrip(t, db.Connection(), DialectSQLite)
+}
+
+func TestPR5PostgresMigration036RoundTripDoesNotReactivateOlderProviderEvidence(t *testing.T) {
+	dsn := os.Getenv("ALTMOUNT_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("ALTMOUNT_TEST_POSTGRES_DSN is not configured")
+	}
+	db, err := NewDB(Config{Type: "postgres", DSN: dsn})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	runPR5Migration036ActivationEpochRoundTrip(t, db.Connection(), DialectPostgres)
 }
 
 func normalizedSchemaSQL(value string) string {
@@ -427,7 +620,10 @@ func pr5IndexDefinition(
 			SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?
 		`, name).Scan(&definition))
 	}
-	return normalizedSchemaSQL(definition)
+	// PostgreSQL renders partial predicates with one cosmetic parenthesis pair
+	// after WHERE, unlike SQLite. Normalize only that representation so table
+	// and foreign-key parentheses remain available to the schema assertions.
+	return strings.Replace(normalizedSchemaSQL(definition), "where(", "where", 1)
 }
 
 func requirePR5Migration036CriticalSchemaParity(
