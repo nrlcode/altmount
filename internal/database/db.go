@@ -46,7 +46,7 @@ func NewDB(config Config) (*DB, error) {
 
 // newSQLiteDB opens a SQLite database with queue-optimized settings.
 func newSQLiteDB(config Config) (*DB, error) {
-	connString := fmt.Sprintf("%s?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-32000&_temp_store=MEMORY&_busy_timeout=30000",
+	connString := fmt.Sprintf("%s?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-32000&_temp_store=MEMORY&_busy_timeout=30000&_foreign_keys=on",
 		config.DatabasePath)
 
 	conn, err := sql.Open("sqlite3", connString)
