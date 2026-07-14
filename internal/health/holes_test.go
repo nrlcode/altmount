@@ -13,6 +13,7 @@ import (
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/testsupport/fakepool"
+	"github.com/javi11/altmount/internal/usenet"
 	"github.com/javi11/nntppool/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -127,10 +128,11 @@ func TestHealthCheckClassifiesSmallHoleAsDegraded(t *testing.T) {
 	require.NotNil(t, details.PlaybackImpact)
 	assert.Equal(t, holes.VerdictDegraded, details.PlaybackImpact.Verdict)
 
-	// Degraded holes are persisted so playback can pre-pad them.
+	// PR3 quarantines the legacy .meta hole field. A single health sweep must
+	// not populate it and thereby authorize replay pre-padding.
 	meta, err := env.ms.ReadFileMetadata(env.filePath)
 	require.NoError(t, err)
-	assert.NotEmpty(t, meta.KnownHoles, "degraded holes should be persisted")
+	assert.Empty(t, meta.KnownHoles, "health results must not create .meta padding authority")
 }
 
 func TestHealthCheckClassifiesLongRunAsFailed(t *testing.T) {
@@ -172,7 +174,7 @@ func TestHealthCheckSkipsClassificationForEncrypted(t *testing.T) {
 	assert.Nil(t, event.Classification, "encrypted files are not hole-classified")
 }
 
-func TestHealthCheckMergesPersistedHoles(t *testing.T) {
+func TestHealthCheckIgnoresLegacyPersistedHoles(t *testing.T) {
 	env := newHoleTestEnv(t, "movie.mp4", 4*1024*1024, 1024)
 	// Seed a persisted hole (as if playback padded it earlier).
 	require.NoError(t, env.ms.AddKnownHoles(env.filePath, []holes.Run{{Start: 5, Count: 1}}))
@@ -183,6 +185,32 @@ func TestHealthCheckMergesPersistedHoles(t *testing.T) {
 	require.Equal(t, EventTypeFileCorrupted, event.Type)
 	require.NotNil(t, event.Classification)
 	assert.Equal(t, holes.VerdictDegraded, event.Classification.Verdict)
-	// Persisted hole (5) + newly observed (20) both counted.
-	assert.Equal(t, 2, event.Classification.TotalMissing)
+	// The legacy .meta hole is unverified and must not influence the verdict.
+	assert.Equal(t, 1, event.Classification.TotalMissing)
+}
+
+func TestHealthClassificationUsesCompletePositionalMissingSet(t *testing.T) {
+	env := newHoleTestEnv(t, "movie.mp4", 4*1024*1024, 1024)
+
+	// Seventy isolated misses exceed the total-segment cap. Only the first 50
+	// are retained as display examples; those 50 alone remain within every cap.
+	missing := make([]usenet.MissingSegment, 0, 70)
+	examples := make([]string, 0, 50)
+	for i := range 70 {
+		idx := i * 10
+		missing = append(missing, usenet.MissingSegment{Index: idx, ID: env.segIDs[idx]})
+		if i < 50 {
+			examples = append(examples, env.segIDs[idx])
+		}
+	}
+
+	impact := env.checker.classifyHoles(context.Background(), env.filePath, usenet.ValidationResult{
+		TotalChecked:    len(env.segIDs),
+		MissingCount:    len(missing),
+		MissingIDs:      examples,
+		MissingSegments: missing,
+	})
+	require.NotNil(t, impact)
+	assert.Equal(t, holes.VerdictFailed, impact.Verdict)
+	assert.Equal(t, 70, impact.TotalMissing)
 }

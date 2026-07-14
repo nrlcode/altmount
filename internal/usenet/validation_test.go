@@ -85,10 +85,11 @@ func TestSelectSegmentsForValidation(t *testing.T) {
 	})
 }
 
-// TestValidateSegmentAvailabilityDetailed_MissingSegmentEmitsDebugLog verifies
-// the same for the non-fail-fast detailed path.
+// TestValidateSegmentAvailabilityDetailed_MissingSegmentDoesNotLogRawID keeps
+// provider article identifiers out of retained logs. Aggregate counts and the
+// error class are sufficient diagnostics.
 // NOT parallel: we replace the global slog default.
-func TestValidateSegmentAvailabilityDetailed_MissingSegmentEmitsDebugLog(t *testing.T) {
+func TestValidateSegmentAvailabilityDetailed_MissingSegmentDoesNotLogRawID(t *testing.T) {
 	const segID = "missing-detailed@host"
 
 	var mu sync.Mutex
@@ -127,13 +128,11 @@ func TestValidateSegmentAvailabilityDetailed_MissingSegmentEmitsDebugLog(t *test
 
 	mu.Lock()
 	defer mu.Unlock()
-	found := false
 	for _, r := range captured {
-		if r.msg == "missing segment" && r.segID == segID {
-			found = true
+		if r.segID == segID {
+			t.Fatalf("raw segment ID leaked in log record %q", r.msg)
 		}
 	}
-	assert.True(t, found, "expected 'missing segment' debug log for segment_id=%q, got: %+v", segID, captured)
 }
 
 // TestValidateSegmentAvailabilityDetailed_MissingSegmentByteRanges verifies
@@ -177,9 +176,9 @@ func TestValidateSegmentAvailabilityDetailed_MissingSegmentByteRanges(t *testing
 	assert.ElementsMatch(t, []string{"seg0@host", "seg7@host"}, result.MissingIDs)
 }
 
-// TestValidateSegmentAvailabilityDetailed_MissingSegmentsCap verifies the
-// 50-entry cap holds while MissingCount reports the true total.
-func TestValidateSegmentAvailabilityDetailed_MissingSegmentsCap(t *testing.T) {
+// TestValidateSegmentAvailabilityDetailed_MissingExamplesCap verifies only
+// display examples are capped; classification retains every missing position.
+func TestValidateSegmentAvailabilityDetailed_MissingExamplesCap(t *testing.T) {
 	fp := fakepool.New()
 	mgr := &validationTestPoolManager{client: fp}
 
@@ -194,7 +193,7 @@ func TestValidateSegmentAvailabilityDetailed_MissingSegmentsCap(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 60, result.MissingCount)
 	assert.Len(t, result.MissingIDs, 50)
-	assert.Len(t, result.MissingSegments, 50)
+	assert.Len(t, result.MissingSegments, 60)
 }
 
 // validationTestPoolManager is a minimal pool.Manager for validation tests.

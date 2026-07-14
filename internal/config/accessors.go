@@ -83,6 +83,16 @@ func (c *Config) GetCheckAllSegments() bool {
 	return *c.Health.CheckAllSegments
 }
 
+// GetPauseHealthDuringPlayback gates the temporary PR3 admission safeguard.
+// It defaults on and pauses only new ordinary health sweeps; PR6 replaces it
+// with adaptive admission and recovery-aware routing.
+func (c *Config) GetPauseHealthDuringPlayback() bool {
+	if c.Health.PauseDuringPlayback == nil {
+		return true
+	}
+	return *c.Health.PauseDuringPlayback
+}
+
 // GetHealthReadTimeout returns the health check read timeout as a duration with a default fallback.
 func (c *Config) GetHealthReadTimeout() time.Duration {
 	if c.Health.ReadTimeoutSeconds <= 0 {

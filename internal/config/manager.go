@@ -359,6 +359,7 @@ type HealthConfig struct {
 	ResolveRepairOnImport               *bool        `yaml:"resolve_repair_on_import" mapstructure:"resolve_repair_on_import" json:"resolve_repair_on_import,omitempty"`
 	VerifyData                          *bool        `yaml:"verify_data" mapstructure:"verify_data" json:"verify_data,omitempty"`
 	CheckAllSegments                    *bool        `yaml:"check_all_segments" mapstructure:"check_all_segments" json:"check_all_segments,omitempty"`
+	PauseDuringPlayback                 *bool        `yaml:"pause_during_playback" mapstructure:"pause_during_playback" json:"pause_during_playback,omitempty"`
 	ReadTimeoutSeconds                  int          `yaml:"read_timeout_seconds" mapstructure:"read_timeout_seconds" json:"read_timeout_seconds,omitempty"`
 	AcceptableMissingSegmentsPercentage float64      `yaml:"acceptable_missing_segments_percentage" mapstructure:"acceptable_missing_segments_percentage" json:"acceptable_missing_segments_percentage"`
 	Repair                              RepairConfig `yaml:"repair" mapstructure:"repair" json:"repair"`
@@ -902,7 +903,15 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Validate each provider
+	// Validate each provider and the exact identities passed to nntppool. Keep
+	// non-empty config IDs unique even while disabled so map-based diffs and a
+	// later enable cannot become ambiguous. Legacy empty IDs remain supported;
+	// enabled providers then use nntppool's endpoint/account fallback identity.
+	configuredIDs := make(map[string]int, len(c.Providers))
+	enabledPoolNames := make(map[string]int, len(c.Providers))
+	enabledTransportIDs := make(map[string]int, len(c.Providers))
+	enabledProviders := 0
+	enabledPrimaries := 0
 	for i, provider := range c.Providers {
 		if provider.Host == "" {
 			return fmt.Errorf("provider %d: host cannot be empty", i)
@@ -919,6 +928,40 @@ func (c *Config) Validate() error {
 		if provider.StatInflightRequests <= 0 {
 			c.Providers[i].StatInflightRequests = 100
 		}
+
+		if provider.ID != "" {
+			if previous, exists := configuredIDs[provider.ID]; exists {
+				return fmt.Errorf("provider %d: stable id duplicates provider %d", i, previous)
+			}
+			configuredIDs[provider.ID] = i
+		}
+
+		if provider.Enabled == nil || !*provider.Enabled {
+			continue
+		}
+		enabledProviders++
+
+		poolName := provider.NNTPPoolName()
+		if previous, exists := enabledPoolNames[poolName]; exists {
+			return fmt.Errorf("provider %d: enabled transport endpoint/account duplicates provider %d", i, previous)
+		}
+		enabledPoolNames[poolName] = i
+
+		transportID := provider.ID
+		if transportID == "" {
+			transportID = poolName
+		}
+		if previous, exists := enabledTransportIDs[transportID]; exists {
+			return fmt.Errorf("provider %d: effective transport id duplicates provider %d", i, previous)
+		}
+		enabledTransportIDs[transportID] = i
+
+		if provider.IsBackupProvider == nil || !*provider.IsBackupProvider {
+			enabledPrimaries++
+		}
+	}
+	if enabledProviders > 0 && enabledPrimaries == 0 {
+		return fmt.Errorf("at least one enabled non-backup provider is required")
 	}
 
 	// Validate Fuse configuration
@@ -1035,6 +1078,7 @@ func (p *ProviderConfig) ToNNTPProvider() nntppool.Provider {
 	}
 
 	return nntppool.Provider{
+		ID:                p.ID,
 		Host:              host,
 		TLSConfig:         tlsCfg,
 		Auth:              nntppool.Auth{Username: p.Username, Password: p.Password},
@@ -1459,6 +1503,7 @@ func DefaultConfig(configDir ...string) *Config {
 	failureMaskingEnabled := false
 	repairEnabled := true
 	repairExponentialBackoff := true
+	pauseHealthDuringPlayback := true
 
 	// Set paths based on whether we're running in Docker or have a specific config directory
 	var dbPath, metadataPath, logPath, rclonePath, cachePath, backupPath string
@@ -1611,7 +1656,8 @@ func DefaultConfig(configDir ...string) *Config {
 			SegmentSamplePercentage:             5,                      // Default: 5% segment sampling
 			LibrarySyncIntervalMinutes:          360,                    // Default: sync every 6 hours
 			ResolveRepairOnImport:               &resolveRepairOnImport, // Enabled by default
-			AcceptableMissingSegmentsPercentage: 0,                      // Default: no missing segments allowed
+			PauseDuringPlayback:                 &pauseHealthDuringPlayback,
+			AcceptableMissingSegmentsPercentage: 0, // Default: no missing segments allowed
 			Repair: RepairConfig{
 				Enabled:            &repairEnabled,
 				IntervalMinutes:    60,

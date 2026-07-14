@@ -437,10 +437,9 @@ func (x *ClipBoundary) GetDelta_90K() int64 {
 	return 0
 }
 
-// HoleRun is a run of consecutive segments confirmed missing on every
-// provider (a "hole"). Persisted so streaming can zero-fill known holes
-// without a wasted network round-trip (replay pre-pad) and so health checks
-// accumulate damage across sweeps. Empty for undamaged files (zero overhead).
+// HoleRun is the legacy pre-PR3 persisted hole representation. Existing rows
+// are unverified and quarantined: they must not authorize padding or health
+// classification until the planned migration establishes durable evidence.
 type HoleRun struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	StartSegment  int64                  `protobuf:"varint,1,opt,name=start_segment,json=startSegment,proto3" json:"start_segment,omitempty"` // first missing segment index
@@ -532,7 +531,7 @@ type FileMetadata struct {
 	StoreRef           string                 `protobuf:"bytes,18,opt,name=store_ref,json=storeRef,proto3" json:"store_ref,omitempty"`          // id/path of the shared NzbStore
 	SegmentRefs        []*SegmentRef          `protobuf:"bytes,19,rep,name=segment_refs,json=segmentRefs,proto3" json:"segment_refs,omitempty"` // v3 replacement for segment_data
 	SegmentRuns        []*SegmentRun          `protobuf:"bytes,20,rep,name=segment_runs,json=segmentRuns,proto3" json:"segment_runs,omitempty"` // compact run encoding; preferred over segment_refs when present
-	KnownHoles         []*HoleRun             `protobuf:"bytes,21,rep,name=known_holes,json=knownHoles,proto3" json:"known_holes,omitempty"`    // segments confirmed missing on all providers (zero-filled during playback)
+	KnownHoles         []*HoleRun             `protobuf:"bytes,21,rep,name=known_holes,json=knownHoles,proto3" json:"known_holes,omitempty"`    // legacy unverified holes; quarantined pending migration
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }

@@ -122,8 +122,8 @@ func TestPrepareUpdateForResultDeleteOnCorruption(t *testing.T) {
 	require.NoError(t, env.metadataService.WriteFileMetadata(filePath, meta))
 
 	fh := database.FileHealth{
-		FilePath:  filePath,
-		Status:    database.HealthStatusPending,
+		FilePath:   filePath,
+		Status:     database.HealthStatusPending,
 		RetryCount: 99,
 	}
 	event := HealthEvent{
@@ -144,4 +144,31 @@ func TestPrepareUpdateForResultDeleteOnCorruption(t *testing.T) {
 	got, err := env.metadataService.ReadFileMetadata(filePath)
 	require.NoError(t, err)
 	assert.NotNil(t, got, "degraded file must not be deleted")
+}
+
+func TestPrepareUpdateForResultIncompleteNeverDeletesOrRepairs(t *testing.T) {
+	tempDir := t.TempDir()
+	env := newRepairTestEnv(t, tempDir, nil, func(c *config.Config) {
+		c.Health.CorruptionAction = "delete"
+	})
+
+	fh := database.FileHealth{
+		FilePath:   "/movies/incomplete.mp4",
+		Status:     database.HealthStatusPending,
+		RetryCount: 99,
+	}
+	event := HealthEvent{
+		Type:     EventTypeCheckFailed,
+		FilePath: fh.FilePath,
+		Status:   database.HealthStatusCorrupted,
+		Error:    context.DeadlineExceeded,
+	}
+
+	update, sideEffect := env.hw.prepareUpdateForResult(context.Background(), &fh, event)
+	assert.False(t, update.Skip, "incomplete checks must not enter delete-on-corruption")
+	assert.Equal(t, database.UpdateTypeRetry, update.Type)
+	assert.Equal(t, database.HealthStatusPending, update.Status)
+	require.NotNil(t, sideEffect)
+	require.NoError(t, sideEffect())
+	assert.Empty(t, env.mockARRs.calls, "incomplete checks must not trigger repair")
 }

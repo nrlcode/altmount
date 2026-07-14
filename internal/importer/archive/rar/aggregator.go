@@ -26,6 +26,7 @@ import (
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/progress"
+	"github.com/javi11/altmount/internal/usenet"
 )
 
 var (
@@ -182,7 +183,7 @@ func ProcessArchive(ctx context.Context, opts ProcessArchiveOptions) error {
 			continue
 		}
 		if r.err != nil {
-			if ctx.Err() != nil || errors.Is(r.err, context.Canceled) {
+			if ctx.Err() != nil || errors.Is(r.err, context.Canceled) || usenet.IsClassifiedNNTPError(r.err) {
 				return r.err
 			}
 			slog.ErrorContext(ctx, "Skipping RAR archive group after failed analysis",

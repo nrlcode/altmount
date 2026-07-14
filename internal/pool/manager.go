@@ -217,19 +217,19 @@ func (m *manager) SetProviders(providers []nntppool.Provider) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Shut down existing pool and metrics tracker if present
-	if m.pool != nil {
-		m.logger.InfoContext(m.ctx, "Shutting down existing NNTP connection pool")
+	// An empty provider list is an explicit clear operation. Tear down every
+	// lifecycle companion even if a prior partial state left no pool pointer.
+	if len(providers) == 0 {
+		m.stopQuotaWatcher()
 		if m.metricsTracker != nil {
 			m.metricsTracker.Stop()
 			m.metricsTracker = nil
 		}
-		m.pool.Close()
-		m.pool = nil
-	}
-
-	// Return early if no providers (clear pool scenario)
-	if len(providers) == 0 {
+		if m.pool != nil {
+			m.logger.InfoContext(m.ctx, "Shutting down existing NNTP connection pool")
+			m.pool.Close()
+			m.pool = nil
+		}
 		m.logger.InfoContext(m.ctx, "No NNTP providers configured - pool cleared")
 		return nil
 	}
@@ -237,20 +237,37 @@ func (m *manager) SetProviders(providers []nntppool.Provider) error {
 	// Restore quota state from DB before creating the pool
 	m.injectQuotaState(providers)
 
-	// Create new pool with providers
+	// Construct and validate the replacement before touching the working pool.
+	// nntppool can reject duplicate identities or an invalid primary/backup
+	// shape; those configuration errors must leave the existing transport live.
 	m.logger.InfoContext(m.ctx, "Creating NNTP connection pool", "provider_count", len(providers))
-	pool, err := nntppool.NewClient(m.ctx, providers)
+	replacement, err := nntppool.NewClient(
+		m.ctx,
+		providers,
+		nntppool.WithDispatchStrategy(nntppool.DispatchFIFO),
+		nntppool.WithStatProbe(false),
+		nntppool.WithProviderCircuitBreaker(true),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create NNTP connection pool: %w", err)
 	}
 
-	m.pool = pool
-
-	// Start metrics tracker
-	m.metricsTracker = NewMetricsTracker(pool, m.repo)
+	replacementMetrics := NewMetricsTracker(replacement, m.repo)
 	if m.providerIDMap != nil {
-		m.metricsTracker.SetProviderIDs(m.providerIDMap)
+		replacementMetrics.SetProviderIDs(m.providerIDMap)
 	}
+
+	// Replacement construction succeeded. Transfer ownership, then retire the
+	// previous pool and tracker exactly once.
+	if m.metricsTracker != nil {
+		m.metricsTracker.Stop()
+	}
+	if m.pool != nil {
+		m.logger.InfoContext(m.ctx, "Shutting down existing NNTP connection pool")
+		m.pool.Close()
+	}
+	m.pool = replacement
+	m.metricsTracker = replacementMetrics
 	m.metricsTracker.Start(m.ctx)
 
 	m.startQuotaWatcher()
@@ -264,13 +281,13 @@ func (m *manager) ClearPool() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.stopQuotaWatcher()
+	if m.metricsTracker != nil {
+		m.metricsTracker.Stop()
+		m.metricsTracker = nil
+	}
 	if m.pool != nil {
 		m.logger.InfoContext(m.ctx, "Clearing NNTP connection pool")
-		m.stopQuotaWatcher()
-		if m.metricsTracker != nil {
-			m.metricsTracker.Stop()
-			m.metricsTracker = nil
-		}
 		m.pool.Close()
 		m.pool = nil
 	}
@@ -398,7 +415,13 @@ func (m *manager) AddProvider(provider nntppool.Provider) error {
 	if m.pool == nil {
 		// No pool yet — create one with this single provider
 		m.logger.InfoContext(m.ctx, "Creating NNTP connection pool for first provider", "provider", provider.Host)
-		pool, err := nntppool.NewClient(m.ctx, []nntppool.Provider{provider}, nntppool.WithDispatchStrategy(nntppool.DispatchRoundRobin))
+		pool, err := nntppool.NewClient(
+			m.ctx,
+			[]nntppool.Provider{provider},
+			nntppool.WithDispatchStrategy(nntppool.DispatchFIFO),
+			nntppool.WithStatProbe(false),
+			nntppool.WithProviderCircuitBreaker(true),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create NNTP connection pool: %w", err)
 		}

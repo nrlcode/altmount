@@ -7,7 +7,6 @@ import (
 
 	"github.com/javi11/altmount/internal/database"
 	"github.com/javi11/altmount/internal/holes"
-	"github.com/javi11/altmount/internal/metadata"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/usenet"
 )
@@ -25,30 +24,20 @@ func (mvf *MetadataVirtualFile) holeEligible() bool {
 
 // holeHooks returns the reader hooks that implement on-the-fly zero-fill for
 // this handle, or nil when the file is ineligible. The hooks are built once
-// per handle; the accumulator they share is seeded from the persisted hole
-// map so replay pre-pad works across opens.
+// per handle. Its accumulator starts empty: legacy persisted holes are
+// quarantined and cannot authorize a fetch-free zero fill.
 func (mvf *MetadataVirtualFile) holeHooks() *usenet.HoleHooks {
 	mvf.holeOnce.Do(func() {
 		if !mvf.holeEligible() {
 			return
 		}
 		acc := &holes.Accumulator{}
-		acc.Load(metadata.KnownHolesFromProto(mvf.meta.KnownHoles))
 		mvf.holeAcc = acc
 		mvf.holeHooksVal = &usenet.HoleHooks{
-			OnHole:     mvf.onHole,
-			KnownHoles: mvf.isKnownHole,
+			OnHole: mvf.onHole,
 		}
 	})
 	return mvf.holeHooksVal
-}
-
-// isKnownHole reports whether a segment is already in the hole map (replay
-// pre-pad: zero-fill without a fetch round-trip).
-func (mvf *MetadataVirtualFile) isKnownHole(segIndex int) bool {
-	mvf.holeMu.Lock()
-	defer mvf.holeMu.Unlock()
-	return mvf.holeAcc.Has(segIndex)
 }
 
 // onHole is the synchronous pad/fail verdict for a segment just confirmed
@@ -80,25 +69,20 @@ func (mvf *MetadataVirtualFile) onHole(segIndex int, segID string) holes.Decisio
 	}
 
 	// Record the degradation without stalling the download goroutine. Replays
-	// of already-known holes change nothing, so only new discoveries write.
+	// within this handle change nothing, so only new discoveries write.
 	if !alreadyKnown {
-		go mvf.recordDegradedPad(segIndex, total, longest, totalSegments, segBytes)
+		go mvf.recordDegradedPad(total, longest, totalSegments, segBytes)
 	}
 	return holes.DecisionPad
 }
 
-// recordDegradedPad persists a newly padded hole and marks the file degraded:
-// hole map merged into metadata, FILE_STATUS_DEGRADED (stays visible and
-// streamable), health record degraded. Deliberately NO repair trigger, NO
+// recordDegradedPad marks a file degraded after a freshly confirmed, session-
+// local pad. It deliberately does not persist padding authority into the
+// legacy .meta hole field. There is NO repair trigger, NO
 // safety-folder move and NO masking-counter increment — the file still plays.
 // Status writes are debounced per file so a burst of pads writes once per
-// window; the hole itself is always persisted (idempotent merge).
-func (mvf *MetadataVirtualFile) recordDegradedPad(segIndex int, total, longest, totalSegments int, segBytes int64) {
-	// Always persist the hole so the next open pre-pads it without a fetch.
-	if err := mvf.metadataService.AddKnownHoles(mvf.name, []holes.Run{{Start: segIndex, Count: 1}}); err != nil {
-		slog.WarnContext(mvf.ctx, "Failed to persist known hole", "file", mvf.name, "error", err)
-	}
-
+// window.
+func (mvf *MetadataVirtualFile) recordDegradedPad(total, longest, totalSegments int, segBytes int64) {
 	// Distinct debounce key from the repair path so pads never consume a
 	// repair-trigger token.
 	if !mvf.repairCoalescer.ShouldTrigger(mvf.name + "\x00degraded-pad") {
@@ -158,7 +142,6 @@ func (mvf *MetadataVirtualFile) classifyStreamingFailure(dcErr *usenet.DataCorru
 	}
 
 	var acc holes.Accumulator
-	acc.Load(metadata.KnownHolesFromProto(mvf.meta.KnownHoles))
 	mvf.holeMu.Lock()
 	if mvf.holeAcc != nil {
 		acc.Load(mvf.holeAcc.Runs())
