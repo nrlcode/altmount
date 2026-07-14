@@ -38,17 +38,10 @@ func TestPR5ResolveCanonicalSegmentLayoutMatchesFingerprintOrder(t *testing.T) {
 	require.NotNil(t, layout)
 	assert.Equal(t, wantFingerprint, layout.Fingerprint)
 	assert.Equal(t, int64(175), layout.VirtualSize)
-	require.Len(t, layout.Segments, 3)
-	assert.Equal(t, []string{"fixture-duplicate", "fixture-duplicate", "fixture-nested"}, []string{
-		layout.Segments[0].MessageID,
-		layout.Segments[1].MessageID,
-		layout.Segments[2].MessageID,
-	})
-	assert.Equal(t, []int64{50, 40, 85}, []int64{
-		layout.Segments[0].UsableBytes,
-		layout.Segments[1].UsableBytes,
-		layout.Segments[2].UsableBytes,
-	})
+	require.Len(t, layout.Segments, 1)
+	assert.Equal(t, "fixture-nested", layout.Segments[0].MessageID,
+		"nested sources are the authoritative playback representation")
+	assert.Equal(t, int64(85), layout.Segments[0].UsableBytes)
 	for i, segment := range layout.Segments {
 		assert.Equal(t, int64(i), segment.Position)
 	}

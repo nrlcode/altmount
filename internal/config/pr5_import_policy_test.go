@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestPR5ImportDamagePolicyDefaultsToStrict(t *testing.T) {
@@ -13,6 +15,28 @@ func TestPR5ImportDamagePolicyDefaultsToStrict(t *testing.T) {
 	}
 	if cfg.GetImportDamagePolicyTolerant() {
 		t.Fatal("default import damage policy is tolerant, want strict")
+	}
+}
+
+func TestPR5ImportDamagePolicyTolerantYAMLRoundTrip(t *testing.T) {
+	input := DefaultConfig(t.TempDir())
+	input.Import.DamagePolicy = string(ImportDamagePolicyTolerant)
+
+	encoded, err := yaml.Marshal(input)
+	if err != nil {
+		t.Fatalf("marshal tolerant config: %v", err)
+	}
+	var restored Config
+	if err := yaml.Unmarshal(encoded, &restored); err != nil {
+		t.Fatalf("unmarshal tolerant config: %v", err)
+	}
+	if err := restored.Validate(); err != nil {
+		t.Fatalf("validate restored tolerant config: %v", err)
+	}
+	if restored.Import.DamagePolicy != string(ImportDamagePolicyTolerant) ||
+		!restored.GetImportDamagePolicyTolerant() {
+		t.Fatalf("restored damage_policy = %q, tolerant = %v",
+			restored.Import.DamagePolicy, restored.GetImportDamagePolicyTolerant())
 	}
 }
 
