@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -20,6 +21,7 @@ import (
 
 const (
 	defaultDurableImportConfirmationDelay = 30 * time.Second
+	defaultDurableImportIncompleteDelay   = 30 * time.Second
 	defaultDurableImportLeaseTTL          = 2 * time.Minute
 	durableImportChunkTargetLimit         = 128
 	durableImportChunkSpanLimit           = 1024
@@ -113,12 +115,18 @@ type TargetedSTATTransport interface {
 }
 
 type durableFinalLayoutRepository interface {
-	EnsureFileRevision(context.Context, database.FileRevisionSpec) (*database.HealthFileRevision, error)
+	EnsureCandidateFileRevision(context.Context, database.FileRevisionSpec) (*database.HealthFileRevision, error)
+	ActivateImportFileRevision(context.Context, int64, string) (*database.HealthFileRevision, error)
 	ReconcileProviders(context.Context, []database.ProviderSpec) ([]database.HealthProvider, error)
 	CaptureActiveProviderSnapshot(context.Context, time.Time) (*database.ProviderSnapshot, error)
 	GetProviderSnapshot(context.Context, string) (*database.ProviderSnapshot, error)
+	GetHealthRun(context.Context, string) (*database.HealthRun, error)
 	EnsureScheduledHealthRun(context.Context, database.ScheduledHealthRunSpec) (*database.HealthRun, bool, error)
 	GetImportValidation(context.Context, int64, string) (*database.ImportValidation, error)
+	GetImportQueueDamagePolicy(context.Context, int64) (database.ImportDamagePolicy, bool, error)
+	ValidateImportProviderSnapshotCurrent(context.Context, string) error
+	AbandonImportValidation(context.Context, int64, string, string, time.Time) error
+	RetireUnboundImportRun(context.Context, string, string, time.Time) error
 	UpsertImportValidation(context.Context, database.ImportValidationWrite) (*database.ImportValidation, error)
 	AcquireRunLease(context.Context, string, string, time.Duration) (*database.HealthRun, error)
 	RenewHealthRunLease(context.Context, string, string, int64, time.Duration) (*database.HealthRun, error)
@@ -138,6 +146,11 @@ type DurableFinalLayoutValidatorOptions struct {
 	ConfirmationDelay time.Duration
 	LeaseTTL          time.Duration
 	WorkerID          string
+	// OnHealthChanged is an invalidation-only callback. It is invoked only
+	// after a durable health chunk or lifecycle transition commits, so API/SSE
+	// readers can reload authoritative progress while ValidateFinalLayout is
+	// still running.
+	OnHealthChanged func()
 }
 
 // DurableFinalLayoutValidationResult contains only positional and lifecycle
@@ -162,6 +175,7 @@ type DurableFinalLayoutValidator struct {
 	confirmationDelay time.Duration
 	leaseTTL          time.Duration
 	workerID          string
+	onHealthChanged   func()
 	now               func() time.Time
 	invocation        atomic.Uint64
 }
@@ -203,8 +217,15 @@ func NewDurableFinalLayoutValidator(
 		repository: repository, transport: transport,
 		providerSpecs: append([]database.ProviderSpec(nil), options.ProviderSpecs...),
 		damagePolicy:  policy, confirmationDelay: delay, leaseTTL: leaseTTL,
-		workerID: workerID, now: func() time.Time { return time.Now().UTC() },
+		workerID: workerID, onHealthChanged: options.OnHealthChanged,
+		now: func() time.Time { return time.Now().UTC() },
 	}, nil
+}
+
+func (v *DurableFinalLayoutValidator) notifyHealthChanged() {
+	if v != nil && v.onHealthChanged != nil {
+		v.onHealthChanged()
+	}
 }
 
 func sanitizeDurableWorkerID(value string) string {
@@ -262,7 +283,7 @@ func (v *DurableFinalLayoutValidator) ValidateFinalLayout(
 	for i, segment := range layout.Segments {
 		spans[i] = segment.UsableBytes
 	}
-	revision, err := v.repository.EnsureFileRevision(ctx, database.FileRevisionSpec{
+	revision, err := v.repository.EnsureCandidateFileRevision(ctx, database.FileRevisionSpec{
 		FilePath: finalVirtualPath, LayoutFingerprint: layout.Fingerprint,
 		VirtualSize: layout.VirtualSize, SegmentCount: int64(len(layout.Segments)),
 	})
@@ -270,26 +291,76 @@ func (v *DurableFinalLayoutValidator) ValidateFinalLayout(
 		return DurableFinalLayoutValidationResult{}, err
 	}
 
-	expectedRunID := durableImportIdentity(
-		"run", fmt.Sprint(queueItemID), revision.ID, string(provenance.Kind),
-	)
 	validation, err := v.repository.GetImportValidation(ctx, queueItemID, revision.ID)
 	if err != nil {
 		return DurableFinalLayoutValidationResult{}, err
 	}
+	hadExistingValidation := validation != nil
 	if validation == nil {
+		queuePolicy, err := v.queueDamagePolicy(ctx, queueItemID, v.damagePolicy)
+		if err != nil {
+			return DurableFinalLayoutValidationResult{}, err
+		}
 		validation, err = v.createValidation(
-			ctx, queueItemID, revision, expectedRunID, layout, provenance,
+			ctx, queueItemID, revision, layout, provenance, queuePolicy,
 		)
+		if errors.Is(err, database.ErrImportDamagePolicy) {
+			queuePolicy, policyErr := v.queueDamagePolicy(ctx, queueItemID, queuePolicy)
+			if policyErr != nil {
+				return DurableFinalLayoutValidationResult{}, policyErr
+			}
+			validation, err = v.createValidation(
+				ctx, queueItemID, revision, layout, provenance, queuePolicy,
+			)
+		}
 		if err != nil {
 			return DurableFinalLayoutValidationResult{}, err
 		}
 	} else {
+		runBinding, err := v.repository.GetHealthRun(ctx, validation.RunID)
+		if err != nil {
+			return DurableFinalLayoutValidationResult{}, err
+		}
+		if runBinding == nil {
+			return DurableFinalLayoutValidationResult{}, fmt.Errorf("durable import health run does not exist")
+		}
+		expectedRunID := durableImportIdentity(
+			"run", fmt.Sprint(queueItemID), revision.ID, string(provenance.Kind), runBinding.ProviderSnapshotID,
+		)
 		if validation.RunID != expectedRunID {
 			return DurableFinalLayoutValidationResult{}, fmt.Errorf("durable import provenance does not match the existing validation")
 		}
-		if validation.DamagePolicy != database.ImportDamagePolicy(v.damagePolicy) {
-			return DurableFinalLayoutValidationResult{}, fmt.Errorf("durable import damage policy does not match the existing validation")
+	}
+	persistedPolicy := config.ImportDamagePolicy(validation.DamagePolicy)
+	if persistedPolicy != config.ImportDamagePolicyStrict && persistedPolicy != config.ImportDamagePolicyTolerant {
+		return DurableFinalLayoutValidationResult{}, fmt.Errorf("durable import validation has an invalid persisted damage policy")
+	}
+
+	_, terminal := terminalDurableImportResult(DurableFinalLayoutValidationResult{}, validation)
+	needsCurrentSnapshot := !terminal ||
+		(!revision.Active && (validation.Phase == database.ImportValidationPhaseAccepted ||
+			validation.Phase == database.ImportValidationPhaseHealthPending))
+	if hadExistingValidation && needsCurrentSnapshot {
+		if _, err := v.repository.ReconcileProviders(ctx, v.providerSpecs); err != nil {
+			return DurableFinalLayoutValidationResult{}, err
+		}
+		if err := v.repository.ValidateImportProviderSnapshotCurrent(ctx, validation.RunID); err != nil {
+			if !errors.Is(err, database.ErrProviderSnapshotMismatch) {
+				return DurableFinalLayoutValidationResult{}, err
+			}
+			now := v.now().UTC()
+			if err := v.repository.AbandonImportValidation(
+				ctx, queueItemID, revision.ID, validation.RunID, now,
+			); err != nil {
+				return DurableFinalLayoutValidationResult{}, err
+			}
+			v.notifyHealthChanged()
+			validation, err = v.createValidation(
+				ctx, queueItemID, revision, layout, provenance, persistedPolicy,
+			)
+			if err != nil {
+				return DurableFinalLayoutValidationResult{}, err
+			}
 		}
 	}
 
@@ -342,8 +413,26 @@ func (v *DurableFinalLayoutValidator) ValidateFinalLayout(
 
 	return v.driveValidation(
 		ctx, validation, run, providers, layout, spans, finalVirtualPath,
-		finalMetadata, provenance, owner,
+		finalMetadata, provenance, persistedPolicy, owner,
 	)
+}
+
+func (v *DurableFinalLayoutValidator) queueDamagePolicy(
+	ctx context.Context,
+	queueItemID int64,
+	fallback config.ImportDamagePolicy,
+) (config.ImportDamagePolicy, error) {
+	policy, frozen, err := v.repository.GetImportQueueDamagePolicy(ctx, queueItemID)
+	if err != nil {
+		return "", err
+	}
+	if frozen {
+		fallback = config.ImportDamagePolicy(policy)
+	}
+	if fallback != config.ImportDamagePolicyStrict && fallback != config.ImportDamagePolicyTolerant {
+		return "", fmt.Errorf("durable import queue has an invalid persisted damage policy")
+	}
+	return fallback, nil
 }
 
 func validFinalLayoutProvenance(kind FinalLayoutProvenanceKind) bool {
@@ -361,9 +450,9 @@ func (v *DurableFinalLayoutValidator) createValidation(
 	ctx context.Context,
 	queueItemID int64,
 	revision *database.HealthFileRevision,
-	runID string,
 	layout *metadata.CanonicalSegmentLayout,
 	provenance FinalLayoutProvenance,
+	damagePolicy config.ImportDamagePolicy,
 ) (*database.ImportValidation, error) {
 	if _, err := v.repository.ReconcileProviders(ctx, v.providerSpecs); err != nil {
 		return nil, err
@@ -376,6 +465,9 @@ func (v *DurableFinalLayoutValidator) createValidation(
 	if _, err := orderedDurableImportProviders(snapshot); err != nil {
 		return nil, err
 	}
+	runID := durableImportIdentity(
+		"run", fmt.Sprint(queueItemID), revision.ID, string(provenance.Kind), snapshot.ID,
+	)
 	run, _, err := v.repository.EnsureScheduledHealthRun(ctx, database.ScheduledHealthRunSpec{
 		Run: database.HealthRunSpec{
 			ID: runID, FileRevisionID: revision.ID, ProviderSnapshotID: snapshot.ID,
@@ -383,7 +475,7 @@ func (v *DurableFinalLayoutValidator) createValidation(
 			CreatedAt: now,
 		},
 		DedupeKey: durableImportIdentity(
-			"schedule", fmt.Sprint(queueItemID), revision.ID, string(provenance.Kind),
+			"schedule", fmt.Sprint(queueItemID), revision.ID, string(provenance.Kind), snapshot.ID,
 		),
 		Priority: database.HealthRunPriorityNormal, NotBefore: now,
 	})
@@ -399,23 +491,60 @@ func (v *DurableFinalLayoutValidator) createValidation(
 		ID:          durableImportIdentity("validation", fmt.Sprint(queueItemID), revision.ID),
 		QueueItemID: queueItemID, FileRevisionID: revision.ID, RunID: run.ID,
 		Phase:        database.ImportValidationPhaseInitialPass,
-		DamagePolicy: database.ImportDamagePolicy(v.damagePolicy),
+		DamagePolicy: database.ImportDamagePolicy(damagePolicy),
 		LeaseOwner:   owner, FencingToken: leased.FencingToken,
 		CreatedAt: now, UpdatedAt: now,
 	}
-	validation, err := v.repository.UpsertImportValidation(ctx, write)
-	if err != nil {
-		return nil, err
+	validation, writeErr := v.repository.UpsertImportValidation(ctx, write)
+	if writeErr == nil {
+		v.notifyHealthChanged()
 	}
 	// The creator lease belongs to this setup operation. Park immediately so
 	// the common resume path acquires a fresh fencing token and one owner is
 	// never silently reused across two logical invocations.
-	if err := v.repository.ParkHealthRun(
+	parkErr := v.repository.ParkHealthRun(
 		ctx, run.ID, owner, leased.FencingToken, now, now,
-	); err != nil {
-		return nil, err
+	)
+	if parkErr == nil {
+		v.notifyHealthChanged()
+	}
+	if writeErr != nil {
+		// A concurrent first file can freeze the queue policy after this
+		// provisional run was scheduled but before its validation is bound.
+		// Retire only a genuinely unbound run; a same-file competitor may have
+		// bound this exact deterministic run already, which is deliberately left
+		// intact by the repository fence.
+		retireErr := v.repository.RetireUnboundImportRun(ctx, run.ID, revision.ID, now)
+		if retireErr == nil {
+			v.notifyHealthChanged()
+		}
+		if retireErr != nil && !errors.Is(retireErr, database.ErrStaleImportValidation) {
+			return nil, errors.Join(writeErr, retireErr)
+		}
+		return nil, writeErr
+	}
+	if parkErr != nil {
+		return nil, parkErr
 	}
 	return validation, nil
+}
+
+// ActivateFileRevision publishes one already-admitted candidate. It is kept
+// separate from validation so MetadataService can call it only after its atomic
+// file rename succeeds.
+func (v *DurableFinalLayoutValidator) ActivateFileRevision(
+	ctx context.Context,
+	queueItemID int64,
+	revisionID string,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, err := v.repository.ActivateImportFileRevision(ctx, queueItemID, revisionID)
+	if err == nil {
+		v.notifyHealthChanged()
+	}
+	return err
 }
 
 func validateDurableImportRun(
@@ -478,9 +607,12 @@ func orderedDurableImportProviders(snapshot *database.ProviderSnapshot) ([]datab
 }
 
 type durableImportCoverage struct {
-	total   int64
-	tested  map[durableImportProviderKey][]byte
-	present map[durableImportProviderKey][]byte
+	total      int64
+	baseStage  string
+	tested     map[durableImportProviderKey][]byte
+	baseTested map[durableImportProviderKey][]byte
+	present    map[durableImportProviderKey][]byte
+	absent     map[durableImportProviderKey][]byte
 }
 
 func loadDurableImportCoverage(
@@ -492,14 +624,18 @@ func loadDurableImportCoverage(
 		return nil, fmt.Errorf("durable import resume state is missing")
 	}
 	coverage := &durableImportCoverage{
-		total:   state.Run.TotalSegments,
-		tested:  make(map[durableImportProviderKey][]byte, len(providers)),
-		present: make(map[durableImportProviderKey][]byte, len(providers)),
+		total: state.Run.TotalSegments, baseStage: stage,
+		tested:     make(map[durableImportProviderKey][]byte, len(providers)),
+		baseTested: make(map[durableImportProviderKey][]byte, len(providers)),
+		present:    make(map[durableImportProviderKey][]byte, len(providers)),
+		absent:     make(map[durableImportProviderKey][]byte, len(providers)),
 	}
 	for _, provider := range providers {
 		key := durableProviderKey(provider)
 		coverage.tested[key] = make([]byte, durableBitmapLength(coverage.total))
+		coverage.baseTested[key] = make([]byte, durableBitmapLength(coverage.total))
 		coverage.present[key] = make([]byte, durableBitmapLength(coverage.total))
+		coverage.absent[key] = make([]byte, durableBitmapLength(coverage.total))
 	}
 	for _, chunk := range state.Chunks {
 		if chunk.Stage != stage {
@@ -516,11 +652,16 @@ func loadDurableImportCoverage(
 		if chunk.ObservationKind != database.HealthObservationSTAT || chunk.SegmentStart < 0 ||
 			chunk.SegmentCount <= 0 || chunk.SegmentStart > coverage.total-chunk.SegmentCount ||
 			len(chunk.TestedBitmap) != durableBitmapLength(chunk.SegmentCount) ||
-			len(chunk.PresentBitmap) != durableBitmapLength(chunk.SegmentCount) {
+			len(chunk.PresentBitmap) != durableBitmapLength(chunk.SegmentCount) ||
+			len(chunk.AbsentBitmap) != durableBitmapLength(chunk.SegmentCount) {
 			return nil, fmt.Errorf("durable import chunk has invalid canonical coverage")
 		}
 		durableOrRelative(tested, chunk.TestedBitmap, chunk.SegmentStart, chunk.SegmentCount)
+		if chunk.Stage == stage {
+			durableOrRelative(coverage.baseTested[key], chunk.TestedBitmap, chunk.SegmentStart, chunk.SegmentCount)
+		}
 		durableOrRelative(coverage.present[key], chunk.PresentBitmap, chunk.SegmentStart, chunk.SegmentCount)
+		durableOrRelative(coverage.absent[key], chunk.AbsentBitmap, chunk.SegmentStart, chunk.SegmentCount)
 	}
 	return coverage, nil
 }
@@ -534,6 +675,10 @@ func durableProviderKey(provider database.ProviderSnapshotEntry) durableImportPr
 
 func (c *durableImportCoverage) testedPosition(provider database.ProviderSnapshotEntry, position int) bool {
 	return durableBitmapSet(c.tested[durableProviderKey(provider)], int64(position))
+}
+
+func (c *durableImportCoverage) baseTestedPosition(provider database.ProviderSnapshotEntry, position int) bool {
+	return durableBitmapSet(c.baseTested[durableProviderKey(provider)], int64(position))
 }
 
 func (c *durableImportCoverage) anyPresent(position int) bool {
@@ -555,6 +700,7 @@ func (v *DurableFinalLayoutValidator) driveValidation(
 	finalVirtualPath string,
 	finalMetadata *metapb.FileMetadata,
 	provenance FinalLayoutProvenance,
+	damagePolicy config.ImportDamagePolicy,
 	owner string,
 ) (DurableFinalLayoutValidationResult, error) {
 	state, err := v.repository.GetHealthRunResumeState(ctx, run.ID)
@@ -575,11 +721,18 @@ func (v *DurableFinalLayoutValidator) driveValidation(
 		if err != nil {
 			return DurableFinalLayoutValidationResult{}, err
 		}
-		unresolved := initialDurableUnresolved(coverage)
+		unresolved := initialDurableUnresolved(coverage, providers)
 		base.UnresolvedPositions = unresolved
 		if !complete {
+			due := v.now().UTC().Add(defaultDurableImportIncompleteDelay)
+			if err := v.parkHealthRun(
+				ctx, run.ID, owner, run.FencingToken, due, v.now().UTC(),
+			); err != nil {
+				return DurableFinalLayoutValidationResult{}, err
+			}
 			base.Status = ImportAdmissionAwaitConfirmation
 			base.ResumeRequired = true
+			base.RetryAt = &due
 			return base, nil
 		}
 		if err := validateInitialDurableCoverage(coverage, providers, unresolved); err != nil {
@@ -587,7 +740,7 @@ func (v *DurableFinalLayoutValidator) driveValidation(
 		}
 		unresolvedBitmap := durablePositionsBitmap(unresolved, coverage.total)
 		if len(unresolved) == 0 {
-			validation, err = v.advanceValidation(
+			_, err = v.advanceValidation(
 				ctx, validation, run, database.ImportValidationPhaseAccepted,
 				unresolvedBitmap, true, false, nil,
 			)
@@ -599,14 +752,14 @@ func (v *DurableFinalLayoutValidator) driveValidation(
 		}
 		now := v.now().UTC()
 		due := now.Add(v.confirmationDelay)
-		validation, err = v.advanceValidation(
+		_, err = v.advanceValidation(
 			ctx, validation, run, database.ImportValidationPhaseConfirmationWait,
 			unresolvedBitmap, true, false, &due,
 		)
 		if err != nil {
 			return DurableFinalLayoutValidationResult{}, err
 		}
-		if err := v.repository.ParkHealthRun(
+		if err := v.parkHealthRun(
 			ctx, run.ID, owner, run.FencingToken, due, now,
 		); err != nil {
 			return DurableFinalLayoutValidationResult{}, err
@@ -635,8 +788,15 @@ func (v *DurableFinalLayoutValidator) driveValidation(
 		}
 		base.UnresolvedPositions = finalUnresolved
 		if !complete {
+			due := v.now().UTC().Add(defaultDurableImportIncompleteDelay)
+			if err := v.parkHealthRun(
+				ctx, run.ID, owner, run.FencingToken, due, v.now().UTC(),
+			); err != nil {
+				return DurableFinalLayoutValidationResult{}, err
+			}
 			base.Status = ImportAdmissionAwaitConfirmation
 			base.ResumeRequired = true
+			base.RetryAt = &due
 			return base, nil
 		}
 		if err := validateConfirmationDurableCoverage(
@@ -645,6 +805,7 @@ func (v *DurableFinalLayoutValidator) driveValidation(
 			return DurableFinalLayoutValidationResult{}, err
 		}
 		phase, impact, err := v.terminalPhase(
+			damagePolicy,
 			finalVirtualPath, finalMetadata, provenance, finalUnresolved, spans, layout.VirtualSize,
 		)
 		if err != nil {
@@ -679,12 +840,12 @@ func (v *DurableFinalLayoutValidator) runInitialPass(
 			if providerIndex > 0 && coverage.anyPresent(position) {
 				continue
 			}
-			if !coverage.testedPosition(provider, position) {
+			if !coverage.baseTestedPosition(provider, position) {
 				targets = append(targets, position)
 			}
 		}
 		complete, err := v.dispatchDurableSTATTargets(
-			ctx, run, owner, provider, database.HealthRunStageImportInitialSTAT,
+			ctx, run, owner, providers, provider, database.HealthRunStageImportInitialSTAT,
 			layout, coverage, targets,
 		)
 		if err != nil || !complete {
@@ -706,12 +867,12 @@ func (v *DurableFinalLayoutValidator) runConfirmationPass(
 	for _, provider := range providers {
 		targets := make([]int, 0, len(initialUnresolved))
 		for _, position := range initialUnresolved {
-			if !coverage.testedPosition(provider, position) {
+			if !coverage.baseTestedPosition(provider, position) {
 				targets = append(targets, position)
 			}
 		}
 		complete, err := v.dispatchDurableSTATTargets(
-			ctx, run, owner, provider, database.HealthRunStageImportConfirmationSTAT,
+			ctx, run, owner, providers, provider, database.HealthRunStageImportConfirmationSTAT,
 			layout, coverage, targets,
 		)
 		if err != nil || !complete {
@@ -726,10 +887,26 @@ type durableSTATObservation struct {
 	result   TargetedSTATResult
 }
 
+type durableImportLeaseHeartbeatError struct {
+	cause error
+}
+
+func (e *durableImportLeaseHeartbeatError) Error() string {
+	return "durable import validation lost its run lease"
+}
+
+func (e *durableImportLeaseHeartbeatError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
 func (v *DurableFinalLayoutValidator) dispatchDurableSTATTargets(
 	ctx context.Context,
 	run *database.HealthRun,
 	owner string,
+	providers []database.ProviderSnapshotEntry,
 	provider database.ProviderSnapshotEntry,
 	stage string,
 	layout *metadata.CanonicalSegmentLayout,
@@ -753,8 +930,10 @@ func (v *DurableFinalLayoutValidator) dispatchDurableSTATTargets(
 			})
 			requested[position] = struct{}{}
 		}
-		results, transportErr := v.transport.TargetedSTAT(
+		results, transportErr := v.targetedSTATWithLeaseHeartbeat(
 			ctx,
+			run,
+			owner,
 			TargetedSTATProvider{
 				ID: provider.ProviderID, Generation: provider.ProviderGeneration,
 				ActivationEpoch: provider.ProviderActivationEpoch,
@@ -762,6 +941,10 @@ func (v *DurableFinalLayoutValidator) dispatchDurableSTATTargets(
 			requests,
 		)
 		if transportErr != nil {
+			var heartbeatErr *durableImportLeaseHeartbeatError
+			if errors.As(transportErr, &heartbeatErr) {
+				return false, heartbeatErr
+			}
 			if err := ctx.Err(); err != nil {
 				return false, err
 			}
@@ -790,7 +973,7 @@ func (v *DurableFinalLayoutValidator) dispatchDurableSTATTargets(
 			batch = append(batch, durableSTATObservation{position: request.Position, result: result})
 		}
 		if err := v.commitDurableSTATBatch(
-			ctx, run, owner, provider, stage, coverage, batch,
+			ctx, run, owner, providers, provider, stage, coverage, batch,
 		); err != nil {
 			return false, err
 		}
@@ -802,6 +985,56 @@ func (v *DurableFinalLayoutValidator) dispatchDurableSTATTargets(
 		first = last
 	}
 	return true, nil
+}
+
+func (v *DurableFinalLayoutValidator) targetedSTATWithLeaseHeartbeat(
+	ctx context.Context,
+	run *database.HealthRun,
+	owner string,
+	provider TargetedSTATProvider,
+	requests []TargetedSTATRequest,
+) ([]TargetedSTATObservation, error) {
+	dispatchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
+	heartbeatDone := make(chan error, 1)
+	interval := v.leaseTTL / 3
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				heartbeatDone <- nil
+				return
+			case <-dispatchCtx.Done():
+				heartbeatDone <- nil
+				return
+			case <-ticker.C:
+				if _, err := v.repository.RenewHealthRunLease(
+					dispatchCtx, run.ID, owner, run.FencingToken, v.leaseTTL,
+				); err != nil {
+					heartbeatDone <- err
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	results, transportErr := v.transport.TargetedSTAT(dispatchCtx, provider, requests)
+	close(done)
+	heartbeatErr := <-heartbeatDone
+	if heartbeatErr != nil {
+		return nil, &durableImportLeaseHeartbeatError{cause: heartbeatErr}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return results, transportErr
 }
 
 func validTerminalTargetedSTAT(result TargetedSTATResult) bool {
@@ -857,6 +1090,7 @@ func (v *DurableFinalLayoutValidator) commitDurableSTATBatch(
 	ctx context.Context,
 	run *database.HealthRun,
 	owner string,
+	providers []database.ProviderSnapshotEntry,
 	provider database.ProviderSnapshotEntry,
 	stage string,
 	coverage *durableImportCoverage,
@@ -885,6 +1119,9 @@ func (v *DurableFinalLayoutValidator) commitDurableSTATBatch(
 	}
 	for _, observation := range observations {
 		relative := int64(observation.position) - start
+		if relative < 0 || relative >= count {
+			return fmt.Errorf("durable import target is outside its committed range")
+		}
 		durableSetBitmap(commit.TestedBitmap, relative)
 		commit.ProviderChecksDelta++
 		switch observation.result.Outcome {
@@ -894,8 +1131,12 @@ func (v *DurableFinalLayoutValidator) commitDurableSTATBatch(
 			commit.ResolvedDelta++
 		case nntppool.OutcomeHardArticleAbsence:
 			durableSetBitmap(commit.AbsentBitmap, relative)
-			durableSetBitmap(commit.ResolvedBitmap, relative)
-			commit.ResolvedDelta++
+			if durableImportAllProvidersAbsentAfter(
+				coverage, providers, provider, observation.position,
+			) {
+				durableSetBitmap(commit.ResolvedBitmap, relative)
+				commit.ResolvedDelta++
+			}
 			commit.MissingCandidatesDelta++
 		case nntppool.OutcomeTemporaryFailure:
 			durableSetBitmap(commit.TemporaryBitmap, relative)
@@ -925,10 +1166,37 @@ func (v *DurableFinalLayoutValidator) commitDurableSTATBatch(
 	if _, err := v.repository.CommitHealthChunk(ctx, commit); err != nil {
 		return err
 	}
+	v.notifyHealthChanged()
 	key := durableProviderKey(provider)
 	durableOrRelative(coverage.tested[key], commit.TestedBitmap, start, count)
 	durableOrRelative(coverage.present[key], commit.PresentBitmap, start, count)
+	durableOrRelative(coverage.absent[key], commit.AbsentBitmap, start, count)
+	if stage == coverage.baseStage {
+		durableOrRelative(coverage.baseTested[key], commit.TestedBitmap, start, count)
+	}
 	return nil
+}
+
+func durableImportAllProvidersAbsentAfter(
+	coverage *durableImportCoverage,
+	providers []database.ProviderSnapshotEntry,
+	current database.ProviderSnapshotEntry,
+	position int,
+) bool {
+	if coverage == nil || len(providers) == 0 {
+		return false
+	}
+	currentKey := durableProviderKey(current)
+	for _, provider := range providers {
+		key := durableProviderKey(provider)
+		if key == currentKey {
+			continue
+		}
+		if !durableBitmapSet(coverage.absent[key], int64(position)) {
+			return false
+		}
+	}
+	return true
 }
 
 func (v *DurableFinalLayoutValidator) advanceValidation(
@@ -950,7 +1218,28 @@ func (v *DurableFinalLayoutValidator) advanceValidation(
 		LeaseOwner: dereferenceString(run.LeaseOwner), FencingToken: run.FencingToken,
 		CreatedAt: validation.CreatedAt, UpdatedAt: v.now().UTC(),
 	}
-	return v.repository.UpsertImportValidation(ctx, write)
+	updated, err := v.repository.UpsertImportValidation(ctx, write)
+	if err == nil {
+		v.notifyHealthChanged()
+	}
+	return updated, err
+}
+
+func (v *DurableFinalLayoutValidator) parkHealthRun(
+	ctx context.Context,
+	runID string,
+	owner string,
+	fencingToken int64,
+	notBefore time.Time,
+	at time.Time,
+) error {
+	err := v.repository.ParkHealthRun(
+		ctx, runID, owner, fencingToken, notBefore, at,
+	)
+	if err == nil {
+		v.notifyHealthChanged()
+	}
+	return err
 }
 
 func dereferenceString(value *string) string {
@@ -960,7 +1249,10 @@ func dereferenceString(value *string) string {
 	return *value
 }
 
-func initialDurableUnresolved(coverage *durableImportCoverage) []int {
+func initialDurableUnresolved(
+	coverage *durableImportCoverage,
+	_ []database.ProviderSnapshotEntry,
+) []int {
 	unresolved := make([]int, 0)
 	for position := 0; position < int(coverage.total); position++ {
 		if !coverage.anyPresent(position) {
@@ -1006,6 +1298,7 @@ func validateConfirmationDurableCoverage(
 }
 
 func (v *DurableFinalLayoutValidator) terminalPhase(
+	damagePolicy config.ImportDamagePolicy,
 	finalVirtualPath string,
 	finalMetadata *metapb.FileMetadata,
 	provenance FinalLayoutProvenance,
@@ -1016,7 +1309,7 @@ func (v *DurableFinalLayoutValidator) terminalPhase(
 	if len(unresolved) == 0 {
 		return database.ImportValidationPhaseAccepted, holes.Impact{Verdict: holes.VerdictClean}, nil
 	}
-	if v.damagePolicy != config.ImportDamagePolicyTolerant ||
+	if damagePolicy != config.ImportDamagePolicyTolerant ||
 		!uncomplicatedStandaloneLayout(finalMetadata, provenance) ||
 		!holes.EligibleFile(finalVirtualPath) {
 		return database.ImportValidationPhaseRejected, holes.Impact{}, nil

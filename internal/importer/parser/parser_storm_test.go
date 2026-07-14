@@ -2,7 +2,9 @@ package parser
 
 import (
 	"context"
+	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +14,8 @@ import (
 	"github.com/javi11/altmount/internal/testsupport/segments"
 	"github.com/javi11/nntppool/v4"
 	"github.com/javi11/nzbparser"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // parser_storm_test.go pins the connection-budget invariants on the parser
@@ -86,6 +90,104 @@ func stormConfigGetter(totalConnections int) config.ConfigGetter {
 		{MaxConnections: totalConnections, Enabled: &enabled},
 	}
 	return func() *config.Config { return cfg }
+}
+
+func TestPR5YEncHeaderBodyAsyncSharesImportConnectionBudget(t *testing.T) {
+	fp := fakepool.New()
+	gate := make(chan struct{})
+	fp.BlockUntil(gate)
+	fp.SetDefaultBehavior(fakepool.SegmentBehavior{
+		YEnc: nntppool.YEncMeta{PartSize: 1024, FileSize: 1024},
+	})
+	mgr := newFakeFullPoolManager(fp)
+	mgr.budget = pool.NewImportBudget()
+	mgr.budget.SetCapacity(1)
+	p := NewParser(mgr, stormConfigGetter(1))
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := p.fetchYencHeaders(context.Background(), nzbparser.NzbSegment{
+			ID: "first-header", Bytes: 1024, Number: 1,
+		}, nil)
+		firstDone <- err
+	}()
+	require.Eventually(t, func() bool { return fp.InFlight() == 1 }, time.Second, time.Millisecond)
+
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := p.fetchYencHeaders(secondCtx, nzbparser.NzbSegment{
+			ID: "second-header", Bytes: 1024, Number: 1,
+		}, nil)
+		secondDone <- err
+	}()
+	cancelSecond()
+	require.Error(t, <-secondDone)
+	assert.Equal(t, int64(1), fp.BodyAsyncCalls(),
+		"a canceled budget waiter must never start an unbudgeted BodyAsync")
+	assert.Equal(t, int32(1), fp.MaxInFlight())
+	close(gate)
+	require.NoError(t, <-firstDone)
+}
+
+type delayedTerminalBodyAsyncClient struct {
+	*fakepool.Client
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int64
+}
+
+func (c *delayedTerminalBodyAsyncClient) BodyAsync(
+	ctx context.Context,
+	_ string,
+	_ io.Writer,
+	_ ...func(nntppool.YEncMeta),
+) <-chan nntppool.BodyResult {
+	c.calls.Add(1)
+	results := make(chan nntppool.BodyResult, 1)
+	c.started <- struct{}{}
+	go func() {
+		<-c.release
+		results <- nntppool.BodyResult{Err: ctx.Err()}
+		close(results)
+	}()
+	return results
+}
+
+func TestPR5CanceledYEncHeaderHoldsConnectionBudgetUntilBodyAsyncTerminal(t *testing.T) {
+	client := &delayedTerminalBodyAsyncClient{
+		Client: fakepool.New(), started: make(chan struct{}, 1), release: make(chan struct{}),
+	}
+	mgr := newFakeFullPoolManager(client)
+	mgr.budget = pool.NewImportBudget()
+	mgr.budget.SetCapacity(1)
+	p := NewParser(mgr, stormConfigGetter(1))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.fetchYencHeaders(ctx, nzbparser.NzbSegment{ID: "canceled-header"}, nil)
+		done <- err
+	}()
+	<-client.started
+	cancel()
+
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancelProbe()
+	_, err := mgr.budget.Acquire(probeCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded,
+		"the canceled async BODY still owns its connection token before terminal cleanup")
+	select {
+	case <-done:
+		t.Fatal("header fetch returned before BodyAsync emitted its terminal result")
+	default:
+	}
+
+	close(client.release)
+	require.Error(t, <-done)
+	release, err := mgr.budget.Acquire(context.Background())
+	require.NoError(t, err)
+	release()
+	assert.Equal(t, int64(1), client.calls.Load())
 }
 
 // buildSyntheticNzbFiles returns numFiles nzbparser.NzbFile entries each
