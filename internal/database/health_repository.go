@@ -1266,6 +1266,32 @@ func (r *HealthRepository) UpdateScheduledCheckTime(ctx context.Context, filePat
 	return nil
 }
 
+// DeferScheduledHealthCheck moves only the next observation time. It must not
+// project a health result: scheduling work is not evidence that the file is
+// healthy, and existing status, retry, error, and last-checked fields remain
+// untouched until an observation run commits its outcome.
+func (r *HealthRepository) DeferScheduledHealthCheck(ctx context.Context, filePath string, nextCheckTime time.Time) error {
+	filePath = normalizeHealthPath(filePath)
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE file_health
+		SET scheduled_check_at = ?,
+		    updated_at = datetime('now')
+		WHERE file_path = ?
+	`, nextCheckTime.UTC().Format("2006-01-02 15:04:05"), filePath)
+	if err != nil {
+		return fmt.Errorf("failed to defer scheduled health check: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get deferred health check rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("no health check found for file: %s", filePath)
+	}
+	return nil
+}
+
 // MarkAsHealthy marks a file as healthy and clears all retry/error state
 func (r *HealthRepository) MarkAsHealthy(ctx context.Context, filePath string, nextCheckTime time.Time) error {
 	query := `
@@ -1831,7 +1857,7 @@ func (r *HealthRepository) RelinkFileByFilename(ctx context.Context, filename, f
 	if err != nil {
 		return false, fmt.Errorf("failed to query records for filename relink: %w", err)
 	}
-	
+
 	type candidate struct {
 		id          int64
 		filePath    string
@@ -1922,12 +1948,12 @@ func (r *HealthRepository) RelinkFileByFilename(ctx context.Context, filename, f
 
 func isDownloaderPath(p string) bool {
 	low := strings.ToLower(p)
-	return strings.Contains(low, "complete") || 
-	       strings.Contains(low, "download") || 
-	       strings.Contains(low, "nzb") || 
-	       strings.Contains(low, "temp") || 
-	       strings.Contains(low, "tmp") || 
-	       strings.Contains(low, "incoming")
+	return strings.Contains(low, "complete") ||
+		strings.Contains(low, "download") ||
+		strings.Contains(low, "nzb") ||
+		strings.Contains(low, "temp") ||
+		strings.Contains(low, "tmp") ||
+		strings.Contains(low, "incoming")
 }
 
 func shareShowFolder(p1, p2 string) bool {
@@ -1936,14 +1962,14 @@ func shareShowFolder(p1, p2 string) bool {
 	if len(s1) < 2 || len(s2) < 2 {
 		return false
 	}
-	for i := len(s1) - 2; i >= 0 && i >= len(s1) - 3; i-- {
+	for i := len(s1) - 2; i >= 0 && i >= len(s1)-3; i-- {
 		seg := s1[i]
 		low := strings.ToLower(seg)
-		if strings.HasPrefix(low, "season") || 
-		   low == "specials" || low == "tv" || low == "movies" || low == "downloads" {
+		if strings.HasPrefix(low, "season") ||
+			low == "specials" || low == "tv" || low == "movies" || low == "downloads" {
 			continue
 		}
-		for j := len(s2) - 2; j >= 0 && j >= len(s2) - 3; j-- {
+		for j := len(s2) - 2; j >= 0 && j >= len(s2)-3; j-- {
 			if s2[j] == seg {
 				return true
 			}
@@ -2158,9 +2184,9 @@ func (r *HealthRepository) relinkOrMergeRecordTx(ctx context.Context, tx *dialec
 	if conflictExists && conflictingID == id {
 		conflictExists = false
 	}
-	
+
 	// Fast-Fail Revalidate Guard: If the target record (the one surviving the merge) recently
-	// had a repair triggered, DO NOT reset it to pending. This prevents Webhooks that fire immediately 
+	// had a repair triggered, DO NOT reset it to pending. This prevents Webhooks that fire immediately
 	// after an import's streaming failure from wiping out the repair trigger.
 	targetStatus := sourceStatus
 	targetUpdatedAt := sourceUpdatedAt
@@ -2168,7 +2194,7 @@ func (r *HealthRepository) relinkOrMergeRecordTx(ctx context.Context, tx *dialec
 		targetStatus = conflictingStatus
 		targetUpdatedAt = conflictingUpdatedAt
 	}
-	
+
 	if revalidate && (targetStatus == "repair_triggered" || targetStatus == "corrupted") && time.Since(targetUpdatedAt) < 60*time.Second {
 		revalidate = false
 	}
@@ -2426,4 +2452,3 @@ func (r *HealthRepository) matchMetadata(dbMeta, webMeta *model.WebhookMetadata)
 
 	return false
 }
-
