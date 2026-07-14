@@ -76,7 +76,7 @@ func TestPR5GapRangeRetainsEpisodesAndRequiresValidatedBodyToClear(t *testing.T)
 	ctx := context.Background()
 	gap, err := f.repo.UpsertGapRange(ctx, GapRangeWrite{
 		ID: "gap-episode-1", FileRevisionID: f.run.FileRevisionID,
-		Kind: GapKindConfirmedAbsent, StartSegment: 2, SegmentCount: 1,
+		Kind: GapKindProvisional, StartSegment: 2, SegmentCount: 1,
 		Status: GapStatusActive, CreatedAt: f.now,
 	})
 	require.NoError(t, err)
@@ -84,7 +84,7 @@ func TestPR5GapRangeRetainsEpisodesAndRequiresValidatedBodyToClear(t *testing.T)
 
 	_, err = f.repo.UpsertGapRange(ctx, GapRangeWrite{
 		ID: "gap-duplicate-active", FileRevisionID: f.run.FileRevisionID,
-		Kind: GapKindConfirmedAbsent, StartSegment: 2, SegmentCount: 1,
+		Kind: GapKindProvisional, StartSegment: 2, SegmentCount: 1,
 		Status: GapStatusActive, CreatedAt: f.now.Add(time.Second),
 	})
 	require.Error(t, err, "one exact range may have only one active lifecycle episode")
@@ -120,7 +120,7 @@ func TestPR5GapRangeRetainsEpisodesAndRequiresValidatedBodyToClear(t *testing.T)
 
 	recurrence, err := f.repo.UpsertGapRange(ctx, GapRangeWrite{
 		ID: "gap-episode-2", FileRevisionID: f.run.FileRevisionID,
-		Kind: GapKindConfirmedAbsent, StartSegment: 2, SegmentCount: 1,
+		Kind: GapKindProvisional, StartSegment: 2, SegmentCount: 1,
 		Status: GapStatusActive, CreatedAt: f.now.Add(3 * time.Minute),
 	})
 	require.NoError(t, err)
@@ -132,7 +132,7 @@ func TestPR5GapRangeRetainsEpisodesAndRequiresValidatedBodyToClear(t *testing.T)
 		SELECT COUNT(*), SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END)
 		FROM health_gap_ranges
 		WHERE file_revision_id = ? AND kind = ? AND start_segment = ? AND segment_count = ?
-	`, f.run.FileRevisionID, GapKindConfirmedAbsent, 2, 1).Scan(&total, &active))
+	`, f.run.FileRevisionID, GapKindProvisional, 2, 1).Scan(&total, &active))
 	assert.Equal(t, 2, total)
 	assert.Equal(t, 1, active)
 }

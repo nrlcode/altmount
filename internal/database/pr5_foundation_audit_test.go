@@ -205,7 +205,8 @@ func TestPR5ImportConfirmationPassIsFencedAndRestartDiscoverable(t *testing.T) {
 		ID: "restartable-import-validation", QueueItemID: f.queueA.ID,
 		FileRevisionID: f.revision.ID, RunID: run.ID,
 		Phase: ImportValidationPhaseInitialPass, DamagePolicy: ImportDamagePolicyStrict,
-		UnresolvedSegments: 1, CreatedAt: f.now, UpdatedAt: f.now,
+		UnresolvedSegments: 1, UnresolvedBitmap: []byte{0b00000010},
+		CreatedAt: f.now, UpdatedAt: f.now,
 		LeaseOwner: *initialLease.LeaseOwner, FencingToken: initialLease.FencingToken,
 	}
 	_, err = f.repo.UpsertImportValidation(ctx, initial)
@@ -216,6 +217,27 @@ func TestPR5ImportConfirmationPassIsFencedAndRestartDiscoverable(t *testing.T) {
 	waiting.InitialPassComplete = true
 	waiting.UpdatedAt = f.now.Add(time.Second)
 	f.clock.now = waiting.UpdatedAt
+	_, err = f.repo.UpsertImportValidation(ctx, waiting)
+	require.Error(t, err,
+		"the import lifecycle cannot trust a caller completion flag without full durable initial STAT coverage")
+
+	provider := f.snapshot.Entries[0]
+	initialCoverage := HealthChunkCommit{
+		ChunkID: "audit-import-initial-coverage", RunID: run.ID,
+		LeaseOwner: *initialLease.LeaseOwner, FencingToken: initialLease.FencingToken,
+		ProviderID: provider.ProviderID, ProviderGeneration: provider.ProviderGeneration,
+		ProviderActivationEpoch: provider.ProviderActivationEpoch,
+		Stage:                   HealthRunStageImportInitialSTAT, ObservationKind: HealthObservationSTAT,
+		SegmentStart: 0, SegmentCount: 2,
+		TestedBitmap: []byte{0b00000011}, PresentBitmap: []byte{0b00000001},
+		AbsentBitmap: []byte{0b00000010}, CorruptBitmap: []byte{0},
+		TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
+		ResolvedBitmap: []byte{0b00000011}, CursorSegment: 2,
+		ResolvedDelta: 2, ProviderChecksDelta: 2, MissingCandidatesDelta: 1,
+		CommittedAt: f.clock.now,
+	}
+	_, err = f.repo.CommitHealthChunk(ctx, initialCoverage)
+	require.NoError(t, err)
 	_, err = f.repo.UpsertImportValidation(ctx, waiting)
 	require.NoError(t, err)
 	f.clock.now = f.now.Add(2 * time.Second)
@@ -234,6 +256,14 @@ func TestPR5ImportConfirmationPassIsFencedAndRestartDiscoverable(t *testing.T) {
 	confirmation.FencingToken = confirmationLease.FencingToken
 	_, err = f.repo.UpsertImportValidation(ctx, confirmation)
 	require.NoError(t, err)
+	prematureTerminal := confirmation
+	prematureTerminal.Phase = ImportValidationPhaseRejected
+	prematureTerminal.SecondPassComplete = true
+	prematureTerminal.UpdatedAt = due.Add(time.Second)
+	f.clock.now = prematureTerminal.UpdatedAt
+	_, err = f.repo.UpsertImportValidation(ctx, prematureTerminal)
+	require.Error(t, err,
+		"a terminal decision requires complete targeted confirmation STAT coverage for every unresolved provider tuple")
 
 	f.clock.now = *confirmationLease.LeaseExpiresAt
 	freshLease, err := f.repo.ClaimDueHealthRun(ctx, "restart-worker", time.Minute)
@@ -250,10 +280,43 @@ func TestPR5ImportConfirmationPassIsFencedAndRestartDiscoverable(t *testing.T) {
 	staleTerminal := confirmation
 	staleTerminal.Phase = ImportValidationPhaseRejected
 	staleTerminal.SecondPassComplete = true
-	staleTerminal.UpdatedAt = f.clock.now.Add(time.Second)
+	staleTerminal.UpdatedAt = f.clock.now
 	_, err = restarted.UpsertImportValidation(ctx, staleTerminal)
 	require.ErrorIs(t, err, ErrStaleHealthLease,
 		"the expired confirmation worker cannot publish a terminal import decision")
+
+	confirmationCoverage := HealthChunkCommit{
+		ChunkID: "audit-import-confirmation-coverage", RunID: run.ID,
+		LeaseOwner: *freshLease.LeaseOwner, FencingToken: freshLease.FencingToken,
+		ProviderID: provider.ProviderID, ProviderGeneration: provider.ProviderGeneration,
+		ProviderActivationEpoch: provider.ProviderActivationEpoch,
+		Stage:                   HealthRunStageImportConfirmationSTAT, ObservationKind: HealthObservationSTAT,
+		SegmentStart: 1, SegmentCount: 1,
+		TestedBitmap: []byte{1}, PresentBitmap: []byte{0}, AbsentBitmap: []byte{1},
+		CorruptBitmap: []byte{0}, TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
+		ResolvedBitmap: []byte{1}, CursorSegment: 2,
+		ResolvedDelta: 1, ProviderChecksDelta: 1, MissingCandidatesDelta: 1,
+		CommittedAt: f.clock.now,
+	}
+	_, err = restarted.CommitHealthChunk(ctx, confirmationCoverage)
+	require.NoError(t, err)
+
+	terminal := confirmation
+	terminal.Phase = ImportValidationPhaseRejected
+	terminal.SecondPassComplete = true
+	terminal.LeaseOwner = *freshLease.LeaseOwner
+	terminal.FencingToken = freshLease.FencingToken
+	terminal.UpdatedAt = f.clock.now.Add(time.Second)
+	f.clock.now = terminal.UpdatedAt
+	completedValidation, err := restarted.UpsertImportValidation(ctx, terminal)
+	require.NoError(t, err)
+	assert.Equal(t, ImportValidationPhaseRejected, completedValidation.Phase)
+	completedRun, err := restarted.GetHealthRun(ctx, run.ID)
+	require.NoError(t, err)
+	require.NotNil(t, completedRun)
+	assert.Equal(t, HealthRunCompleted, completedRun.Status,
+		"the fenced terminal import transition and run completion must commit atomically")
+	assert.Nil(t, completedRun.LeaseOwner)
 }
 
 func TestPR5GapRejectsBodyPresencePredatingItsEpisode(t *testing.T) {
@@ -419,6 +482,72 @@ func TestPR5GenericGapUpsertCannotClearOrForgeConfirmations(t *testing.T) {
 	})
 	require.Error(t, err,
 		"a caller-supplied count cannot manufacture time-separated confirmation evidence")
+
+	_, err = f.repo.UpsertGapRange(ctx, GapRangeWrite{
+		ID: "forged-legacy-epoch-gap", FileRevisionID: f.run.FileRevisionID,
+		Kind: GapKindProvisional, StartSegment: 5, SegmentCount: 1,
+		Status: GapStatusActive, CreatedAt: f.now,
+		Causes: []GapProviderCause{{
+			ProviderID: f.providerID, ProviderGeneration: 1,
+			ProviderActivationEpoch: 0, Cause: GapCauseAbsent,
+			ConfirmationCount: 2, ConfirmedAt: f.now,
+		}},
+	})
+	require.Error(t, err,
+		"an epoch-zero compatibility value cannot bypass activation-scoped durable evidence")
+
+	_, err = f.repo.UpsertGapRange(ctx, GapRangeWrite{
+		ID: "forged-confirmed-kind-gap", FileRevisionID: f.run.FileRevisionID,
+		Kind: GapKindConfirmedAbsent, StartSegment: 6, SegmentCount: 1,
+		Status: GapStatusActive, CreatedAt: f.now,
+	})
+	require.Error(t, err,
+		"a confirmed gap kind requires evidence-derived time-separated causes for every active provider")
+}
+
+func TestPR5GapConfirmationCountUsesTimeSeparatedDurableEvents(t *testing.T) {
+	f := newPR4RunFixture(t)
+	ctx := context.Background()
+	gapWrite := GapRangeWrite{
+		ID: "time-separated-gap", FileRevisionID: f.run.FileRevisionID,
+		Kind: GapKindProvisional, StartSegment: 1, SegmentCount: 1,
+		Status: GapStatusActive, CreatedAt: f.now,
+	}
+	_, err := f.repo.UpsertGapRange(ctx, gapWrite)
+	require.NoError(t, err)
+	lease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "time-separated-worker", 30*time.Minute)
+	require.NoError(t, err)
+
+	commitAt := func(id, stage string, at time.Time) {
+		t.Helper()
+		f.clock.now = at
+		commit := pr5AuditAbsentCommit(f, f.run, lease, id, stage, 1, 1, at)
+		_, commitErr := f.repo.CommitHealthChunk(ctx, commit)
+		require.NoError(t, commitErr)
+	}
+	firstAt := f.now.Add(time.Minute)
+	commitAt("time-separated-first", "time_separated_first", firstAt)
+	commitAt("time-separated-too-soon", "time_separated_too_soon", firstAt.Add(9*time.Minute))
+
+	gapWrite.Causes = []GapProviderCause{{
+		ProviderID: f.providerID, ProviderGeneration: 1, ProviderActivationEpoch: 1,
+		Cause: GapCauseAbsent,
+	}}
+	gap, err := f.repo.UpsertGapRange(ctx, gapWrite)
+	require.NoError(t, err)
+	require.Len(t, gap.Causes, 1)
+	assert.Equal(t, 1, gap.Causes[0].ConfirmationCount,
+		"evidence inside the ten-minute minimum cannot increment persistent confirmation")
+	assert.Equal(t, firstAt, gap.Causes[0].ConfirmedAt)
+
+	thirdAt := firstAt.Add(10 * time.Minute)
+	commitAt("time-separated-boundary", "time_separated_boundary", thirdAt)
+	gap, err = f.repo.UpsertGapRange(ctx, gapWrite)
+	require.NoError(t, err)
+	require.Len(t, gap.Causes, 1)
+	assert.Equal(t, 2, gap.Causes[0].ConfirmationCount)
+	assert.Equal(t, thirdAt, gap.Causes[0].ConfirmedAt,
+		"the exact ten-minute boundary supplies the second independent confirmation")
 }
 
 func TestPR5ClearedGapScheduleIsRetiredBeforeClaim(t *testing.T) {

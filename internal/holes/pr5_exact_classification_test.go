@@ -35,7 +35,7 @@ func TestPR5ClassifyPositionsUsesExactUsableBytes(t *testing.T) {
 		{
 			name:         "variable segments sum their own spans not an average",
 			missing:      []int{0, 3},
-			segmentBytes: []int64{50, 4_900, 4_900, 50},
+			segmentBytes: []int64{50, 5_000, 4_900, 50},
 			want:         VerdictDegraded,
 			wantRatio:    0.01,
 		},
@@ -59,6 +59,7 @@ func TestPR5ClassifyPositionsUsesPositionalRuns(t *testing.T) {
 	for i := range segmentBytes {
 		segmentBytes[i] = 1
 	}
+	segmentBytes[99] += 9_900
 
 	impact, err := ClassifyPositions([]int{12, 10, 14, 11, 13}, segmentBytes, 10_000)
 	require.NoError(t, err)

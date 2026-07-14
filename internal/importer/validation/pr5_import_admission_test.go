@@ -10,57 +10,144 @@ import (
 )
 
 const (
-	pr5ProviderPrimary = "provider-primary"
-	pr5ProviderBackup  = "provider-backup"
+	pr5ProviderPrimary   = "provider-primary"
+	pr5ProviderBackup    = "provider-backup"
+	pr5ProviderEpoch     = int64(1)
+	pr5LayoutFingerprint = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 )
 
 func pr5Code(code int) *int { return &code }
 
-func pr5Attempt(provider string, outcome nntppool.OutcomeKind, code int) ImportAvailabilityAttempt {
-	attempt := ImportAvailabilityAttempt{
-		ProviderID:         provider,
-		ProviderGeneration: 1,
-		Outcome:            outcome,
-		CauseClass:         "synthetic-" + string(outcome),
-		Completed:          true,
+func pr5Check(provider string, outcome nntppool.OutcomeKind, code int) ImportProviderCheck {
+	check := ImportProviderCheck{
+		ProviderID:              provider,
+		ProviderGeneration:      1,
+		ProviderActivationEpoch: pr5ProviderEpoch,
+		Operation:               nntppool.OperationStat,
+		Outcome:                 outcome,
+		BodyValidation:          nntppool.BodyValidationNotApplicable,
+		CompletionDisposition:   ImportCheckDispositionAttempted,
+		RawAttempts: []nntppool.AttemptEvidence{
+			{
+				ProviderID:     provider,
+				Operation:      nntppool.OperationStat,
+				Outcome:        outcome,
+				ResponseCode:   code,
+				BodyValidation: nntppool.BodyValidationNotApplicable,
+			},
+		},
 	}
 	if code != 0 {
-		attempt.ResponseCode = pr5Code(code)
+		check.ResponseCode = pr5Code(code)
 	}
-	return attempt
+	return check
 }
 
-func pr5Position(index int, start, end int64, initial, confirmation []ImportAvailabilityAttempt) ImportAvailabilityPosition {
+func pr5IncompleteCheck(provider string, outcome nntppool.OutcomeKind, includeRawAttempt bool) ImportProviderCheck {
+	check := ImportProviderCheck{
+		ProviderID:              provider,
+		ProviderGeneration:      1,
+		ProviderActivationEpoch: pr5ProviderEpoch,
+		Operation:               nntppool.OperationStat,
+		Outcome:                 outcome,
+		BodyValidation:          nntppool.BodyValidationNotApplicable,
+		CompletionDisposition:   ImportCheckDispositionIncomplete,
+	}
+	if includeRawAttempt {
+		check.RawAttempts = []nntppool.AttemptEvidence{
+			{
+				ProviderID:     provider,
+				Operation:      nntppool.OperationStat,
+				Outcome:        outcome,
+				BodyValidation: nntppool.BodyValidationNotApplicable,
+			},
+		}
+	}
+	return check
+}
+
+func pr5Position(index int, start, end int64, initial, confirmation []ImportProviderCheck) ImportAvailabilityPosition {
 	return ImportAvailabilityPosition{
-		Index:                index,
-		StartOffset:          start,
-		EndOffset:            end,
-		InitialAttempts:      initial,
-		ConfirmationAttempts: confirmation,
+		Index:              index,
+		StartOffset:        start,
+		EndOffset:          end,
+		InitialChecks:      initial,
+		ConfirmationChecks: confirmation,
 	}
 }
 
-func pr5AdmissionInput(policy string, positions []ImportAvailabilityPosition) ImportAdmissionInput {
+func pr5AdmissionInput(policy string, fileSize int64, fixtures []ImportAvailabilityPosition) ImportAdmissionInput {
+	fixtureByIndex := make(map[int]ImportAvailabilityPosition, len(fixtures))
+	maxIndex := -1
+	var explicitBytes int64
+	for _, fixture := range fixtures {
+		fixtureByIndex[fixture.Index] = fixture
+		if fixture.Index > maxIndex {
+			maxIndex = fixture.Index
+		}
+		explicitBytes += fixture.EndOffset - fixture.StartOffset + 1
+	}
+
+	// Fill any omitted canonical positions with healthy synthetic coverage. If
+	// every listed position is explicit, append one healthy position so the
+	// fixture still describes the complete virtual file rather than a sample.
+	positionCount := maxIndex + 1
+	fillerCount := positionCount - len(fixtures)
+	if fillerCount == 0 {
+		positionCount++
+		fillerCount++
+	}
+	fillerBytes := fileSize - explicitBytes
+	positions := make([]ImportAvailabilityPosition, positionCount)
+	spans := make([]int64, positionCount)
+	firstFiller := true
+	for index := range positions {
+		if fixture, ok := fixtureByIndex[index]; ok {
+			spans[index] = fixture.EndOffset - fixture.StartOffset + 1
+			fixture.StartOffset = 0
+			fixture.EndOffset = 0
+			positions[index] = fixture
+			continue
+		}
+
+		span := int64(1)
+		if firstFiller {
+			span += fillerBytes - int64(fillerCount)
+			firstFiller = false
+		}
+		spans[index] = span
+		positions[index] = ImportAvailabilityPosition{
+			Index: index,
+			InitialChecks: []ImportProviderCheck{
+				pr5Check(pr5ProviderPrimary, nntppool.OutcomeSuccess, 223),
+			},
+		}
+	}
+
 	return ImportAdmissionInput{
-		DamagePolicy:        policy,
-		Filename:            "synthetic-video.mkv",
-		FileSize:            10_000,
-		InitialPassComplete: true,
+		DamagePolicy:              policy,
+		Filename:                  "synthetic-video.mkv",
+		FileSize:                  fileSize,
+		FinalLayoutFingerprint:    pr5LayoutFingerprint,
+		EvidenceLayoutFingerprint: pr5LayoutFingerprint,
+		CanonicalUsableBytes:      spans,
+		UncomplicatedStandalone:   true,
+		InitialPassComplete:       true,
 		ActiveProviders: []ImportAvailabilityProvider{
-			{ID: pr5ProviderPrimary, Generation: 1},
-			{ID: pr5ProviderBackup, Generation: 1},
+			{ID: pr5ProviderPrimary, Generation: 1, ActivationEpoch: pr5ProviderEpoch},
+			{ID: pr5ProviderBackup, Generation: 1, ActivationEpoch: pr5ProviderEpoch},
 		},
 		Positions: positions,
 	}
 }
 
 func TestPR5ImportAdmissionCleanCompleteCoverageIsAccepted(t *testing.T) {
-	input := pr5AdmissionInput("strict", []ImportAvailabilityPosition{
-		pr5Position(0, 0, 99, []ImportAvailabilityAttempt{
-			pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeSuccess, 223),
+	input := pr5AdmissionInput("strict", 10_000, []ImportAvailabilityPosition{
+		pr5Position(0, 0, 99, []ImportProviderCheck{
+			pr5Check(pr5ProviderPrimary, nntppool.OutcomeSuccess, 223),
 		}, nil),
-		pr5Position(1, 100, 199, []ImportAvailabilityAttempt{
-			pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeSuccess, 223),
+		pr5Position(1, 100, 199, []ImportProviderCheck{
+			pr5Check(pr5ProviderPrimary, nntppool.OutcomeSuccess, 223),
 		}, nil),
 	})
 
@@ -77,17 +164,17 @@ func TestPR5ImportAdmissionCleanCompleteCoverageIsAccepted(t *testing.T) {
 }
 
 func TestPR5ImportAdmissionReturnsDurableThirtySecondTargetPlan(t *testing.T) {
-	input := pr5AdmissionInput("strict", []ImportAvailabilityPosition{
-		pr5Position(0, 0, 99, []ImportAvailabilityAttempt{
-			pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeSuccess, 223),
+	input := pr5AdmissionInput("strict", 10_000, []ImportAvailabilityPosition{
+		pr5Position(0, 0, 99, []ImportProviderCheck{
+			pr5Check(pr5ProviderPrimary, nntppool.OutcomeSuccess, 223),
 		}, nil),
-		pr5Position(1, 100, 199, []ImportAvailabilityAttempt{
-			pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
-			pr5Attempt(pr5ProviderBackup, nntppool.OutcomeHardArticleAbsence, 430),
+		pr5Position(1, 100, 199, []ImportProviderCheck{
+			pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+			pr5Check(pr5ProviderBackup, nntppool.OutcomeHardArticleAbsence, 430),
 		}, nil),
-		pr5Position(2, 200, 299, []ImportAvailabilityAttempt{
-			pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeTemporaryFailure, 451),
-			pr5Attempt(pr5ProviderBackup, nntppool.OutcomeProviderUnavailable, 0),
+		pr5Position(2, 200, 299, []ImportProviderCheck{
+			pr5Check(pr5ProviderPrimary, nntppool.OutcomeTemporaryFailure, 451),
+			pr5Check(pr5ProviderBackup, nntppool.OutcomeProviderUnavailable, 0),
 		}, nil),
 	})
 
@@ -103,10 +190,10 @@ func TestPR5ImportAdmissionReturnsDurableThirtySecondTargetPlan(t *testing.T) {
 	}
 
 	want := []ImportConfirmationTarget{
-		{Position: 1, ProviderID: pr5ProviderPrimary, ProviderGeneration: 1},
-		{Position: 1, ProviderID: pr5ProviderBackup, ProviderGeneration: 1},
-		{Position: 2, ProviderID: pr5ProviderPrimary, ProviderGeneration: 1},
-		{Position: 2, ProviderID: pr5ProviderBackup, ProviderGeneration: 1},
+		{Position: 1, ProviderID: pr5ProviderPrimary, ProviderGeneration: 1, ProviderActivationEpoch: pr5ProviderEpoch},
+		{Position: 1, ProviderID: pr5ProviderBackup, ProviderGeneration: 1, ProviderActivationEpoch: pr5ProviderEpoch},
+		{Position: 2, ProviderID: pr5ProviderPrimary, ProviderGeneration: 1, ProviderActivationEpoch: pr5ProviderEpoch},
+		{Position: 2, ProviderID: pr5ProviderBackup, ProviderGeneration: 1, ProviderActivationEpoch: pr5ProviderEpoch},
 	}
 	if !reflect.DeepEqual(got.ConfirmationTargets, want) {
 		t.Fatalf("confirmation targets = %#v, want only unresolved positions across every provider %#v", got.ConfirmationTargets, want)
@@ -114,15 +201,15 @@ func TestPR5ImportAdmissionReturnsDurableThirtySecondTargetPlan(t *testing.T) {
 }
 
 func TestPR5ImportAdmissionAnyProviderSuccessWins(t *testing.T) {
-	input := pr5AdmissionInput("strict", []ImportAvailabilityPosition{
+	input := pr5AdmissionInput("strict", 10_000, []ImportAvailabilityPosition{
 		pr5Position(0, 0, 99,
-			[]ImportAvailabilityAttempt{
-				pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
-				pr5Attempt(pr5ProviderBackup, nntppool.OutcomeTemporaryFailure, 451),
+			[]ImportProviderCheck{
+				pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+				pr5Check(pr5ProviderBackup, nntppool.OutcomeTemporaryFailure, 451),
 			},
-			[]ImportAvailabilityAttempt{
-				pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
-				pr5Attempt(pr5ProviderBackup, nntppool.OutcomeSuccess, 223),
+			[]ImportProviderCheck{
+				pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+				pr5Check(pr5ProviderBackup, nntppool.OutcomeSuccess, 223),
 			}),
 	})
 	input.SecondPassComplete = true
@@ -140,15 +227,15 @@ func TestPR5ImportAdmissionAnyProviderSuccessWins(t *testing.T) {
 }
 
 func TestPR5StrictImportRejectsCompletedUnresolvedAndPreservesCauses(t *testing.T) {
-	input := pr5AdmissionInput("strict", []ImportAvailabilityPosition{
+	input := pr5AdmissionInput("strict", 10_000, []ImportAvailabilityPosition{
 		pr5Position(0, 0, 99,
-			[]ImportAvailabilityAttempt{
-				pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
-				pr5Attempt(pr5ProviderBackup, nntppool.OutcomeTemporaryFailure, 451),
+			[]ImportProviderCheck{
+				pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+				pr5Check(pr5ProviderBackup, nntppool.OutcomeTemporaryFailure, 451),
 			},
-			[]ImportAvailabilityAttempt{
-				pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
-				pr5Attempt(pr5ProviderBackup, nntppool.OutcomeTemporaryFailure, 451),
+			[]ImportProviderCheck{
+				pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+				pr5Check(pr5ProviderBackup, nntppool.OutcomeTemporaryFailure, 451),
 			}),
 	})
 	input.SecondPassComplete = true
@@ -164,14 +251,14 @@ func TestPR5StrictImportRejectsCompletedUnresolvedAndPreservesCauses(t *testing.
 		t.Fatalf("unresolved positions = %d, want 1", len(got.Unresolved))
 	}
 
-	evidence := got.Unresolved[0].ConfirmationAttempts
+	evidence := got.Unresolved[0].ConfirmationChecks
 	if len(evidence) != 2 {
-		t.Fatalf("preserved confirmation attempts = %d, want 2", len(evidence))
+		t.Fatalf("preserved confirmation checks = %d, want 2", len(evidence))
 	}
-	if evidence[0].Outcome != nntppool.OutcomeHardArticleAbsence || evidence[0].ResponseCode == nil || *evidence[0].ResponseCode != 430 {
+	if evidence[0].Outcome != nntppool.OutcomeHardArticleAbsence || evidence[0].ResponseCode == nil || *evidence[0].ResponseCode != 430 || len(evidence[0].RawAttempts) != 1 || evidence[0].RawAttempts[0].ResponseCode != 430 {
 		t.Fatalf("hard-absence evidence changed: %+v", evidence[0])
 	}
-	if evidence[1].Outcome != nntppool.OutcomeTemporaryFailure || evidence[1].ResponseCode == nil || *evidence[1].ResponseCode != 451 {
+	if evidence[1].Outcome != nntppool.OutcomeTemporaryFailure || evidence[1].ResponseCode == nil || *evidence[1].ResponseCode != 451 || len(evidence[1].RawAttempts) != 1 || evidence[1].RawAttempts[0].ResponseCode != 451 {
 		t.Fatalf("451 evidence was rewritten instead of retained as temporary: %+v", evidence[1])
 	}
 }
@@ -189,9 +276,9 @@ func TestPR5TolerantImportUsesExactPositionAndByteEnvelope(t *testing.T) {
 			filename: "synthetic-video.mkv",
 			fileSize: 10_000,
 			positions: []ImportAvailabilityPosition{
-				pr5Position(2, 2_000, 2_099, pr5CompletedMissingAttempts(), []ImportAvailabilityAttempt{
-					pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
-					pr5Attempt(pr5ProviderBackup, nntppool.OutcomeTemporaryFailure, 451),
+				pr5Position(2, 2_000, 2_099, pr5CompletedMissingChecks(), []ImportProviderCheck{
+					pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+					pr5Check(pr5ProviderBackup, nntppool.OutcomeTemporaryFailure, 451),
 				}),
 			},
 			want: ImportAdmissionHealthPending,
@@ -201,9 +288,9 @@ func TestPR5TolerantImportUsesExactPositionAndByteEnvelope(t *testing.T) {
 			filename: "synthetic-video.mkv",
 			fileSize: 10_000,
 			positions: []ImportAvailabilityPosition{
-				pr5Position(2, 2_000, 2_299, pr5CompletedMissingAttempts(), []ImportAvailabilityAttempt{
-					pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
-					pr5Attempt(pr5ProviderBackup, nntppool.OutcomeHardArticleAbsence, 430),
+				pr5Position(2, 2_000, 2_299, pr5CompletedMissingChecks(), []ImportProviderCheck{
+					pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+					pr5Check(pr5ProviderBackup, nntppool.OutcomeHardArticleAbsence, 430),
 				}),
 			},
 			want: ImportAdmissionReject,
@@ -213,11 +300,11 @@ func TestPR5TolerantImportUsesExactPositionAndByteEnvelope(t *testing.T) {
 			filename: "synthetic-video.mkv",
 			fileSize: 100_000,
 			positions: []ImportAvailabilityPosition{
-				pr5Position(2, 2_000, 2_099, pr5CompletedMissingAttempts(), pr5CompletedMissingAttempts()),
-				pr5Position(3, 2_100, 2_199, pr5CompletedMissingAttempts(), pr5CompletedMissingAttempts()),
-				pr5Position(4, 2_200, 2_299, pr5CompletedMissingAttempts(), pr5CompletedMissingAttempts()),
-				pr5Position(5, 2_300, 2_399, pr5CompletedMissingAttempts(), pr5CompletedMissingAttempts()),
-				pr5Position(6, 2_400, 2_499, pr5CompletedMissingAttempts(), pr5CompletedMissingAttempts()),
+				pr5Position(2, 2_000, 2_099, pr5CompletedMissingChecks(), pr5CompletedMissingChecks()),
+				pr5Position(3, 2_100, 2_199, pr5CompletedMissingChecks(), pr5CompletedMissingChecks()),
+				pr5Position(4, 2_200, 2_299, pr5CompletedMissingChecks(), pr5CompletedMissingChecks()),
+				pr5Position(5, 2_300, 2_399, pr5CompletedMissingChecks(), pr5CompletedMissingChecks()),
+				pr5Position(6, 2_400, 2_499, pr5CompletedMissingChecks(), pr5CompletedMissingChecks()),
 			},
 			want: ImportAdmissionReject,
 		},
@@ -226,7 +313,7 @@ func TestPR5TolerantImportUsesExactPositionAndByteEnvelope(t *testing.T) {
 			filename: "synthetic-volume.rar",
 			fileSize: 100_000,
 			positions: []ImportAvailabilityPosition{
-				pr5Position(2, 2_000, 2_099, pr5CompletedMissingAttempts(), pr5CompletedMissingAttempts()),
+				pr5Position(2, 2_000, 2_099, pr5CompletedMissingChecks(), pr5CompletedMissingChecks()),
 			},
 			want: ImportAdmissionReject,
 		},
@@ -234,9 +321,8 @@ func TestPR5TolerantImportUsesExactPositionAndByteEnvelope(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			input := pr5AdmissionInput("tolerant", tt.positions)
+			input := pr5AdmissionInput("tolerant", tt.fileSize, tt.positions)
 			input.Filename = tt.filename
-			input.FileSize = tt.fileSize
 			input.SecondPassComplete = true
 
 			got, err := DecideImportAdmission(context.Background(), input)
@@ -250,58 +336,46 @@ func TestPR5TolerantImportUsesExactPositionAndByteEnvelope(t *testing.T) {
 	}
 }
 
-func pr5CompletedMissingAttempts() []ImportAvailabilityAttempt {
-	return []ImportAvailabilityAttempt{
-		pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
-		pr5Attempt(pr5ProviderBackup, nntppool.OutcomeHardArticleAbsence, 430),
+func pr5CompletedMissingChecks() []ImportProviderCheck {
+	return []ImportProviderCheck{
+		pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+		pr5Check(pr5ProviderBackup, nntppool.OutcomeHardArticleAbsence, 430),
 	}
 }
 
 func TestPR5ImportCannotRejectIncompleteConfirmationWork(t *testing.T) {
 	tests := []struct {
-		name     string
-		attempts []ImportAvailabilityAttempt
+		name   string
+		checks []ImportProviderCheck
 	}{
 		{
 			name: "provider was never attempted",
-			attempts: []ImportAvailabilityAttempt{
-				pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+			checks: []ImportProviderCheck{
+				pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
 			},
 		},
 		{
 			name: "canceled provider attempt",
-			attempts: []ImportAvailabilityAttempt{
-				pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
-				{
-					ProviderID:         pr5ProviderBackup,
-					ProviderGeneration: 1,
-					Outcome:            nntppool.OutcomeCancellation,
-					CauseClass:         "synthetic-canceled",
-					Completed:          false,
-				},
+			checks: []ImportProviderCheck{
+				pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+				pr5IncompleteCheck(pr5ProviderBackup, nntppool.OutcomeCancellation, true),
 			},
 		},
 		{
 			name: "omitted result remains incomplete",
-			attempts: []ImportAvailabilityAttempt{
-				pr5Attempt(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
-				{
-					ProviderID:         pr5ProviderBackup,
-					ProviderGeneration: 1,
-					Outcome:            nntppool.OutcomeInconclusive,
-					CauseClass:         "synthetic-omitted",
-					Completed:          false,
-				},
+			checks: []ImportProviderCheck{
+				pr5Check(pr5ProviderPrimary, nntppool.OutcomeHardArticleAbsence, 430),
+				pr5IncompleteCheck(pr5ProviderBackup, nntppool.OutcomeInconclusive, false),
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			input := pr5AdmissionInput("strict", []ImportAvailabilityPosition{
+			input := pr5AdmissionInput("strict", 10_000, []ImportAvailabilityPosition{
 				pr5Position(0, 0, 99,
-					pr5CompletedMissingAttempts(),
-					tt.attempts),
+					pr5CompletedMissingChecks(),
+					tt.checks),
 			})
 			input.SecondPassComplete = true
 
@@ -319,8 +393,8 @@ func TestPR5ImportCannotRejectIncompleteConfirmationWork(t *testing.T) {
 func TestPR5ImportCancellationNeverBecomesAdmissionRejection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	input := pr5AdmissionInput("strict", []ImportAvailabilityPosition{
-		pr5Position(0, 0, 99, pr5CompletedMissingAttempts(), nil),
+	input := pr5AdmissionInput("strict", 10_000, []ImportAvailabilityPosition{
+		pr5Position(0, 0, 99, pr5CompletedMissingChecks(), nil),
 	})
 
 	got, err := DecideImportAdmission(ctx, input)
