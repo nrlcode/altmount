@@ -363,6 +363,26 @@ func (r *QueueRepository) UpdateQueueItemStatus(ctx context.Context, id int64, s
 	return nil
 }
 
+// ResumePausedQueueItem atomically returns a validation-waiting import to the
+// pending queue. The paused predicate fences duplicate resumers and prevents a
+// stale validation timer from resurrecting terminal work.
+func (r *QueueRepository) ResumePausedQueueItem(ctx context.Context, id int64) (bool, error) {
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE import_queue
+		SET status = ?, error_message = NULL, started_at = NULL, updated_at = ?
+		WHERE id = ? AND status = ?
+	`, QueueStatusPending, time.Now(), id, QueueStatusPaused)
+	if err != nil {
+		return false, fmt.Errorf("failed to resume paused queue item: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect resumed queue item: %w", err)
+	}
+	return rows > 0, nil
+}
+
 // IncrementDailyStat increments the completed or failed count for the current day
 func (r *QueueRepository) IncrementDailyStat(ctx context.Context, statType string) error {
 	if statType != "completed" && statType != "failed" {

@@ -51,6 +51,8 @@ type HealthProvider struct {
 	Order             int
 	Active            bool
 	CurrentGeneration int64
+	ActivationEpoch   int64
+	ActivatedAt       time.Time
 	TombstonedAt      *time.Time
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
@@ -67,10 +69,11 @@ type HealthProviderGeneration struct {
 }
 
 type ProviderSnapshotEntry struct {
-	ProviderID         string
-	ProviderGeneration int64
-	Role               ProviderRole
-	Order              int
+	ProviderID              string
+	ProviderGeneration      int64
+	ProviderActivationEpoch int64
+	Role                    ProviderRole
+	Order                   int
 }
 
 type ProviderSnapshot struct {
@@ -125,6 +128,7 @@ type HealthRun struct {
 	StartedAt                 *time.Time
 	UpdatedAt                 time.Time
 	CompletedAt               *time.Time
+	LastError                 string
 }
 
 type HealthAttemptEvidence struct {
@@ -176,32 +180,41 @@ const (
 	HealthObservationValidatedBody HealthObservationKind = "validated_body"
 )
 
+// Health-run stages used by import admission are a durable database contract:
+// phase transitions are derived from chunks committed under these exact names.
+const (
+	HealthRunStageImportInitialSTAT      = "import_initial_stat"
+	HealthRunStageImportConfirmationSTAT = "import_confirmation_stat"
+)
+
 type HealthChunkCommit struct {
-	ChunkID                string
-	RunID                  string
-	LeaseOwner             string
-	FencingToken           int64
-	ProviderID             string
-	ProviderGeneration     int64
-	Stage                  string
-	ObservationKind        HealthObservationKind
-	SegmentStart           int64
-	SegmentCount           int64
-	TestedBitmap           []byte
-	PresentBitmap          []byte
-	AbsentBitmap           []byte
-	CorruptBitmap          []byte
-	TemporaryBitmap        []byte
-	InconclusiveBitmap     []byte
-	CursorSegment          int64
-	ResolvedDelta          int64
-	ProviderChecksDelta    int64
-	MissingCandidatesDelta int64
-	InconclusiveDelta      int64
-	CommittedAt            time.Time
-	Attempts               []HealthAttemptEvidence
-	Confirmations          []HealthConfirmationEvent
-	Retry                  *HealthRetryState
+	ChunkID                 string
+	RunID                   string
+	LeaseOwner              string
+	FencingToken            int64
+	ProviderID              string
+	ProviderGeneration      int64
+	ProviderActivationEpoch int64
+	Stage                   string
+	ObservationKind         HealthObservationKind
+	SegmentStart            int64
+	SegmentCount            int64
+	TestedBitmap            []byte
+	PresentBitmap           []byte
+	AbsentBitmap            []byte
+	CorruptBitmap           []byte
+	TemporaryBitmap         []byte
+	InconclusiveBitmap      []byte
+	ResolvedBitmap          []byte
+	CursorSegment           int64
+	ResolvedDelta           int64
+	ProviderChecksDelta     int64
+	MissingCandidatesDelta  int64
+	InconclusiveDelta       int64
+	CommittedAt             time.Time
+	Attempts                []HealthAttemptEvidence
+	Confirmations           []HealthConfirmationEvent
+	Retry                   *HealthRetryState
 }
 
 type GapKind string
@@ -222,11 +235,12 @@ const (
 )
 
 type GapProviderCause struct {
-	ProviderID         string
-	ProviderGeneration int64
-	Cause              GapCause
-	ConfirmationCount  int
-	ConfirmedAt        time.Time
+	ProviderID              string
+	ProviderGeneration      int64
+	ProviderActivationEpoch int64
+	Cause                   GapCause
+	ConfirmationCount       int
+	ConfirmedAt             time.Time
 }
 
 type GapRangeWrite struct {
@@ -248,6 +262,7 @@ type HealthGapRange struct {
 	Kind           GapKind
 	StartSegment   int64
 	SegmentCount   int64
+	Episode        int64
 	Status         GapStatus
 	CreatedAt      time.Time
 	ConfirmedAt    *time.Time

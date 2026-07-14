@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,20 +21,46 @@ var (
 	ErrProviderSnapshotMismatch = errors.New("provider generation is not in the run dispatch snapshot")
 )
 
+const DefaultGapConfirmationMinimumDelay = 10 * time.Minute
+
 // HealthStateRepository owns the additive PR4 durable provider, revision, run,
 // observation, gap, and recovery state. The PR3 health engine is intentionally
 // not wired to it until PR5 observation mode.
 type HealthStateRepository struct {
-	db      *dialectAwareDB
-	dialect dialectHelper
-	now     func() time.Time
+	db                               *dialectAwareDB
+	dialect                          dialectHelper
+	now                              func() time.Time
+	gapConfirmationMinimumDelayNanos atomic.Int64
 }
 
 func NewHealthStateRepository(db *sql.DB, d Dialect) *HealthStateRepository {
-	return &HealthStateRepository{
+	repository := &HealthStateRepository{
 		db: newDialectAwareDB(db, d), dialect: dialectHelper{d: d},
 		now: func() time.Time { return time.Now().UTC() },
 	}
+	repository.gapConfirmationMinimumDelayNanos.Store(
+		int64(DefaultGapConfirmationMinimumDelay),
+	)
+	return repository
+}
+
+// SetGapConfirmationMinimumDelay configures how far apart two complete,
+// coherent confirmation waves must be. The setting is local to this repository
+// instance and can be updated safely while workers are active.
+func (r *HealthStateRepository) SetGapConfirmationMinimumDelay(delay time.Duration) error {
+	if delay <= 0 {
+		return fmt.Errorf("gap confirmation minimum delay must be positive")
+	}
+	r.gapConfirmationMinimumDelayNanos.Store(int64(delay))
+	return nil
+}
+
+func (r *HealthStateRepository) gapConfirmationMinimumDelay() time.Duration {
+	delay := time.Duration(r.gapConfirmationMinimumDelayNanos.Load())
+	if delay <= 0 {
+		return DefaultGapConfirmationMinimumDelay
+	}
+	return delay
 }
 
 func (r *HealthStateRepository) withTransaction(ctx context.Context, fn func(*dialectAwareTx) error) error {
@@ -211,21 +238,14 @@ func (r *HealthStateRepository) ReconcileProviders(ctx context.Context, specs []
 	}
 	sort.SliceStable(normalized, func(i, j int) bool { return normalized[i].spec.Order < normalized[j].spec.Order })
 
-	now := time.Now().UTC()
+	now := r.now().UTC()
 	seenIDs := make(map[string]struct{}, len(normalized))
+	activeIDs := make([]string, 0, len(normalized))
 	reservedIDs := make(map[string]struct{}, len(stableIDs))
 	for id := range stableIDs {
 		reservedIDs[id] = struct{}{}
 	}
 	err := r.withTransaction(ctx, func(tx *dialectAwareTx) error {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE health_providers
-			SET active = FALSE, tombstoned_at = ?, updated_at = ?
-			WHERE active = TRUE
-		`, now, now); err != nil {
-			return fmt.Errorf("tombstone prior providers: %w", err)
-		}
-
 		for _, desired := range normalized {
 			providerID := desired.spec.StableID
 			if providerID == "" {
@@ -248,25 +268,32 @@ func (r *HealthStateRepository) ReconcileProviders(ctx context.Context, specs []
 				return fmt.Errorf("provider configuration resolves to duplicate stable identity")
 			}
 			seenIDs[providerID] = struct{}{}
+			activeIDs = append(activeIDs, providerID)
 
-			var generation int64
+			var generation, activationEpoch int64
 			var currentIdentity string
+			var wasActive bool
+			var activatedAt time.Time
 			err := tx.QueryRowContext(ctx, `
-				SELECT p.current_generation, g.identity_fingerprint
+				SELECT p.current_generation, p.activation_epoch, p.activated_at,
+				       p.active, g.identity_fingerprint
 				FROM health_providers p
 				JOIN health_provider_generations g
 				  ON g.provider_id = p.id AND g.generation = p.current_generation
 				WHERE p.id = ?
-			`, providerID).Scan(&generation, &currentIdentity)
+			`, providerID).Scan(&generation, &activationEpoch, &activatedAt, &wasActive, &currentIdentity)
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
 				generation = 1
+				activationEpoch = 1
+				activatedAt = now
 				_, err = tx.ExecContext(ctx, `
 					INSERT INTO health_providers
 						(id, display_name, role, configured_order, active, current_generation,
-						 tombstoned_at, created_at, updated_at)
-					VALUES (?, ?, ?, ?, TRUE, 1, NULL, ?, ?)
-				`, providerID, desired.spec.DisplayName, desired.spec.Role, desired.spec.Order, now, now)
+						 activation_epoch, activated_at, tombstoned_at, created_at, updated_at)
+					VALUES (?, ?, ?, ?, TRUE, 1, 1, ?, NULL, ?, ?)
+				`, providerID, desired.spec.DisplayName, desired.spec.Role, desired.spec.Order,
+					activatedAt, now, now)
 				if err != nil {
 					return fmt.Errorf("insert provider registry row: %w", err)
 				}
@@ -276,6 +303,10 @@ func (r *HealthStateRepository) ReconcileProviders(ctx context.Context, specs []
 			case err != nil:
 				return fmt.Errorf("read provider registry row: %w", err)
 			default:
+				if !wasActive {
+					activationEpoch++
+					activatedAt = now
+				}
 				if currentIdentity != desired.identity {
 					generation++
 					if err := insertProviderGeneration(ctx, tx, providerID, generation, desired, now); err != nil {
@@ -285,13 +316,31 @@ func (r *HealthStateRepository) ReconcileProviders(ctx context.Context, specs []
 				_, err = tx.ExecContext(ctx, `
 					UPDATE health_providers
 					SET display_name = ?, role = ?, configured_order = ?, active = TRUE,
-					    current_generation = ?, tombstoned_at = NULL, updated_at = ?
+					    current_generation = ?, activation_epoch = ?, activated_at = ?,
+					    tombstoned_at = NULL, updated_at = ?
 					WHERE id = ?
-				`, desired.spec.DisplayName, desired.spec.Role, desired.spec.Order, generation, now, providerID)
+				`, desired.spec.DisplayName, desired.spec.Role, desired.spec.Order, generation,
+					activationEpoch, activatedAt, now, providerID)
 				if err != nil {
 					return fmt.Errorf("update provider registry row: %w", err)
 				}
 			}
+		}
+
+		query := `
+			UPDATE health_providers
+			SET active = FALSE, tombstoned_at = ?, updated_at = ?
+			WHERE active = TRUE
+		`
+		args := []any{now, now}
+		if len(activeIDs) > 0 {
+			query += ` AND id NOT IN (` + strings.TrimSuffix(strings.Repeat("?,", len(activeIDs)), ",") + `)`
+			for _, providerID := range activeIDs {
+				args = append(args, providerID)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("tombstone removed providers: %w", err)
 		}
 		return nil
 	})
@@ -340,14 +389,14 @@ func insertProviderGeneration(ctx context.Context, tx *dialectAwareTx, providerI
 
 func scanHealthProvider(row rowScanner, provider *HealthProvider) error {
 	return row.Scan(&provider.ID, &provider.DisplayName, &provider.Role, &provider.Order,
-		&provider.Active, &provider.CurrentGeneration, &provider.TombstonedAt,
-		&provider.CreatedAt, &provider.UpdatedAt)
+		&provider.Active, &provider.CurrentGeneration, &provider.ActivationEpoch,
+		&provider.ActivatedAt, &provider.TombstonedAt, &provider.CreatedAt, &provider.UpdatedAt)
 }
 
 func (r *HealthStateRepository) ListProviders(ctx context.Context, includeTombstoned bool) ([]HealthProvider, error) {
 	query := `
 		SELECT id, display_name, role, configured_order, active, current_generation,
-		       tombstoned_at, created_at, updated_at
+		       activation_epoch, activated_at, tombstoned_at, created_at, updated_at
 		FROM health_providers
 	`
 	if !includeTombstoned {
@@ -404,7 +453,7 @@ func (r *HealthStateRepository) CaptureActiveProviderSnapshot(ctx context.Contex
 			return fmt.Errorf("insert provider snapshot: %w", err)
 		}
 		rows, err := tx.QueryContext(ctx, `
-			SELECT id, current_generation, role, configured_order
+			SELECT id, current_generation, activation_epoch, role, configured_order
 			FROM health_providers
 			WHERE active = TRUE
 			ORDER BY configured_order, id
@@ -415,7 +464,8 @@ func (r *HealthStateRepository) CaptureActiveProviderSnapshot(ctx context.Contex
 		defer rows.Close()
 		for rows.Next() {
 			var entry ProviderSnapshotEntry
-			if err := rows.Scan(&entry.ProviderID, &entry.ProviderGeneration, &entry.Role, &entry.Order); err != nil {
+			if err := rows.Scan(&entry.ProviderID, &entry.ProviderGeneration,
+				&entry.ProviderActivationEpoch, &entry.Role, &entry.Order); err != nil {
 				return fmt.Errorf("scan provider snapshot entry: %w", err)
 			}
 			snapshot.Entries = append(snapshot.Entries, entry)
@@ -426,9 +476,11 @@ func (r *HealthStateRepository) CaptureActiveProviderSnapshot(ctx context.Contex
 		for _, entry := range snapshot.Entries {
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO health_provider_snapshot_entries
-					(snapshot_id, provider_id, provider_generation, role, configured_order)
-				VALUES (?, ?, ?, ?, ?)
-			`, snapshot.ID, entry.ProviderID, entry.ProviderGeneration, entry.Role, entry.Order); err != nil {
+					(snapshot_id, provider_id, provider_generation, provider_activation_epoch,
+					 role, configured_order)
+				VALUES (?, ?, ?, ?, ?, ?)
+			`, snapshot.ID, entry.ProviderID, entry.ProviderGeneration,
+				entry.ProviderActivationEpoch, entry.Role, entry.Order); err != nil {
 				return fmt.Errorf("insert provider snapshot entry: %w", err)
 			}
 		}
@@ -449,7 +501,7 @@ func (r *HealthStateRepository) GetProviderSnapshot(ctx context.Context, id stri
 		return nil, fmt.Errorf("get provider snapshot: %w", err)
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT provider_id, provider_generation, role, configured_order
+		SELECT provider_id, provider_generation, provider_activation_epoch, role, configured_order
 		FROM health_provider_snapshot_entries
 		WHERE snapshot_id = ?
 		ORDER BY configured_order, provider_id
@@ -460,7 +512,8 @@ func (r *HealthStateRepository) GetProviderSnapshot(ctx context.Context, id stri
 	defer rows.Close()
 	for rows.Next() {
 		var entry ProviderSnapshotEntry
-		if err := rows.Scan(&entry.ProviderID, &entry.ProviderGeneration, &entry.Role, &entry.Order); err != nil {
+		if err := rows.Scan(&entry.ProviderID, &entry.ProviderGeneration,
+			&entry.ProviderActivationEpoch, &entry.Role, &entry.Order); err != nil {
 			return nil, err
 		}
 		snapshot.Entries = append(snapshot.Entries, entry)
