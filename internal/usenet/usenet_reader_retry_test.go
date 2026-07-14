@@ -130,6 +130,28 @@ func TestRetry_ContextCancellation_StopsImmediately(t *testing.T) {
 	}
 }
 
+func TestPR3UntypedErrorTextDoesNotBecomeCorruptBody(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	fp := fakepool.New()
+	fp.SetBehavior(segments.MessageID(0), fakepool.SegmentBehavior{
+		Err: errors.New("vendor said data corruption detected in an unrelated diagnostic"),
+	})
+	rg := buildEagerRange(ctx, t, 1, 16)
+	ur := newReaderForTest(t, ctx, fp, rg, 1)
+
+	_, err := ur.downloadSegmentWithRetry(ctx, rg.segments[0])
+	if err == nil {
+		t.Fatal("download returned nil error")
+	}
+	var corruption *DataCorruptionError
+	if errors.As(err, &corruption) {
+		t.Fatalf("untyped error text was promoted to corrupt-body evidence: %v", err)
+	}
+}
+
 // TestMissingSegment_EmitsDebugLog verifies that a DebugContext log with
 // message "missing segment" is emitted when a segment permanently fails
 // with ErrArticleNotFound.
@@ -150,7 +172,7 @@ func TestMissingSegment_EmitsDebugLog(t *testing.T) {
 
 	var mu sync.Mutex
 	type logRecord struct {
-		msg  string
+		msg   string
 		segID string
 	}
 	var captured []logRecord

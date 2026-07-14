@@ -35,6 +35,23 @@ func (c *statOrderClient) StatMany(ctx context.Context, messageIDs []string, opt
 	return c.Client.StatMany(ctx, messageIDs, opts)
 }
 
+// scriptedStatClient returns exactly the supplied StatMany results. It lets
+// the regression suite model a transport failure or an early-closed sweep
+// without relying on timing or a live provider.
+type scriptedStatClient struct {
+	*fakepool.Client
+	results []nntppool.StatManyResult
+}
+
+func (c *scriptedStatClient) StatMany(context.Context, []string, nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
+	out := make(chan nntppool.StatManyResult, len(c.results))
+	for _, result := range c.results {
+		out <- result
+	}
+	close(out)
+	return out
+}
+
 func idList(prefix string, n int) []string {
 	ids := make([]string, n)
 	for i := range n {
@@ -90,7 +107,7 @@ func TestValidateSegmentAvailabilityBatch(t *testing.T) {
 		assert.Equal(t, int64(3), client.StatCalls())
 	})
 
-	t.Run("missing IDs capped at 50 per file", func(t *testing.T) {
+	t.Run("missing examples capped but positional set complete", func(t *testing.T) {
 		client := fakepool.New()
 		client.SetDefaultBehavior(fakepool.SegmentBehavior{Err: nntppool.ErrArticleNotFound})
 		mgr := &validationTestPoolManager{client: client}
@@ -100,6 +117,8 @@ func TestValidateSegmentAvailabilityBatch(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 60, results[0].MissingCount)
 		assert.Len(t, results[0].MissingIDs, 50)
+		assert.Len(t, results[0].MissingSegments, 60,
+			"classification input must retain every missing position")
 	})
 
 	t.Run("duplicate ID across files attributed to both", func(t *testing.T) {
@@ -113,6 +132,41 @@ func TestValidateSegmentAvailabilityBatch(t *testing.T) {
 		assert.Equal(t, 1, results[0].MissingCount)
 		assert.Equal(t, 1, results[1].MissingCount)
 	})
+}
+
+func TestValidateSegmentAvailabilityBatch_TemporaryResultIsIncomplete(t *testing.T) {
+	client := &scriptedStatClient{
+		Client: fakepool.New(),
+		results: []nntppool.StatManyResult{{
+			MessageID: "temporary@test",
+			Err:       errors.New("synthetic transport failure"),
+		}},
+	}
+	mgr := &validationTestPoolManager{client: client}
+
+	results, err := ValidateSegmentAvailabilityBatch(
+		context.Background(), [][]string{{"temporary@test"}}, mgr, 1, time.Second,
+	)
+	require.Error(t, err, "a non-conclusive result must make the sweep incomplete")
+	require.Len(t, results, 1)
+	assert.Zero(t, results[0].MissingCount,
+		"transport failures must never be counted as hard absence")
+	assert.Equal(t, 1, results[0].TotalChecked,
+		"the one returned result was actually checked")
+}
+
+func TestValidateSegmentAvailabilityBatch_OmittedResultIsIncomplete(t *testing.T) {
+	client := &scriptedStatClient{Client: fakepool.New()}
+	mgr := &validationTestPoolManager{client: client}
+
+	results, err := ValidateSegmentAvailabilityBatch(
+		context.Background(), [][]string{{"returned@test", "omitted@test"}}, mgr, 1, time.Second,
+	)
+	require.Error(t, err, "an early-closed StatMany stream must not look healthy")
+	require.Len(t, results, 1)
+	assert.Zero(t, results[0].MissingCount)
+	assert.Zero(t, results[0].TotalChecked,
+		"TotalChecked must count results received, not work requested")
 }
 
 func TestValidateSegmentAvailabilityBatch_PoolUnavailable(t *testing.T) {

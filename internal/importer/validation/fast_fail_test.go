@@ -13,7 +13,7 @@ import (
 )
 
 type fastFailPoolManager struct {
-	client *fakepool.Client
+	client pool.NntpClient
 }
 
 func (m fastFailPoolManager) GetPool() (pool.NntpClient, error) { return m.client, nil }
@@ -46,6 +46,20 @@ func (m fastFailPoolManager) SetImportConnCapacity(int)                 {}
 func (m fastFailPoolManager) ImportConnCapacity() int                   { return 0 }
 func (m fastFailPoolManager) SetStreamSource(pool.StreamActivitySource) {}
 func (m fastFailPoolManager) NotifyStreamChange()                       {}
+
+type scriptedFastFailClient struct {
+	*fakepool.Client
+	results []nntppool.StatManyResult
+}
+
+func (c *scriptedFastFailClient) StatMany(context.Context, []string, nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
+	out := make(chan nntppool.StatManyResult, len(c.results))
+	for _, result := range c.results {
+		out <- result
+	}
+	close(out)
+	return out
+}
 
 func TestFastFailReleaseProbeUsesSegmentSamplePercentage(t *testing.T) {
 	client := fakepool.New()
@@ -104,6 +118,46 @@ func TestFastFailReleaseProbeReportsMissingOnUnreachableSegment(t *testing.T) {
 	}
 	if !missing {
 		t.Fatal("missing = false, want true (rar-2 is unreachable)")
+	}
+}
+
+func TestFastFailReleaseProbeTemporaryFailureIsIncomplete(t *testing.T) {
+	client := &scriptedFastFailClient{
+		Client: fakepool.New(),
+		results: []nntppool.StatManyResult{{
+			MessageID: "temporary-0",
+			Err:       fmt.Errorf("synthetic transport failure"),
+		}},
+	}
+
+	missing, err := FastFailReleaseProbe(
+		context.Background(),
+		[]FastFailFile{{Filename: "movie.mkv", Segments: makeTestSegments("temporary", 1)}},
+		fastFailPoolManager{client: client},
+		100, 1, 100*time.Millisecond,
+	)
+	if err == nil {
+		t.Fatal("temporary provider failure returned nil error, want retryable incomplete result")
+	}
+	if missing {
+		t.Fatal("temporary provider failure became a missing segment")
+	}
+}
+
+func TestFastFailReleaseProbeOmittedResultIsIncomplete(t *testing.T) {
+	client := &scriptedFastFailClient{Client: fakepool.New()}
+
+	missing, err := FastFailReleaseProbe(
+		context.Background(),
+		[]FastFailFile{{Filename: "movie.mkv", Segments: makeTestSegments("omitted", 1)}},
+		fastFailPoolManager{client: client},
+		100, 1, 100*time.Millisecond,
+	)
+	if err == nil {
+		t.Fatal("omitted StatMany work returned nil error, want retryable incomplete result")
+	}
+	if missing {
+		t.Fatal("omitted StatMany work became a missing segment")
 	}
 }
 
@@ -264,6 +318,28 @@ func TestFastFailCheckFilesOneFileBroken(t *testing.T) {
 	}
 	if len(results[1].MissingSegmentIDs) == 0 {
 		t.Errorf("results[1].MissingSegmentIDs is empty, want populated")
+	}
+}
+
+func TestFastFailCheckFilesTemporaryFailureDoesNotBreakFile(t *testing.T) {
+	client := &scriptedFastFailClient{
+		Client: fakepool.New(),
+		results: []nntppool.StatManyResult{{
+			MessageID: "temporary-0",
+			Err:       fmt.Errorf("synthetic transport failure"),
+		}},
+	}
+	files := []FastFailFile{{Filename: "movie.mkv", Segments: makeTestSegments("temporary", 1)}}
+
+	results, err := FastFailCheckFiles(
+		context.Background(), files, fastFailPoolManager{client: client},
+		100, 1, 100*time.Millisecond, nil,
+	)
+	if err == nil {
+		t.Fatal("temporary provider failure returned nil error, want retryable incomplete result")
+	}
+	if len(results) == 1 && results[0].Broken {
+		t.Fatal("temporary provider failure marked the file broken")
 	}
 }
 
