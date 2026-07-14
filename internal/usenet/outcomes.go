@@ -91,3 +91,38 @@ func IsHardArticleAbsence(err error) bool {
 func IsCorruptBody(err error) bool {
 	return ClassifyNNTPOutcome(err) == nntppool.OutcomeCorruptBody
 }
+
+// IsClassifiedNNTPError reports whether an error carries transport-owned or
+// AltMount incomplete-work semantics, as opposed to an ordinary local parser
+// or archive-format failure. Callers that intentionally isolate local file
+// failures must still propagate these errors so temporary or inconclusive
+// provider work cannot become partial success.
+func IsClassifiedNNTPError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var transportErr *nntppool.TransportError
+	if errors.As(err, &transportErr) {
+		return true
+	}
+	var incomplete *IncompleteError
+	if errors.As(err, &incomplete) {
+		return true
+	}
+	var corruption *DataCorruptionError
+	if errors.As(err, &corruption) && corruption.Outcome != "" {
+		return true
+	}
+
+	return errors.Is(err, nntppool.ErrArticleNotFound) ||
+		errors.Is(err, nntppool.ErrBodyCorrupt) ||
+		errors.Is(err, nntppool.ErrCRCMismatch) ||
+		errors.Is(err, nntppool.ErrCircuitBreakerOpen) ||
+		errors.Is(err, nntppool.ErrServiceUnavailable) ||
+		errors.Is(err, nntppool.ErrAuthRequired) ||
+		errors.Is(err, nntppool.ErrAuthRejected) ||
+		errors.Is(err, nntppool.ErrQuotaExceeded) ||
+		errors.Is(err, nntppool.ErrInvalidProviderConfiguration) ||
+		errors.Is(err, nntppool.ErrMaxConnections)
+}

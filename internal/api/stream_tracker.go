@@ -355,7 +355,10 @@ func (t *StreamTracker) UpdateBufferedOffset(id string, offset int64) {
 
 // Remove removes a stream by ID and adds it to history
 func (t *StreamTracker) Remove(id string) {
-	if val, ok := t.streams.Load(id); ok {
+	// Claim the entry atomically. Normal close, file close, and stale cleanup
+	// can race to remove the same stream; only the winner may cancel it, add a
+	// history row, decrement activeCount, or notify admission waiters.
+	if val, ok := t.streams.LoadAndDelete(id); ok {
 		internal := valueToInternal(val)
 
 		// Cancel the context to stop underlying readers and release resources
@@ -379,7 +382,6 @@ func (t *StreamTracker) Remove(id string) {
 		t.history = append(t.history, finalStream)
 		t.mu.Unlock()
 
-		t.streams.Delete(id)
 		t.activeCount.Add(-1)
 		t.notifyChange()
 	}

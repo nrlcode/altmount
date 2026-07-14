@@ -467,6 +467,25 @@ func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 //	@Failure		400		{object}	APIResponse
 //	@Security		BearerAuth
 //	@Router			/providers [post]
+func nextProviderID(providers []config.ProviderConfig) string {
+	used := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		if provider.ID != "" {
+			used[provider.ID] = struct{}{}
+		}
+	}
+
+	// Preserve the existing human-readable format while probing past holes
+	// that would otherwise collide after a provider deletion. PR4 owns the
+	// durable UUID registry; this is only the narrow pre-registry safeguard.
+	for suffix := len(providers) + 1; ; suffix++ {
+		candidate := fmt.Sprintf("provider_%d", suffix)
+		if _, exists := used[candidate]; !exists {
+			return candidate
+		}
+	}
+}
+
 func (s *Server) handleCreateProvider(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
@@ -520,8 +539,8 @@ func (s *Server) handleCreateProvider(c *fiber.Ctx) error {
 		createReq.MaxConnections = 1 // Default
 	}
 
-	// Generate new ID
-	newID := fmt.Sprintf("provider_%d", len(currentConfig.Providers)+1)
+	// Generate a collision-free stable ID for the current pre-registry format.
+	newID := nextProviderID(currentConfig.Providers)
 
 	// Create new provider
 	newProvider := config.ProviderConfig{
