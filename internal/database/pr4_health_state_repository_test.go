@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -249,7 +250,7 @@ func pr4Commit(f pr4Fixture, chunkID string, token int64, owner string, start in
 		SegmentStart:    start, SegmentCount: 4,
 		TestedBitmap: []byte{0b00001111}, PresentBitmap: []byte{0b00000011},
 		AbsentBitmap: []byte{0b00000100}, TemporaryBitmap: []byte{0b00001000},
-		CorruptBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
+		CorruptBitmap: []byte{0}, InconclusiveBitmap: []byte{0}, ResolvedBitmap: []byte{0b00000111},
 		CursorSegment: start + 4, ResolvedDelta: 3, ProviderChecksDelta: 4,
 		MissingCandidatesDelta: 1, InconclusiveDelta: 1,
 		CommittedAt: f.now.Add(time.Minute),
@@ -376,6 +377,7 @@ func TestPR4ChunkCommitIsFencedAtomicAndIdempotent(t *testing.T) {
 	require.Error(t, err, "ordinary run deletion must not cascade away durable observations")
 
 	conflict := fresh
+	conflict.ResolvedBitmap = []byte{0b00000011}
 	conflict.ResolvedDelta = 2
 	_, err = f.repo.CommitHealthChunk(ctx, conflict)
 	require.ErrorIs(t, err, ErrHealthChunkConflict)
@@ -393,11 +395,12 @@ func TestPR4WeakOrSTATPresenceDoesNotClearCorruptBodyEvidence(t *testing.T) {
 			ProviderID: f.providerID, ProviderGeneration: 1, Stage: stage, ObservationKind: kind,
 			SegmentStart: 0, SegmentCount: 1, TestedBitmap: []byte{1},
 			PresentBitmap: []byte{present}, AbsentBitmap: []byte{0}, CorruptBitmap: []byte{corrupt},
-			TemporaryBitmap: []byte{temporary}, InconclusiveBitmap: []byte{0},
+			TemporaryBitmap: []byte{temporary}, InconclusiveBitmap: []byte{0}, ResolvedBitmap: []byte{0},
 			CursorSegment: 1, ProviderChecksDelta: 1, CommittedAt: at,
 		}
 		if present != 0 {
 			commit.ResolvedDelta = 1
+			commit.ResolvedBitmap[0] = 1
 		}
 		if corrupt != 0 {
 			commit.MissingCandidatesDelta = 1
@@ -449,7 +452,8 @@ func TestPR4OlderCrossRunObservationCannotOverwriteNewerProviderState(t *testing
 		ObservationKind: HealthObservationValidatedBody,
 		SegmentStart:    0, SegmentCount: 1, TestedBitmap: []byte{1}, PresentBitmap: []byte{0},
 		AbsentBitmap: []byte{0}, CorruptBitmap: []byte{1}, TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
-		CursorSegment: 1, ProviderChecksDelta: 1, MissingCandidatesDelta: 1,
+		ResolvedBitmap: []byte{0},
+		CursorSegment:  1, ProviderChecksDelta: 1, MissingCandidatesDelta: 1,
 		CommittedAt: f.now.Add(2 * time.Minute),
 	}
 	_, err = f.repo.CommitHealthChunk(ctx, newer)
@@ -461,7 +465,8 @@ func TestPR4OlderCrossRunObservationCannotOverwriteNewerProviderState(t *testing
 		ObservationKind: HealthObservationValidatedBody,
 		SegmentStart:    0, SegmentCount: 1, TestedBitmap: []byte{1}, PresentBitmap: []byte{1},
 		AbsentBitmap: []byte{0}, CorruptBitmap: []byte{0}, TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
-		CursorSegment: 1, ResolvedDelta: 1, ProviderChecksDelta: 1,
+		ResolvedBitmap: []byte{1},
+		CursorSegment:  1, ResolvedDelta: 1, ProviderChecksDelta: 1,
 		CommittedAt: f.now.Add(time.Minute),
 	}
 	_, err = f.repo.CommitHealthChunk(ctx, older)
@@ -496,7 +501,8 @@ func TestPR4OlderNegativeCannotReappearAfterNewerValidatedBody(t *testing.T) {
 		ObservationKind: HealthObservationValidatedBody,
 		SegmentStart:    0, SegmentCount: 1, TestedBitmap: []byte{1}, PresentBitmap: []byte{1},
 		AbsentBitmap: []byte{0}, CorruptBitmap: []byte{0}, TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
-		CursorSegment: 1, ResolvedDelta: 1, ProviderChecksDelta: 1,
+		ResolvedBitmap: []byte{1},
+		CursorSegment:  1, ResolvedDelta: 1, ProviderChecksDelta: 1,
 		CommittedAt: f.now.Add(2 * time.Minute),
 	}
 	_, err = f.repo.CommitHealthChunk(ctx, newer)
@@ -508,7 +514,8 @@ func TestPR4OlderNegativeCannotReappearAfterNewerValidatedBody(t *testing.T) {
 		ObservationKind: HealthObservationValidatedBody,
 		SegmentStart:    0, SegmentCount: 1, TestedBitmap: []byte{1}, PresentBitmap: []byte{0},
 		AbsentBitmap: []byte{0}, CorruptBitmap: []byte{1}, TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
-		CursorSegment: 1, ProviderChecksDelta: 1, MissingCandidatesDelta: 1,
+		ResolvedBitmap: []byte{0},
+		CursorSegment:  1, ProviderChecksDelta: 1, MissingCandidatesDelta: 1,
 		CommittedAt: f.now.Add(time.Minute),
 	}
 	_, err = f.repo.CommitHealthChunk(ctx, older)
@@ -662,7 +669,8 @@ func TestPR4RetryDeadlineAppliesOnlyToItsRecordedSubrange(t *testing.T) {
 		ProviderID: f.providerID, ProviderGeneration: 1, Stage: "primary_stat", ObservationKind: HealthObservationSTAT,
 		SegmentStart: 0, SegmentCount: 4, TestedBitmap: []byte{0b1111}, PresentBitmap: []byte{0b0101},
 		AbsentBitmap: []byte{0}, CorruptBitmap: []byte{0}, TemporaryBitmap: []byte{0b1010}, InconclusiveBitmap: []byte{0},
-		CursorSegment: 4, ResolvedDelta: 2, ProviderChecksDelta: 4, InconclusiveDelta: 2,
+		ResolvedBitmap: []byte{0b0101},
+		CursorSegment:  4, ResolvedDelta: 2, ProviderChecksDelta: 4, InconclusiveDelta: 2,
 		CommittedAt: f.now.Add(time.Minute),
 		Retry: &HealthRetryState{
 			RetryKey: "segment-three-retry", SegmentStart: 3, SegmentCount: 1,
@@ -743,11 +751,36 @@ func TestPR4GapCausesAndSyntheticCacheStateAreDurable(t *testing.T) {
 	ctx := context.Background()
 	revision, err := f.repo.GetFileRevisionForRun(ctx, f.run.ID)
 	require.NoError(t, err)
+	lease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "durable-corrupt-gap-worker", 30*time.Minute)
+	require.NoError(t, err)
+	commitCorruptWave := func(id, stage string, at time.Time) {
+		t.Helper()
+		f.clock.now = at
+		_, commitErr := f.repo.CommitHealthChunk(ctx, HealthChunkCommit{
+			ChunkID: id, RunID: f.run.ID, LeaseOwner: *lease.LeaseOwner,
+			FencingToken: lease.FencingToken, ProviderID: f.providerID,
+			ProviderGeneration: 1, ProviderActivationEpoch: 1,
+			Stage: stage, ObservationKind: HealthObservationValidatedBody,
+			SegmentStart: 2, SegmentCount: 2, TestedBitmap: []byte{0x03},
+			PresentBitmap: []byte{0}, AbsentBitmap: []byte{0}, CorruptBitmap: []byte{0x03},
+			TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
+			ResolvedBitmap: []byte{0x03}, CursorSegment: 4,
+			ResolvedDelta: 2, ProviderChecksDelta: 2, MissingCandidatesDelta: 2,
+			CommittedAt: at,
+			Confirmations: []HealthConfirmationEvent{
+				{IdempotencyKey: id + ":2", SegmentIndex: 2, Cause: GapCauseCorrupt, ObservedAt: at},
+				{IdempotencyKey: id + ":3", SegmentIndex: 3, Cause: GapCauseCorrupt, ObservedAt: at},
+			},
+		})
+		require.NoError(t, commitErr)
+	}
+	commitCorruptWave("durable-corrupt-gap-first", "durable_corrupt_first", f.now)
+	commitCorruptWave("durable-corrupt-gap-second", "durable_corrupt_second", f.now.Add(10*time.Minute))
 	gap, err := f.repo.UpsertGapRange(ctx, GapRangeWrite{
 		ID: "gap-1", FileRevisionID: revision.ID, Kind: GapKindConfirmedUnusable,
 		StartSegment: 2, SegmentCount: 2, Status: GapStatusActive, CreatedAt: f.now,
 		Causes: []GapProviderCause{
-			{ProviderID: f.providerID, ProviderGeneration: 1, Cause: GapCauseCorrupt, ConfirmationCount: 2, ConfirmedAt: f.now},
+			{ProviderID: f.providerID, ProviderGeneration: 1, ProviderActivationEpoch: 1, Cause: GapCauseCorrupt},
 		},
 	})
 	require.NoError(t, err)
@@ -755,7 +788,7 @@ func TestPR4GapCausesAndSyntheticCacheStateAreDurable(t *testing.T) {
 
 	state, err := f.repo.RecordSyntheticOutput(ctx, SyntheticOutputWrite{
 		ID: "synthetic-1", GapID: gap.ID, FileRevisionID: revision.ID,
-		ByteStart: 200, ByteEnd: 299, EmittedAt: f.now.Add(time.Minute),
+		ByteStart: 200, ByteEnd: 299, EmittedAt: f.now.Add(11 * time.Minute),
 	})
 	require.NoError(t, err)
 	assert.Equal(t, CacheRecoverySynthetic, state.Status,
@@ -769,18 +802,18 @@ func TestPR4GapCausesAndSyntheticCacheStateAreDurable(t *testing.T) {
 	require.NoError(t, err)
 	_, err = f.repo.RecordSyntheticOutput(ctx, SyntheticOutputWrite{
 		ID: "synthetic-1", GapID: otherGap.ID, FileRevisionID: revision.ID,
-		ByteStart: 200, ByteEnd: 299, EmittedAt: f.now.Add(time.Minute),
+		ByteStart: 200, ByteEnd: 299, EmittedAt: f.now.Add(11 * time.Minute),
 	})
 	require.ErrorIs(t, err, ErrHealthChunkConflict,
 		"a synthetic range identity cannot be rebound to another gap")
 
-	state, err = f.repo.MarkSyntheticRangeRecovered(ctx, "synthetic-1", f.now.Add(2*time.Minute))
+	state, err = f.repo.MarkSyntheticRangeRecovered(ctx, "synthetic-1", f.now.Add(12*time.Minute))
 	require.NoError(t, err)
 	assert.Equal(t, CacheRecoveryPending, state.Status,
 		"validated recovery, not synthetic emission, creates cache_recovery_pending")
 	assert.Zero(t, state.ContentRevision, "PR8 advances content revision during serialized invalidation")
 	firstRecoveryUpdate := state.UpdatedAt
-	replayed, err := f.repo.MarkSyntheticRangeRecovered(ctx, "synthetic-1", f.now.Add(3*time.Minute))
+	replayed, err := f.repo.MarkSyntheticRangeRecovered(ctx, "synthetic-1", f.now.Add(13*time.Minute))
 	require.NoError(t, err)
 	assert.Equal(t, CacheRecoveryPending, replayed.Status)
 	assert.Equal(t, firstRecoveryUpdate, replayed.UpdatedAt,
@@ -835,11 +868,39 @@ func TestPR4ConcurrentGapCauseUpdatesDoNotLoseProviders(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, providers, 2)
 	base := GapRangeWrite{
-		ID: "concurrent-gap", FileRevisionID: revision.ID, Kind: GapKindConfirmedAbsent,
+		ID: "concurrent-gap", FileRevisionID: revision.ID, Kind: GapKindProvisional,
 		StartSegment: 3, SegmentCount: 1, Status: GapStatusActive, CreatedAt: f.now,
 	}
 	_, err = f.repo.UpsertGapRange(ctx, base)
 	require.NoError(t, err)
+	snapshot, err := f.repo.CaptureActiveProviderSnapshot(ctx, f.now)
+	require.NoError(t, err)
+	run, err := f.repo.CreateHealthRun(ctx, HealthRunSpec{
+		ID: "concurrent-gap-evidence-run", FileRevisionID: revision.ID,
+		ProviderSnapshotID: snapshot.ID, Trigger: "manual", Mode: "observation",
+		TotalSegments: revision.SegmentCount, CreatedAt: f.now,
+	})
+	require.NoError(t, err)
+	lease, err := f.repo.AcquireRunLease(ctx, run.ID, "concurrent-gap-evidence-worker", time.Minute)
+	require.NoError(t, err)
+	for index, providerID := range []string{f.providerID, "provider-b"} {
+		_, err = f.repo.CommitHealthChunk(ctx, HealthChunkCommit{
+			ChunkID: fmt.Sprintf("concurrent-gap-evidence-%d", index), RunID: run.ID,
+			LeaseOwner: *lease.LeaseOwner, FencingToken: lease.FencingToken,
+			ProviderID: providerID, ProviderGeneration: 1, ProviderActivationEpoch: 1,
+			Stage: fmt.Sprintf("concurrent_gap_provider_%d", index), ObservationKind: HealthObservationSTAT,
+			SegmentStart: 3, SegmentCount: 1, TestedBitmap: []byte{1},
+			PresentBitmap: []byte{0}, AbsentBitmap: []byte{1}, CorruptBitmap: []byte{0},
+			TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0}, ResolvedBitmap: []byte{1},
+			CursorSegment: 4, ResolvedDelta: 1, ProviderChecksDelta: 1,
+			MissingCandidatesDelta: 1, CommittedAt: f.now,
+			Confirmations: []HealthConfirmationEvent{{
+				IdempotencyKey: fmt.Sprintf("concurrent-gap-confirmation-%d", index),
+				SegmentIndex:   3, Cause: GapCauseAbsent, ObservedAt: f.now,
+			}},
+		})
+		require.NoError(t, err)
+	}
 
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
@@ -850,8 +911,8 @@ func TestPR4ConcurrentGapCauseUpdatesDoNotLoseProviders(t *testing.T) {
 			defer wg.Done()
 			write := base
 			write.Causes = []GapProviderCause{{
-				ProviderID: providerID, ProviderGeneration: 1, Cause: GapCauseAbsent,
-				ConfirmationCount: 2, ConfirmedAt: f.now,
+				ProviderID: providerID, ProviderGeneration: 1,
+				ProviderActivationEpoch: 1, Cause: GapCauseAbsent,
 			}}
 			_, err := f.repo.UpsertGapRange(ctx, write)
 			errs <- err

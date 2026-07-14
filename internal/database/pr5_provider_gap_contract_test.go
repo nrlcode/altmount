@@ -98,7 +98,7 @@ func TestPR5GapRangeRetainsEpisodesAndRequiresValidatedBodyToClear(t *testing.T)
 			ProviderGeneration: 1, Stage: stage, ObservationKind: kind,
 			SegmentStart: 2, SegmentCount: 1, TestedBitmap: []byte{1},
 			PresentBitmap: []byte{1}, AbsentBitmap: []byte{0}, CorruptBitmap: []byte{0},
-			TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
+			TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0}, ResolvedBitmap: []byte{1},
 			CursorSegment: 3, ResolvedDelta: 1, ProviderChecksDelta: 1,
 			CommittedAt: at,
 		})

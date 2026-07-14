@@ -79,6 +79,21 @@ func TestPR5ResolvedProgressUnionsPositionsAcrossProviderStages(t *testing.T) {
 		"provider work remains an attempt count even when positional resolution is already known")
 }
 
+func TestPR5ChunkRequiresExplicitResolvedPositionIdentity(t *testing.T) {
+	f := newPR4RunFixture(t)
+	ctx := context.Background()
+	lease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "explicit-resolution-worker", 10*time.Minute)
+	require.NoError(t, err)
+
+	ambiguous := pr5AuditPresentCommit(
+		f, lease, "ambiguous-resolution", "primary_stat", 0, HealthObservationSTAT, f.now)
+	ambiguous.ResolvedBitmap = nil
+	ambiguous.ResolvedDelta = 1
+	_, err = f.repo.CommitHealthChunk(ctx, ambiguous)
+	require.Error(t, err,
+		"a count cannot identify which canonical position resolved and must not be projected onto arbitrary outcomes")
+}
+
 type pr5AuditImportFixture struct {
 	db       *DB
 	repo     *HealthStateRepository

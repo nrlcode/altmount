@@ -607,17 +607,18 @@ func buildMultiSegmentNzb(client *fakepool.Client, fileName string, segCount int
 }
 
 // TestPreParseFastFailTolerantImportsDegradedVideo verifies a standalone video
-// file with a small hole imports (not broken) under the default tolerant policy.
+// file with a small hole imports (not broken) when tolerant is explicitly set.
 func TestPreParseFastFailTolerantImportsDegradedVideo(t *testing.T) {
 	client := fakepool.New()
 	proc := &Processor{
 		poolManager:       processorTestPoolManager{client: client},
 		validationTimeout: 100 * time.Millisecond,
 	}
-	// 200 segments, 1 missing (0.5%) — well within the pad caps.
+	// 50 segments, 1 missing (2%) — exactly within the pad caps.
 	n := buildMultiSegmentNzb(client, "Movie.2024.mkv", 50, 25)
 	cfg := config.DefaultConfig()
 	cfg.Import.SegmentSamplePercentage = 100
+	cfg.Import.DamagePolicy = string(config.ImportDamagePolicyTolerant)
 
 	brokenIdx, _, err := proc.preParseFastFail(context.Background(), n, cfg, 1)
 	if err != nil {
@@ -639,7 +640,7 @@ func TestPreParseFastFailStrictFailsDegradedVideo(t *testing.T) {
 	n := buildMultiSegmentNzb(client, "Movie.2024.mkv", 50, 25)
 	cfg := config.DefaultConfig()
 	cfg.Import.SegmentSamplePercentage = 100
-	cfg.Import.DamagePolicy = "strict"
+	cfg.Import.DamagePolicy = string(config.ImportDamagePolicyStrict)
 
 	brokenIdx, _, err := proc.preParseFastFail(context.Background(), n, cfg, 1)
 	if !errors.Is(err, multifile.ErrNoFilesProcessed) {
@@ -661,6 +662,7 @@ func TestPreParseFastFailTolerantStillFailsLongRun(t *testing.T) {
 	n := buildMultiSegmentNzb(client, "Movie.2024.mkv", 50, 20, 21, 22, 23, 24)
 	cfg := config.DefaultConfig()
 	cfg.Import.SegmentSamplePercentage = 100
+	cfg.Import.DamagePolicy = string(config.ImportDamagePolicyTolerant)
 
 	_, _, err := proc.preParseFastFail(context.Background(), n, cfg, 1)
 	if !errors.Is(err, multifile.ErrNoFilesProcessed) {

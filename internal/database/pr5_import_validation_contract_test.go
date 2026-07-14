@@ -9,6 +9,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func commitPR5ImportSTATCoverage(
+	t *testing.T,
+	repo *HealthStateRepository,
+	run, lease *HealthRun,
+	provider ProviderSnapshotEntry,
+	chunkID, stage string,
+	tested, present byte,
+	at time.Time,
+) {
+	t.Helper()
+	absent := tested &^ present
+	_, err := repo.CommitHealthChunk(context.Background(), HealthChunkCommit{
+		ChunkID: chunkID, RunID: run.ID, LeaseOwner: *lease.LeaseOwner,
+		FencingToken: lease.FencingToken, ProviderID: provider.ProviderID,
+		ProviderGeneration:      provider.ProviderGeneration,
+		ProviderActivationEpoch: provider.ProviderActivationEpoch,
+		Stage:                   stage, ObservationKind: HealthObservationSTAT,
+		SegmentStart: 0, SegmentCount: run.TotalSegments,
+		TestedBitmap: []byte{tested}, PresentBitmap: []byte{present},
+		AbsentBitmap: []byte{absent}, CorruptBitmap: []byte{0},
+		TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
+		ResolvedBitmap: []byte{tested}, CursorSegment: run.TotalSegments,
+		ResolvedDelta:          bitmapPopulation([]byte{tested}),
+		ProviderChecksDelta:    bitmapPopulation([]byte{tested}),
+		MissingCandidatesDelta: bitmapPopulation([]byte{absent}),
+		CommittedAt:            at,
+	})
+	require.NoError(t, err)
+}
+
 func TestPR5ImportValidationIsDurablePerFinalFileAndFreezesDamagePolicy(t *testing.T) {
 	db, repo := newPR4Repository(t)
 	ctx := context.Background()
@@ -53,14 +83,29 @@ func TestPR5ImportValidationIsDurablePerFinalFileAndFreezesDamagePolicy(t *testi
 		"import-run-c", "library/import-final-c.mkv", "sha256:import-final-c")
 
 	due := now.Add(30 * time.Second)
-	strictWrite := ImportValidationWrite{
+	firstLease, err := repo.AcquireRunLease(ctx, firstRun.ID, "strict-durability-worker", 5*time.Minute)
+	require.NoError(t, err)
+	strictInitial := ImportValidationWrite{
 		ID: "import-validation-a", QueueItemID: queueItem.ID,
 		FileRevisionID: firstRevision.ID, RunID: firstRun.ID,
-		Phase:             ImportValidationPhaseConfirmationWait,
-		DamagePolicy:      ImportDamagePolicyStrict,
-		ConfirmationDueAt: &due, UnresolvedSegments: 2,
+		Phase: ImportValidationPhaseInitialPass, DamagePolicy: ImportDamagePolicyStrict,
 		CreatedAt: now, UpdatedAt: now,
+		LeaseOwner: *firstLease.LeaseOwner, FencingToken: firstLease.FencingToken,
 	}
+	_, err = repo.UpsertImportValidation(ctx, strictInitial)
+	require.NoError(t, err)
+	commitPR5ImportSTATCoverage(
+		t, repo, firstRun, firstLease, snapshot.Entries[0], "strict-initial-coverage",
+		HealthRunStageImportInitialSTAT, 0xff, 0xfc, now,
+	)
+	strictWrite := strictInitial
+	strictWrite.Phase = ImportValidationPhaseConfirmationWait
+	strictWrite.ConfirmationDueAt = &due
+	strictWrite.UnresolvedSegments = 2
+	strictWrite.UnresolvedBitmap = []byte{0x03}
+	strictWrite.InitialPassComplete = true
+	strictWrite.UpdatedAt = now.Add(time.Second)
+	clock.now = strictWrite.UpdatedAt
 	strictState, err := repo.UpsertImportValidation(ctx, strictWrite)
 	require.NoError(t, err)
 	assert.Equal(t, ImportDamagePolicyStrict, strictState.DamagePolicy)
@@ -69,13 +114,47 @@ func TestPR5ImportValidationIsDurablePerFinalFileAndFreezesDamagePolicy(t *testi
 	assert.Equal(t, due, *strictState.ConfirmationDueAt)
 	assert.Equal(t, firstRun.ID, strictState.RunID)
 
-	tolerantWrite := ImportValidationWrite{
+	secondLease, err := repo.AcquireRunLease(ctx, secondRun.ID, "tolerant-durability-worker", 5*time.Minute)
+	require.NoError(t, err)
+	tolerantInitial := ImportValidationWrite{
 		ID: "import-validation-b", QueueItemID: queueItem.ID,
 		FileRevisionID: secondRevision.ID, RunID: secondRun.ID,
-		Phase:              ImportValidationPhaseHealthPending,
-		DamagePolicy:       ImportDamagePolicyTolerant,
-		UnresolvedSegments: 1, CreatedAt: now, UpdatedAt: now,
+		Phase: ImportValidationPhaseInitialPass, DamagePolicy: ImportDamagePolicyTolerant,
+		CreatedAt: now, UpdatedAt: now,
+		LeaseOwner: *secondLease.LeaseOwner, FencingToken: secondLease.FencingToken,
 	}
+	_, err = repo.UpsertImportValidation(ctx, tolerantInitial)
+	require.NoError(t, err)
+	commitPR5ImportSTATCoverage(
+		t, repo, secondRun, secondLease, snapshot.Entries[0], "tolerant-initial-coverage",
+		HealthRunStageImportInitialSTAT, 0xff, 0xfe, clock.now,
+	)
+	tolerantWaiting := tolerantInitial
+	tolerantWaiting.Phase = ImportValidationPhaseConfirmationWait
+	tolerantWaiting.ConfirmationDueAt = &due
+	tolerantWaiting.UnresolvedSegments = 1
+	tolerantWaiting.UnresolvedBitmap = []byte{0x01}
+	tolerantWaiting.InitialPassComplete = true
+	tolerantWaiting.UpdatedAt = now.Add(2 * time.Second)
+	clock.now = tolerantWaiting.UpdatedAt
+	_, err = repo.UpsertImportValidation(ctx, tolerantWaiting)
+	require.NoError(t, err)
+	clock.now = due
+	tolerantConfirmation := tolerantWaiting
+	tolerantConfirmation.Phase = ImportValidationPhaseConfirmationPass
+	tolerantConfirmation.ConfirmationDueAt = nil
+	tolerantConfirmation.UpdatedAt = due
+	_, err = repo.UpsertImportValidation(ctx, tolerantConfirmation)
+	require.NoError(t, err)
+	commitPR5ImportSTATCoverage(
+		t, repo, secondRun, secondLease, snapshot.Entries[0], "tolerant-confirmation-coverage",
+		HealthRunStageImportConfirmationSTAT, 0x01, 0x00, due,
+	)
+	tolerantWrite := tolerantConfirmation
+	tolerantWrite.Phase = ImportValidationPhaseHealthPending
+	tolerantWrite.SecondPassComplete = true
+	tolerantWrite.UpdatedAt = due.Add(time.Second)
+	clock.now = tolerantWrite.UpdatedAt
 	tolerantState, err := repo.UpsertImportValidation(ctx, tolerantWrite)
 	require.NoError(t, err)
 	assert.Equal(t, ImportValidationPhaseHealthPending, tolerantState.Phase)
@@ -103,13 +182,14 @@ func TestPR5ImportValidationIsDurablePerFinalFileAndFreezesDamagePolicy(t *testi
 
 	rebound := strictWrite
 	rebound.ID = "different-validation-same-final-file"
-	rebound.UpdatedAt = now.Add(time.Second)
+	rebound.UpdatedAt = due.Add(2 * time.Second)
+	clock.now = rebound.UpdatedAt
 	_, err = restarted.UpsertImportValidation(ctx, rebound)
 	require.Error(t, err, "queue item and final revision identify one durable validation lifecycle")
 
 	policyChange := strictWrite
 	policyChange.DamagePolicy = ImportDamagePolicyTolerant
-	policyChange.UpdatedAt = now.Add(time.Second)
+	policyChange.UpdatedAt = due.Add(2 * time.Second)
 	_, err = restarted.UpsertImportValidation(ctx, policyChange)
 	require.Error(t, err, "an in-flight validation keeps the policy selected when it began")
 
@@ -117,7 +197,9 @@ func TestPR5ImportValidationIsDurablePerFinalFileAndFreezesDamagePolicy(t *testi
 	wrongRun.ID = "wrong-revision-run-link"
 	wrongRun.RunID = firstRun.ID
 	wrongRun.FileRevisionID = thirdRevision.ID
-	wrongRun.UpdatedAt = now.Add(time.Second)
+	wrongRun.LeaseOwner = *firstLease.LeaseOwner
+	wrongRun.FencingToken = firstLease.FencingToken
+	wrongRun.UpdatedAt = due.Add(2 * time.Second)
 	_, err = restarted.UpsertImportValidation(ctx, wrongRun)
 	require.Error(t, err, "raw or unrelated run coverage cannot be attached to another final layout")
 }
@@ -131,22 +213,58 @@ func TestPR5ImportValidationEnforcesStrictRejectVersusTolerantHealthPending(t *t
 	}
 	require.NoError(t, f.db.Repository.AddToQueue(ctx, queueItem))
 	due := f.now.Add(30 * time.Second)
-
-	strict := ImportValidationWrite{
-		ID: "strict-validation", QueueItemID: queueItem.ID,
-		FileRevisionID: f.run.FileRevisionID, RunID: f.run.ID,
-		Phase:             ImportValidationPhaseConfirmationWait,
-		DamagePolicy:      ImportDamagePolicyStrict,
-		ConfirmationDueAt: &due, UnresolvedSegments: 1,
-		CreatedAt: f.now, UpdatedAt: f.now,
-	}
-	_, err := f.repo.UpsertImportValidation(ctx, strict)
+	strictRun, err := f.repo.CreateHealthRun(ctx, HealthRunSpec{
+		ID: "strict-import-run", FileRevisionID: f.run.FileRevisionID,
+		ProviderSnapshotID: f.run.ProviderSnapshotID, Trigger: "import",
+		Mode: "observation", TotalSegments: 8, CreatedAt: f.now,
+	})
 	require.NoError(t, err)
+	strictLease, err := f.repo.AcquireRunLease(ctx, strictRun.ID, "strict-policy-worker", 5*time.Minute)
+	require.NoError(t, err)
+	snapshot, err := f.repo.GetProviderSnapshot(ctx, strictRun.ProviderSnapshotID)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Entries, 1)
 
-	strictPending := strict
+	strictInitial := ImportValidationWrite{
+		ID: "strict-validation", QueueItemID: queueItem.ID,
+		FileRevisionID: f.run.FileRevisionID, RunID: strictRun.ID,
+		Phase: ImportValidationPhaseInitialPass, DamagePolicy: ImportDamagePolicyStrict,
+		CreatedAt: f.now, UpdatedAt: f.now,
+		LeaseOwner: *strictLease.LeaseOwner, FencingToken: strictLease.FencingToken,
+	}
+	_, err = f.repo.UpsertImportValidation(ctx, strictInitial)
+	require.NoError(t, err)
+	commitPR5ImportSTATCoverage(
+		t, f.repo, strictRun, strictLease, snapshot.Entries[0], "strict-policy-initial",
+		HealthRunStageImportInitialSTAT, 0xff, 0xfe, f.now,
+	)
+	strict := strictInitial
+	strict.Phase = ImportValidationPhaseConfirmationWait
+	strict.ConfirmationDueAt = &due
+	strict.UnresolvedSegments = 1
+	strict.UnresolvedBitmap = []byte{0x01}
+	strict.InitialPassComplete = true
+	strict.UpdatedAt = f.now.Add(time.Second)
+	f.clock.now = strict.UpdatedAt
+	_, err = f.repo.UpsertImportValidation(ctx, strict)
+	require.NoError(t, err)
+	f.clock.now = due
+	strictConfirmation := strict
+	strictConfirmation.Phase = ImportValidationPhaseConfirmationPass
+	strictConfirmation.ConfirmationDueAt = nil
+	strictConfirmation.UpdatedAt = due
+	_, err = f.repo.UpsertImportValidation(ctx, strictConfirmation)
+	require.NoError(t, err)
+	commitPR5ImportSTATCoverage(
+		t, f.repo, strictRun, strictLease, snapshot.Entries[0], "strict-policy-confirmation",
+		HealthRunStageImportConfirmationSTAT, 0x01, 0x00, due,
+	)
+
+	strictPending := strictConfirmation
 	strictPending.Phase = ImportValidationPhaseHealthPending
-	strictPending.ConfirmationDueAt = nil
-	strictPending.UpdatedAt = due
+	strictPending.SecondPassComplete = true
+	strictPending.UpdatedAt = due.Add(time.Second)
+	f.clock.now = strictPending.UpdatedAt
 	_, err = f.repo.UpsertImportValidation(ctx, strictPending)
 	require.Error(t, err, "strict mode rejects unresolved coverage rather than admitting it degraded")
 
@@ -169,13 +287,48 @@ func TestPR5ImportValidationEnforcesStrictRejectVersusTolerantHealthPending(t *t
 		Mode: "observation", TotalSegments: 8, CreatedAt: f.now,
 	})
 	require.NoError(t, err)
-	tolerant := ImportValidationWrite{
+	tolerantLease, err := f.repo.AcquireRunLease(ctx, secondRun.ID, "tolerant-policy-worker", 5*time.Minute)
+	require.NoError(t, err)
+	tolerantInitial := ImportValidationWrite{
 		ID: "tolerant-validation", QueueItemID: queueItem.ID,
 		FileRevisionID: secondRevision.ID, RunID: secondRun.ID,
-		Phase:              ImportValidationPhaseHealthPending,
-		DamagePolicy:       ImportDamagePolicyTolerant,
-		UnresolvedSegments: 1, CreatedAt: f.now, UpdatedAt: due,
+		Phase: ImportValidationPhaseInitialPass, DamagePolicy: ImportDamagePolicyTolerant,
+		CreatedAt: f.now, UpdatedAt: f.clock.now,
+		LeaseOwner: *tolerantLease.LeaseOwner, FencingToken: tolerantLease.FencingToken,
 	}
+	_, err = f.repo.UpsertImportValidation(ctx, tolerantInitial)
+	require.NoError(t, err)
+	commitPR5ImportSTATCoverage(
+		t, f.repo, secondRun, tolerantLease, snapshot.Entries[0], "tolerant-policy-initial",
+		HealthRunStageImportInitialSTAT, 0xff, 0xfe, f.clock.now,
+	)
+	tolerantWaiting := tolerantInitial
+	tolerantWaiting.Phase = ImportValidationPhaseConfirmationWait
+	tolerantDue := f.clock.now.Add(30 * time.Second)
+	tolerantWaiting.ConfirmationDueAt = &tolerantDue
+	tolerantWaiting.UnresolvedSegments = 1
+	tolerantWaiting.UnresolvedBitmap = []byte{0x01}
+	tolerantWaiting.InitialPassComplete = true
+	tolerantWaiting.UpdatedAt = f.clock.now.Add(time.Second)
+	f.clock.now = tolerantWaiting.UpdatedAt
+	_, err = f.repo.UpsertImportValidation(ctx, tolerantWaiting)
+	require.NoError(t, err)
+	f.clock.now = tolerantDue
+	tolerantConfirmation := tolerantWaiting
+	tolerantConfirmation.Phase = ImportValidationPhaseConfirmationPass
+	tolerantConfirmation.ConfirmationDueAt = nil
+	tolerantConfirmation.UpdatedAt = tolerantDue
+	_, err = f.repo.UpsertImportValidation(ctx, tolerantConfirmation)
+	require.NoError(t, err)
+	commitPR5ImportSTATCoverage(
+		t, f.repo, secondRun, tolerantLease, snapshot.Entries[0], "tolerant-policy-confirmation",
+		HealthRunStageImportConfirmationSTAT, 0x01, 0x00, tolerantDue,
+	)
+	tolerant := tolerantConfirmation
+	tolerant.Phase = ImportValidationPhaseHealthPending
+	tolerant.SecondPassComplete = true
+	tolerant.UpdatedAt = tolerantDue.Add(time.Second)
+	f.clock.now = tolerant.UpdatedAt
 	pending, err := f.repo.UpsertImportValidation(ctx, tolerant)
 	require.NoError(t, err)
 	assert.Equal(t, ImportValidationPhaseHealthPending, pending.Phase)
@@ -192,12 +345,27 @@ func TestPR5ImportValidationEnforcesStrictRejectVersusTolerantHealthPending(t *t
 		Mode: "observation", TotalSegments: 8, CreatedAt: f.now,
 	})
 	require.NoError(t, err)
+	deadlineLease, err := f.repo.AcquireRunLease(ctx, thirdRun.ID, "deadline-policy-worker", 5*time.Minute)
+	require.NoError(t, err)
+	deadlineInitial := ImportValidationWrite{
+		ID: "missing-deadline", QueueItemID: queueItem.ID,
+		FileRevisionID: thirdRevision.ID, RunID: thirdRun.ID,
+		Phase: ImportValidationPhaseInitialPass, DamagePolicy: ImportDamagePolicyTolerant,
+		CreatedAt: f.now, UpdatedAt: f.clock.now,
+		LeaseOwner: *deadlineLease.LeaseOwner, FencingToken: deadlineLease.FencingToken,
+	}
+	_, err = f.repo.UpsertImportValidation(ctx, deadlineInitial)
+	require.NoError(t, err)
 	missingDeadline := tolerant
 	missingDeadline.ID = "missing-deadline"
 	missingDeadline.FileRevisionID = thirdRevision.ID
 	missingDeadline.RunID = thirdRun.ID
 	missingDeadline.Phase = ImportValidationPhaseConfirmationWait
 	missingDeadline.ConfirmationDueAt = nil
+	missingDeadline.LeaseOwner = *deadlineLease.LeaseOwner
+	missingDeadline.FencingToken = deadlineLease.FencingToken
+	missingDeadline.CreatedAt = f.now
+	missingDeadline.UpdatedAt = f.clock.now.Add(time.Second)
 	_, err = f.repo.UpsertImportValidation(ctx, missingDeadline)
 	require.Error(t, err, "a persisted confirmation wait needs an exact restart-safe deadline")
 }
