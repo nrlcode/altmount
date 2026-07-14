@@ -295,6 +295,21 @@ func TestPR4ExpiredLeaseCannotCommitWithBackdatedEvidenceTime(t *testing.T) {
 		"lease validity must use the repository clock rather than a worker-supplied evidence timestamp")
 }
 
+func TestPR4LeaseIsExpiredAtItsExactDeadline(t *testing.T) {
+	f := newPR4RunFixture(t)
+	ctx := context.Background()
+	lease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "deadline-worker", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, lease.LeaseExpiresAt)
+	f.clock.now = *lease.LeaseExpiresAt
+
+	commit := pr4Commit(f, "at-lease-deadline", lease.FencingToken, "deadline-worker", 0)
+	commit.CommittedAt = f.clock.now
+	_, err = f.repo.CommitHealthChunk(ctx, commit)
+	require.ErrorIs(t, err, ErrStaleHealthLease,
+		"a half-open lease interval must reject commits once now equals expires_at")
+}
+
 func TestPR4ChunkCommitIsFencedAtomicAndIdempotent(t *testing.T) {
 	f := newPR4RunFixture(t)
 	ctx := context.Background()

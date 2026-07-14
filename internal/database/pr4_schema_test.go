@@ -104,11 +104,54 @@ func requirePR4Schema(t *testing.T, db *sql.DB, dialect Dialect) {
 	}
 }
 
+func requirePR4SQLiteColumnNotNull(t *testing.T, db *sql.DB, table, column string) {
+	t.Helper()
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	require.NoError(t, err)
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, typ string
+		var defaultValue any
+		require.NoError(t, rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey))
+		if name == column {
+			assert.Equalf(t, 1, notNull, "%s.%s must reject NULL identities", table, column)
+			return
+		}
+	}
+	require.NoError(t, rows.Err())
+	t.Fatalf("column %s.%s does not exist", table, column)
+}
+
 func TestPR4SQLiteMigrationCreatesDurableHealthSchema(t *testing.T) {
 	db, err := NewDB(Config{Type: "sqlite", DatabasePath: filepath.Join(t.TempDir(), "pr4.db")})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	requirePR4Schema(t, db.Connection(), DialectSQLite)
+}
+
+func TestPR4SQLitePrimaryIdentitiesAreExplicitlyNotNull(t *testing.T) {
+	db, err := NewDB(Config{Type: "sqlite", DatabasePath: filepath.Join(t.TempDir(), "not-null-identities.db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	identities := map[string]string{
+		"health_file_revisions":      "id",
+		"health_providers":           "id",
+		"health_provider_snapshots":  "id",
+		"health_runs":                "id",
+		"health_run_chunks":          "id",
+		"health_provider_coverage":   "id",
+		"health_attempt_evidence":    "idempotency_key",
+		"health_confirmation_events": "idempotency_key",
+		"health_retry_states":        "retry_key",
+		"health_gap_ranges":          "id",
+		"health_synthetic_ranges":    "id",
+		"health_cache_recovery":      "file_revision_id",
+	}
+	for table, column := range identities {
+		requirePR4SQLiteColumnNotNull(t, db.Connection(), table, column)
+	}
 }
 
 func TestPR4SQLiteEnablesForeignKeysOnEveryPooledConnection(t *testing.T) {
