@@ -13,7 +13,9 @@
 package holes
 
 import (
+	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -28,6 +30,9 @@ const (
 	// guards; this ratio only protects small files where the segment caps
 	// would be a large share.
 	MaxPadFileBytesRatio = 0.02
+	// maxPadFileBytesRatioDenominator is the exact integer representation of
+	// MaxPadFileBytesRatio (1/50), used to avoid floating-point boundary drift.
+	maxPadFileBytesRatioDenominator int64 = 50
 	// ProjectionMinHits is the minimum number of confirmed misses a PARTIAL
 	// sample needs before a projection may fail a file; an observed run
 	// beyond MaxPadRunSegments fails regardless (measured, not projected).
@@ -138,6 +143,91 @@ func Classify(runs []Run, fileBytes int64, avgSegBytes int64) Verdict {
 		}
 	}
 	return VerdictDegraded
+}
+
+// ClassifyPositions applies the shared damage envelope to exact positional
+// evidence. missing contains every unresolved segment position and
+// segmentBytes contains the complete canonical usable-byte domain by position.
+// Every span is validated even when the corresponding position is available;
+// an incomplete domain cannot prove a clean or tolerably degraded file.
+//
+// The input order is irrelevant. Ambiguous positions, duplicate evidence, and
+// missing usable-byte spans are rejected rather than estimated from an average.
+func ClassifyPositions(missing []int, segmentBytes []int64, fileBytes int64) (Impact, error) {
+	impact := Impact{TotalSegments: len(segmentBytes)}
+	if fileBytes <= 0 {
+		return impact, fmt.Errorf("file size must be positive")
+	}
+	if len(segmentBytes) == 0 {
+		return impact, fmt.Errorf("canonical segment layout must not be empty")
+	}
+	var canonicalBytes int64
+	for position, usableBytes := range segmentBytes {
+		if usableBytes <= 0 {
+			return Impact{}, fmt.Errorf("canonical position %d has no exact usable-byte span", position)
+		}
+		if usableBytes > int64(^uint64(0)>>1)-canonicalBytes {
+			return Impact{}, fmt.Errorf("canonical usable-byte total overflows")
+		}
+		canonicalBytes += usableBytes
+	}
+	if canonicalBytes != fileBytes {
+		return Impact{}, fmt.Errorf("canonical usable-byte coverage does not match file size")
+	}
+	if len(missing) == 0 {
+		impact.Verdict = VerdictClean
+		return impact, nil
+	}
+
+	positions := append([]int(nil), missing...)
+	sort.Ints(positions)
+
+	var missingBytes int64
+	longestRun := 0
+	currentRun := 0
+	previous := -2
+	for i, position := range positions {
+		if position < 0 || position >= len(segmentBytes) {
+			return Impact{}, fmt.Errorf("missing position %d is outside the canonical layout", position)
+		}
+		if i > 0 && position == positions[i-1] {
+			return Impact{}, fmt.Errorf("missing position %d is duplicated", position)
+		}
+		usableBytes := segmentBytes[position]
+		if usableBytes <= 0 {
+			return Impact{}, fmt.Errorf("missing position %d has no exact usable-byte span", position)
+		}
+		if usableBytes > int64(^uint64(0)>>1)-missingBytes {
+			return Impact{}, fmt.Errorf("missing usable-byte total overflows")
+		}
+		missingBytes += usableBytes
+
+		if position == previous+1 {
+			currentRun++
+		} else {
+			currentRun = 1
+		}
+		if currentRun > longestRun {
+			longestRun = currentRun
+		}
+		previous = position
+	}
+
+	impact.TotalMissing = len(positions)
+	impact.LongestRun = longestRun
+	impact.PaddedRatio = float64(missingBytes) / float64(fileBytes)
+
+	impact.Verdict = VerdictDegraded
+	if impact.LongestRun > MaxPadRunSegments || impact.TotalMissing > MaxPadTotalSegments {
+		impact.Verdict = VerdictFailed
+		return impact, nil
+	}
+	// Because missingBytes is integral, comparing it with floor(fileBytes/50)
+	// is exactly equivalent to missingBytes/fileBytes > 2% and cannot overflow.
+	if missingBytes > fileBytes/maxPadFileBytesRatioDenominator {
+		impact.Verdict = VerdictFailed
+	}
+	return impact, nil
 }
 
 // ClassifyProjected classifies from a partial, uniform sample. It never

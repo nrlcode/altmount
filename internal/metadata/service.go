@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -47,6 +48,12 @@ type FileMetadataLite struct {
 	Status     metapb.FileStatus
 }
 
+// MetadataWriteValidator gates import metadata before it becomes visible in
+// the mounted namespace. Implementations must not retain or mutate metadata.
+type MetadataWriteValidator interface {
+	ValidateMetadataWrite(context.Context, string, *metapb.FileMetadata) error
+}
+
 // MetadataService provides low-level read/write operations for metadata files.
 //
 // Only a lightweight metadata projection (liteCache) is kept in memory. The
@@ -67,6 +74,11 @@ type MetadataService struct {
 	// storeRefCounter tracks reference counts for shared NzbStore files.
 	// nil means reference counting is disabled.
 	storeRefCounter StoreRefCounter
+	// writeValidator is optional so non-import callers retain the existing
+	// metadata write behavior. The lock permits safe setup/reconfiguration
+	// while imports are running.
+	writeValidatorMu sync.RWMutex
+	writeValidator   MetadataWriteValidator
 }
 
 // NewMetadataService creates a new metadata service
@@ -88,6 +100,14 @@ func (ms *MetadataService) Store() *StoreService {
 // NzbStore files are maintained when metadata is deleted or created.
 func (ms *MetadataService) SetStoreRefCounter(c StoreRefCounter) {
 	ms.storeRefCounter = c
+}
+
+// SetWriteValidator installs the admission gate used by import writes. Passing
+// nil restores the historical behavior for callers that do not use PR5.
+func (ms *MetadataService) SetWriteValidator(validator MetadataWriteValidator) {
+	ms.writeValidatorMu.Lock()
+	defer ms.writeValidatorMu.Unlock()
+	ms.writeValidator = validator
 }
 
 // IncStoreRef increments the reference count for a v3 store file.
@@ -289,6 +309,15 @@ func (ms *MetadataService) WriteFileMetadataV3(ctx context.Context, virtualPath 
 // problem on one file never blocks the import). With an empty storeRef it writes v1.
 // This is the single entry point import processors should use.
 func (ms *MetadataService) WriteFileMetadataAuto(ctx context.Context, virtualPath string, metadata *metapb.FileMetadata, index map[string]int64, storeRef string) error {
+	ms.writeValidatorMu.RLock()
+	validator := ms.writeValidator
+	ms.writeValidatorMu.RUnlock()
+	if validator != nil {
+		if err := validator.ValidateMetadataWrite(ctx, virtualPath, metadata); err != nil {
+			return fmt.Errorf("validate metadata write: %w", err)
+		}
+	}
+
 	if storeRef == "" {
 		return ms.WriteFileMetadata(virtualPath, metadata)
 	}
