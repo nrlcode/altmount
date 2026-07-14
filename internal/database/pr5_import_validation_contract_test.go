@@ -52,6 +52,12 @@ func TestPR5ImportValidationIsDurablePerFinalFileAndFreezesDamagePolicy(t *testi
 	}
 	require.NoError(t, db.Repository.AddToQueue(ctx, queueItem))
 	require.Positive(t, queueItem.ID)
+	tolerantQueueItem := &ImportQueueItem{
+		NzbPath: "queue/synthetic-tolerant-import.nzb", Priority: QueuePriorityNormal,
+		Status: QueueStatusProcessing, MaxRetries: 3,
+	}
+	require.NoError(t, db.Repository.AddToQueue(ctx, tolerantQueueItem))
+	require.Positive(t, tolerantQueueItem.ID)
 
 	providers, err := repo.ReconcileProviders(ctx, []ProviderSpec{{
 		StableID: "import-validation-provider", DisplayName: "Primary",
@@ -117,7 +123,7 @@ func TestPR5ImportValidationIsDurablePerFinalFileAndFreezesDamagePolicy(t *testi
 	secondLease, err := repo.AcquireRunLease(ctx, secondRun.ID, "tolerant-durability-worker", 5*time.Minute)
 	require.NoError(t, err)
 	tolerantInitial := ImportValidationWrite{
-		ID: "import-validation-b", QueueItemID: queueItem.ID,
+		ID: "import-validation-b", QueueItemID: tolerantQueueItem.ID,
 		FileRevisionID: secondRevision.ID, RunID: secondRun.ID,
 		Phase: ImportValidationPhaseInitialPass, DamagePolicy: ImportDamagePolicyTolerant,
 		CreatedAt: now, UpdatedAt: now,
@@ -165,8 +171,12 @@ func TestPR5ImportValidationIsDurablePerFinalFileAndFreezesDamagePolicy(t *testi
 	require.NoError(t, db.Connection().QueryRow(`
 		SELECT COUNT(*) FROM health_import_validations WHERE queue_item_id = ?
 	`, queueItem.ID).Scan(&validationCount))
-	assert.Equal(t, 2, validationCount,
-		"one archive may produce multiple final files with independent canonical layouts")
+	assert.Equal(t, 1, validationCount)
+	require.NoError(t, db.Connection().QueryRow(`
+		SELECT COUNT(*) FROM health_import_validations WHERE queue_item_id = ?
+	`, tolerantQueueItem.ID).Scan(&validationCount))
+	assert.Equal(t, 1, validationCount,
+		"each import freezes one damage policy while each final file keeps independent durable state")
 
 	restarted := NewHealthStateRepository(db.Connection(), DialectSQLite)
 	restarted.now = clock.Now
@@ -212,6 +222,11 @@ func TestPR5ImportValidationEnforcesStrictRejectVersusTolerantHealthPending(t *t
 		Status: QueueStatusProcessing, MaxRetries: 3,
 	}
 	require.NoError(t, f.db.Repository.AddToQueue(ctx, queueItem))
+	tolerantQueueItem := &ImportQueueItem{
+		NzbPath: "queue/policy-tolerant-import.nzb", Priority: QueuePriorityNormal,
+		Status: QueueStatusProcessing, MaxRetries: 3,
+	}
+	require.NoError(t, f.db.Repository.AddToQueue(ctx, tolerantQueueItem))
 	due := f.now.Add(30 * time.Second)
 	strictRun, err := f.repo.CreateHealthRun(ctx, HealthRunSpec{
 		ID: "strict-import-run", FileRevisionID: f.run.FileRevisionID,
@@ -297,6 +312,10 @@ func TestPR5ImportValidationEnforcesStrictRejectVersusTolerantHealthPending(t *t
 		LeaseOwner: *tolerantLease.LeaseOwner, FencingToken: tolerantLease.FencingToken,
 	}
 	_, err = f.repo.UpsertImportValidation(ctx, tolerantInitial)
+	require.ErrorIs(t, err, ErrImportDamagePolicy,
+		"all final files in one import must use the damage policy frozen by its first validation")
+	tolerantInitial.QueueItemID = tolerantQueueItem.ID
+	_, err = f.repo.UpsertImportValidation(ctx, tolerantInitial)
 	require.NoError(t, err)
 	commitPR5ImportSTATCoverage(
 		t, f.repo, secondRun, tolerantLease, snapshot.Entries[0], "tolerant-policy-initial",
@@ -348,7 +367,7 @@ func TestPR5ImportValidationEnforcesStrictRejectVersusTolerantHealthPending(t *t
 	deadlineLease, err := f.repo.AcquireRunLease(ctx, thirdRun.ID, "deadline-policy-worker", 5*time.Minute)
 	require.NoError(t, err)
 	deadlineInitial := ImportValidationWrite{
-		ID: "missing-deadline", QueueItemID: queueItem.ID,
+		ID: "missing-deadline", QueueItemID: tolerantQueueItem.ID,
 		FileRevisionID: thirdRevision.ID, RunID: thirdRun.ID,
 		Phase: ImportValidationPhaseInitialPass, DamagePolicy: ImportDamagePolicyTolerant,
 		CreatedAt: f.now, UpdatedAt: f.clock.now,

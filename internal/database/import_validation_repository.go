@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -195,6 +196,27 @@ func (r *HealthStateRepository) UpsertImportValidation(
 		if err != nil {
 			return err
 		}
+		var lockedQueueID int64
+		if err := tx.QueryRowContext(ctx, `
+			UPDATE import_queue SET updated_at = updated_at
+			WHERE id = ? RETURNING id
+		`, write.QueueItemID).Scan(&lockedQueueID); errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("import validation queue item does not exist")
+		} else if err != nil {
+			return fmt.Errorf("lock import validation queue item: %w", err)
+		}
+		var frozenPolicy ImportDamagePolicy
+		err = tx.QueryRowContext(ctx, `
+			SELECT damage_policy FROM health_import_validations
+			WHERE queue_item_id = ?
+			ORDER BY created_at, id LIMIT 1
+		`, write.QueueItemID).Scan(&frozenPolicy)
+		if err == nil && frozenPolicy != write.DamagePolicy {
+			return ErrImportDamagePolicy
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read frozen import queue damage policy: %w", err)
+		}
 
 		var boundID string
 		var boundQueue int64
@@ -260,6 +282,15 @@ func (r *HealthStateRepository) UpsertImportValidation(
 			); err != nil {
 				return err
 			}
+			if terminalImportValidationPhase(write.Phase) {
+				current, err := providerSnapshotMembershipMatchesCurrentTx(ctx, tx, run.SnapshotID)
+				if err != nil {
+					return err
+				}
+				if !current {
+					return ErrProviderSnapshotMismatch
+				}
+			}
 			updated, err := tx.ExecContext(ctx, `
 				UPDATE health_import_validations
 				SET phase = ?, confirmation_due_at = ?, unresolved_segments = ?,
@@ -290,6 +321,201 @@ func (r *HealthStateRepository) UpsertImportValidation(
 		return nil, err
 	}
 	return &result, nil
+}
+
+// GetImportQueueDamagePolicy returns the first policy durably frozen for a
+// queue item. Every final file produced by that queue item must use it.
+func (r *HealthStateRepository) GetImportQueueDamagePolicy(
+	ctx context.Context,
+	queueItemID int64,
+) (ImportDamagePolicy, bool, error) {
+	if queueItemID <= 0 {
+		return "", false, fmt.Errorf("positive import queue item ID is required")
+	}
+	var policy ImportDamagePolicy
+	err := r.db.QueryRowContext(ctx, `
+		SELECT damage_policy FROM health_import_validations
+		WHERE queue_item_id = ?
+		ORDER BY created_at, id LIMIT 1
+	`, queueItemID).Scan(&policy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get import queue damage policy: %w", err)
+	}
+	return policy, true, nil
+}
+
+// ValidateImportProviderSnapshotCurrent fences terminal admission against the
+// current provider membership while deliberately tolerating order/role-only
+// changes. UpsertImportValidation performs the same check atomically at its
+// terminal transition; this read seam lets a resumable importer decide whether
+// it must abandon and reseed before doing further network work.
+func (r *HealthStateRepository) ValidateImportProviderSnapshotCurrent(
+	ctx context.Context,
+	runID string,
+) error {
+	if strings.TrimSpace(runID) == "" {
+		return fmt.Errorf("import health run ID is required")
+	}
+	var snapshotID, trigger, mode string
+	if err := r.db.QueryRowContext(ctx, `
+		SELECT provider_snapshot_id, trigger, mode FROM health_runs WHERE id = ?
+	`, runID).Scan(&snapshotID, &trigger, &mode); errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("import health run does not exist")
+	} else if err != nil {
+		return fmt.Errorf("read import health run snapshot: %w", err)
+	}
+	if trigger != "import" || mode != "observation" {
+		return fmt.Errorf("provider snapshot validation requires an import observation run")
+	}
+	current, err := r.providerSnapshotMembershipMatchesCurrent(ctx, snapshotID)
+	if err != nil {
+		return err
+	}
+	if !current {
+		return ErrProviderSnapshotMismatch
+	}
+	return nil
+}
+
+// AbandonImportValidation detaches only the current nonterminal validation
+// after a provider-set change. The old run/chunks/attempts remain immutable
+// history and a replacement run must capture its own provider snapshot.
+func (r *HealthStateRepository) AbandonImportValidation(
+	ctx context.Context,
+	queueItemID int64,
+	fileRevisionID, expectedRunID string,
+	at time.Time,
+) error {
+	if queueItemID <= 0 || strings.TrimSpace(fileRevisionID) == "" ||
+		strings.TrimSpace(expectedRunID) == "" || at.IsZero() {
+		return fmt.Errorf("queue item, file revision, expected run, and abandonment time are required")
+	}
+	at = at.UTC()
+	return r.withTransaction(ctx, func(tx *dialectAwareTx) error {
+		var validationID, currentRunID string
+		var phase ImportValidationPhase
+		err := tx.QueryRowContext(ctx, `
+			UPDATE health_import_validations SET updated_at = updated_at
+			WHERE queue_item_id = ? AND file_revision_id = ?
+			RETURNING id, run_id, phase
+		`, queueItemID, fileRevisionID).Scan(&validationID, &currentRunID, &phase)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("lock import validation for abandonment: %w", err)
+		}
+		if currentRunID != expectedRunID {
+			return ErrStaleImportValidation
+		}
+		if phase == ImportValidationPhaseRejected {
+			return fmt.Errorf("rejected import validation cannot be abandoned")
+		}
+		if phase == ImportValidationPhaseAccepted || phase == ImportValidationPhaseHealthPending {
+			var active bool
+			if err := tx.QueryRowContext(ctx, `
+				SELECT active FROM health_file_revisions WHERE id = ?
+			`, fileRevisionID).Scan(&active); err != nil {
+				return fmt.Errorf("read admitted candidate publication state: %w", err)
+			}
+			if active {
+				return fmt.Errorf("published import validation cannot be abandoned")
+			}
+		}
+		var trigger, mode string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT trigger, mode FROM health_runs WHERE id = ?
+		`, currentRunID).Scan(&trigger, &mode); err != nil {
+			return fmt.Errorf("read abandoned import health run: %w", err)
+		}
+		if trigger != "import" || mode != "observation" {
+			return fmt.Errorf("only an import observation run may be abandoned")
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE health_runs
+			SET status = 'canceled', lease_owner = NULL, lease_expires_at = NULL,
+			    cancel_requested = TRUE, updated_at = ?, completed_at = ?
+			WHERE id = ? AND status IN ('pending', 'running', 'paused')
+		`, at, at, currentRunID); err != nil {
+			return fmt.Errorf("cancel abandoned import health run: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE health_run_schedule SET active = FALSE, updated_at = ?
+			WHERE run_id = ? AND active = TRUE
+		`, at, currentRunID); err != nil {
+			return fmt.Errorf("retire abandoned import schedule: %w", err)
+		}
+		deleted, err := tx.ExecContext(ctx, `
+			DELETE FROM health_import_validations WHERE id = ? AND run_id = ?
+		`, validationID, currentRunID)
+		if err != nil {
+			return fmt.Errorf("reset abandoned import validation: %w", err)
+		}
+		if rows, err := deleted.RowsAffected(); err != nil {
+			return fmt.Errorf("read abandoned import validation result: %w", err)
+		} else if rows != 1 {
+			return ErrStaleImportValidation
+		}
+		return nil
+	})
+}
+
+// RetireUnboundImportRun removes schedulable ownership from a provisional
+// import run that lost the queue-policy race before any validation bound to it.
+// Any already-committed transport evidence remains immutable history.
+func (r *HealthStateRepository) RetireUnboundImportRun(
+	ctx context.Context,
+	runID, revisionID string,
+	at time.Time,
+) error {
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(revisionID) == "" || at.IsZero() {
+		return fmt.Errorf("import run, revision, and retirement time are required")
+	}
+	at = at.UTC()
+	return r.withTransaction(ctx, func(tx *dialectAwareTx) error {
+		var boundRevision, trigger, mode string
+		err := tx.QueryRowContext(ctx, `
+			UPDATE health_runs SET updated_at = updated_at
+			WHERE id = ? RETURNING file_revision_id, trigger, mode
+		`, runID).Scan(&boundRevision, &trigger, &mode)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("lock unbound import run: %w", err)
+		}
+		if boundRevision != revisionID || trigger != "import" || mode != "observation" {
+			return ErrStaleImportValidation
+		}
+		var references int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM health_import_validations WHERE run_id = ?
+		`, runID).Scan(&references); err != nil {
+			return fmt.Errorf("check provisional import run binding: %w", err)
+		}
+		if references != 0 {
+			return ErrStaleImportValidation
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE health_runs
+			SET status = CASE WHEN status IN ('completed', 'failed', 'canceled') THEN status ELSE 'canceled' END,
+			    lease_owner = NULL, lease_expires_at = NULL, cancel_requested = TRUE,
+			    updated_at = ?, completed_at = COALESCE(completed_at, ?)
+			WHERE id = ?
+		`, at, at, runID); err != nil {
+			return fmt.Errorf("retire unbound import run: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE health_run_schedule SET active = FALSE, updated_at = ?
+			WHERE run_id = ? AND active = TRUE
+		`, at, runID); err != nil {
+			return fmt.Errorf("retire unbound import schedule: %w", err)
+		}
+		return nil
+	})
 }
 
 func validateImportValidationIdentity(existing ImportValidation, write ImportValidationWrite) error {
