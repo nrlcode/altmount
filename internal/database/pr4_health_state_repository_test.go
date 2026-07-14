@@ -461,6 +461,72 @@ func TestPR4OlderCrossRunObservationCannotOverwriteNewerProviderState(t *testing
 		"commit order cannot let an older observation erase newer provider evidence from another run")
 }
 
+func TestPR4OlderNegativeCannotReappearAfterNewerValidatedBody(t *testing.T) {
+	f := newPR4RunFixture(t)
+	ctx := context.Background()
+	otherRun, err := f.repo.CreateHealthRun(ctx, HealthRunSpec{
+		ID: "run-stale-negative", FileRevisionID: f.run.FileRevisionID,
+		ProviderSnapshotID: f.run.ProviderSnapshotID, Trigger: "scheduled", Mode: "observation",
+		TotalSegments: f.run.TotalSegments, CreatedAt: f.now,
+	})
+	require.NoError(t, err)
+	newerLease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "newer-worker", 10*time.Minute)
+	require.NoError(t, err)
+	olderLease, err := f.repo.AcquireRunLease(ctx, otherRun.ID, "older-worker", 10*time.Minute)
+	require.NoError(t, err)
+
+	newer := HealthChunkCommit{
+		ChunkID: "newer-valid-body", RunID: f.run.ID, LeaseOwner: "newer-worker", FencingToken: newerLease.FencingToken,
+		ProviderID: f.providerID, ProviderGeneration: 1, Stage: "body_delivery",
+		ObservationKind: HealthObservationValidatedBody,
+		SegmentStart:    0, SegmentCount: 1, TestedBitmap: []byte{1}, PresentBitmap: []byte{1},
+		AbsentBitmap: []byte{0}, CorruptBitmap: []byte{0}, TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
+		CursorSegment: 1, ResolvedDelta: 1, ProviderChecksDelta: 1,
+		CommittedAt: f.now.Add(2 * time.Minute),
+	}
+	_, err = f.repo.CommitHealthChunk(ctx, newer)
+	require.NoError(t, err)
+
+	older := HealthChunkCommit{
+		ChunkID: "older-corrupt-body", RunID: otherRun.ID, LeaseOwner: "older-worker", FencingToken: olderLease.FencingToken,
+		ProviderID: f.providerID, ProviderGeneration: 1, Stage: "body_revalidation",
+		ObservationKind: HealthObservationValidatedBody,
+		SegmentStart:    0, SegmentCount: 1, TestedBitmap: []byte{1}, PresentBitmap: []byte{0},
+		AbsentBitmap: []byte{0}, CorruptBitmap: []byte{1}, TemporaryBitmap: []byte{0}, InconclusiveBitmap: []byte{0},
+		CursorSegment: 1, ProviderChecksDelta: 1, MissingCandidatesDelta: 1,
+		CommittedAt: f.now.Add(time.Minute),
+	}
+	_, err = f.repo.CommitHealthChunk(ctx, older)
+	require.NoError(t, err)
+
+	var outcome string
+	err = f.db.Connection().QueryRow(`
+		SELECT outcome FROM health_segment_exceptions
+		WHERE file_revision_id = ? AND provider_id = ? AND provider_generation = 1 AND segment_index = 0
+	`, f.run.FileRevisionID, f.providerID).Scan(&outcome)
+	require.ErrorIs(t, err, sql.ErrNoRows,
+		"an older negative observation cannot reappear after newer validated BODY recovery")
+}
+
+func TestPR4StageTransitionUsesItsOwnCommittedCursor(t *testing.T) {
+	f := newPR4RunFixture(t)
+	ctx := context.Background()
+	lease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "worker", 10*time.Minute)
+	require.NoError(t, err)
+	primary := pr4Commit(f, "primary-late-range", lease.FencingToken, "worker", 4)
+	_, err = f.repo.CommitHealthChunk(ctx, primary)
+	require.NoError(t, err)
+
+	fallback := pr4Commit(f, "fallback-early-range", lease.FencingToken, "worker", 0)
+	fallback.Stage = "later_primary_stat"
+	fallback.CommittedAt = f.now.Add(time.Minute + time.Second)
+	after, err := f.repo.CommitHealthChunk(ctx, fallback)
+	require.NoError(t, err)
+	assert.Equal(t, fallback.Stage, after.Stage)
+	assert.Equal(t, int64(4), after.CursorSegment,
+		"changing provider stage must not retain the previous stage's later cursor")
+}
+
 func TestPR4ExplicitFileHealthDeletionClearsOnlyThatFilesDurableTree(t *testing.T) {
 	f := newPR4RunFixture(t)
 	ctx := context.Background()
