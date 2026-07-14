@@ -495,9 +495,10 @@ func sanitizeObservationAttempts(
 		if kind == database.HealthObservationValidatedBody {
 			operation = "BODY"
 			validation = string(nntppool.BodyValidationIncomplete)
-			if finalOutcome == observationOutcomePresent {
+			switch finalOutcome {
+			case observationOutcomePresent:
 				validation = string(nntppool.BodyValidationValid)
-			} else if finalOutcome == observationOutcomeCorrupt {
+			case observationOutcomeCorrupt:
 				validation = string(nntppool.BodyValidationInvalid)
 			}
 		}
