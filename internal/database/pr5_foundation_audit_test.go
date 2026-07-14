@@ -530,13 +530,18 @@ func TestPR5GapConfirmationCountUsesTimeSeparatedDurableEvents(t *testing.T) {
 	}
 	_, err := f.repo.UpsertGapRange(ctx, gapWrite)
 	require.NoError(t, err)
-	lease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "time-separated-worker", 30*time.Minute)
-	require.NoError(t, err)
-
 	commitAt := func(id, stage string, at time.Time) {
 		t.Helper()
 		f.clock.now = at
-		commit := pr5AuditAbsentCommit(f, f.run, lease, id, stage, 1, 1, at)
+		run, runErr := f.repo.CreateHealthRun(ctx, HealthRunSpec{
+			ID: id + "-run", FileRevisionID: f.run.FileRevisionID,
+			ProviderSnapshotID: f.run.ProviderSnapshotID, Trigger: "confirmation",
+			Mode: "observation", TotalSegments: f.run.TotalSegments, CreatedAt: at,
+		})
+		require.NoError(t, runErr)
+		lease, leaseErr := f.repo.AcquireRunLease(ctx, run.ID, id+"-worker", 30*time.Minute)
+		require.NoError(t, leaseErr)
+		commit := pr5AuditAbsentCommit(f, run, lease, id, stage, 1, 1, at)
 		_, commitErr := f.repo.CommitHealthChunk(ctx, commit)
 		require.NoError(t, commitErr)
 	}

@@ -751,13 +751,19 @@ func TestPR4GapCausesAndSyntheticCacheStateAreDurable(t *testing.T) {
 	ctx := context.Background()
 	revision, err := f.repo.GetFileRevisionForRun(ctx, f.run.ID)
 	require.NoError(t, err)
-	lease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "durable-corrupt-gap-worker", 30*time.Minute)
-	require.NoError(t, err)
 	commitCorruptWave := func(id, stage string, at time.Time) {
 		t.Helper()
 		f.clock.now = at
+		run, runErr := f.repo.CreateHealthRun(ctx, HealthRunSpec{
+			ID: id + "-run", FileRevisionID: f.run.FileRevisionID,
+			ProviderSnapshotID: f.run.ProviderSnapshotID, Trigger: "confirmation",
+			Mode: "observation", TotalSegments: f.run.TotalSegments, CreatedAt: at,
+		})
+		require.NoError(t, runErr)
+		lease, leaseErr := f.repo.AcquireRunLease(ctx, run.ID, id+"-worker", 30*time.Minute)
+		require.NoError(t, leaseErr)
 		_, commitErr := f.repo.CommitHealthChunk(ctx, HealthChunkCommit{
-			ChunkID: id, RunID: f.run.ID, LeaseOwner: *lease.LeaseOwner,
+			ChunkID: id, RunID: run.ID, LeaseOwner: *lease.LeaseOwner,
 			FencingToken: lease.FencingToken, ProviderID: f.providerID,
 			ProviderGeneration: 1, ProviderActivationEpoch: 1,
 			Stage: stage, ObservationKind: HealthObservationValidatedBody,
