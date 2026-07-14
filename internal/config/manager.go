@@ -290,6 +290,18 @@ const (
 	ImportStrategySTRM    ImportStrategy = "STRM"
 )
 
+// ImportDamagePolicy controls whether an import with unresolved article
+// positions may enter the library after its bounded confirmation pass.
+type ImportDamagePolicy string
+
+const (
+	// ImportDamagePolicyStrict rejects every import that remains unresolved.
+	ImportDamagePolicyStrict ImportDamagePolicy = "strict"
+	// ImportDamagePolicyTolerant admits only eligible files whose exact damage
+	// remains within the shared playback envelope.
+	ImportDamagePolicyTolerant ImportDamagePolicy = "tolerant"
+)
+
 // ImportConfig represents import processing configuration
 type ImportConfig struct {
 	MaxProcessorWorkers            int      `yaml:"max_processor_workers" mapstructure:"max_processor_workers" json:"max_processor_workers"`
@@ -299,27 +311,26 @@ type ImportConfig struct {
 	// end-to-end at the same time. 0 = unlimited. NNTP connection use is
 	// balanced automatically: imports share the pool's full capacity and
 	// yield to streams (priority lane + adaptive connection budget).
-	MaxConcurrentImports               int            `yaml:"max_concurrent_imports" mapstructure:"max_concurrent_imports" json:"max_concurrent_imports"`
-	MaxDownloadPrefetch                int            `yaml:"max_download_prefetch" mapstructure:"max_download_prefetch" json:"max_download_prefetch"`
-	SegmentSamplePercentage            int            `yaml:"segment_sample_percentage" mapstructure:"segment_sample_percentage" json:"segment_sample_percentage"`
-	ReadTimeoutSeconds                 int            `yaml:"read_timeout_seconds" mapstructure:"read_timeout_seconds" json:"read_timeout_seconds"`
-	IsoAnalyzeTimeoutSeconds           *int           `yaml:"iso_analyze_timeout_seconds" mapstructure:"iso_analyze_timeout_seconds" json:"iso_analyze_timeout_seconds,omitempty"`
-	ImportStrategy                     ImportStrategy `yaml:"import_strategy" mapstructure:"import_strategy" json:"import_strategy"`
-	ImportDir                          *string        `yaml:"import_dir" mapstructure:"import_dir" json:"import_dir,omitempty"`
-	WatchDir                           *string        `yaml:"watch_dir" mapstructure:"watch_dir" json:"watch_dir,omitempty"`
-	WatchIntervalSeconds               *int           `yaml:"watch_interval_seconds" mapstructure:"watch_interval_seconds" json:"watch_interval_seconds,omitempty"`
-	AllowNestedRarExtraction           *bool          `yaml:"allow_nested_rar_extraction" mapstructure:"allow_nested_rar_extraction" json:"allow_nested_rar_extraction,omitempty"`
-	ExpandBlurayIso                    *bool          `yaml:"expand_bluray_iso" mapstructure:"expand_bluray_iso" json:"expand_bluray_iso,omitempty"`
-	RenameToNzbName                    *bool          `yaml:"rename_to_nzb_name" mapstructure:"rename_to_nzb_name" json:"rename_to_nzb_name,omitempty"`
-	FilterSampleFiles                  *bool          `yaml:"filter_sample_files" mapstructure:"filter_sample_files" json:"filter_sample_files,omitempty"`
-	FailedItemRetentionHours           *int           `yaml:"failed_item_retention_hours" mapstructure:"failed_item_retention_hours" json:"failed_item_retention_hours,omitempty"`
-	HistoryRetentionDays               *int           `yaml:"history_retention_days" mapstructure:"history_retention_days" json:"history_retention_days,omitempty"`
-	// DamagePolicy governs standalone video files whose fast-fail sweep finds
-	// SMALL confirmed damage (within the playback padding caps, see
-	// internal/holes): "tolerant" (default) imports them as degraded so
-	// streaming zero-fills the gaps; "strict" fails the import so an ARR can
-	// grab a different release. Damage beyond the caps, archive-set members
-	// and non-video files fail either way.
+	MaxConcurrentImports     int            `yaml:"max_concurrent_imports" mapstructure:"max_concurrent_imports" json:"max_concurrent_imports"`
+	MaxDownloadPrefetch      int            `yaml:"max_download_prefetch" mapstructure:"max_download_prefetch" json:"max_download_prefetch"`
+	SegmentSamplePercentage  int            `yaml:"segment_sample_percentage" mapstructure:"segment_sample_percentage" json:"segment_sample_percentage"`
+	ReadTimeoutSeconds       int            `yaml:"read_timeout_seconds" mapstructure:"read_timeout_seconds" json:"read_timeout_seconds"`
+	IsoAnalyzeTimeoutSeconds *int           `yaml:"iso_analyze_timeout_seconds" mapstructure:"iso_analyze_timeout_seconds" json:"iso_analyze_timeout_seconds,omitempty"`
+	ImportStrategy           ImportStrategy `yaml:"import_strategy" mapstructure:"import_strategy" json:"import_strategy"`
+	ImportDir                *string        `yaml:"import_dir" mapstructure:"import_dir" json:"import_dir,omitempty"`
+	WatchDir                 *string        `yaml:"watch_dir" mapstructure:"watch_dir" json:"watch_dir,omitempty"`
+	WatchIntervalSeconds     *int           `yaml:"watch_interval_seconds" mapstructure:"watch_interval_seconds" json:"watch_interval_seconds,omitempty"`
+	AllowNestedRarExtraction *bool          `yaml:"allow_nested_rar_extraction" mapstructure:"allow_nested_rar_extraction" json:"allow_nested_rar_extraction,omitempty"`
+	ExpandBlurayIso          *bool          `yaml:"expand_bluray_iso" mapstructure:"expand_bluray_iso" json:"expand_bluray_iso,omitempty"`
+	RenameToNzbName          *bool          `yaml:"rename_to_nzb_name" mapstructure:"rename_to_nzb_name" json:"rename_to_nzb_name,omitempty"`
+	FilterSampleFiles        *bool          `yaml:"filter_sample_files" mapstructure:"filter_sample_files" json:"filter_sample_files,omitempty"`
+	FailedItemRetentionHours *int           `yaml:"failed_item_retention_hours" mapstructure:"failed_item_retention_hours" json:"failed_item_retention_hours,omitempty"`
+	HistoryRetentionDays     *int           `yaml:"history_retention_days" mapstructure:"history_retention_days" json:"history_retention_days,omitempty"`
+	// DamagePolicy governs files that remain unresolved after the bounded
+	// import availability checks. "strict" (the default) rejects them;
+	// "tolerant" admits only eligible files within the exact shared damage
+	// envelope as health-pending. Archive members and ineligible files fail
+	// either way.
 	DamagePolicy string `yaml:"damage_policy" mapstructure:"damage_policy" json:"damage_policy,omitempty"`
 }
 
@@ -349,6 +360,7 @@ type HealthConfig struct {
 	LibraryDir                          *string      `yaml:"library_dir" mapstructure:"library_dir" json:"library_dir,omitempty"`
 	CleanupOrphanedMetadata             *bool        `yaml:"cleanup_orphaned_metadata" mapstructure:"cleanup_orphaned_metadata" json:"cleanup_orphaned_metadata,omitempty"`
 	CheckIntervalSeconds                int          `yaml:"check_interval_seconds" mapstructure:"check_interval_seconds" json:"check_interval_seconds,omitempty"`
+	GapConfirmationDelayMinutes         int          `yaml:"gap_confirmation_delay_minutes" mapstructure:"gap_confirmation_delay_minutes" json:"gap_confirmation_delay_minutes,omitempty"`
 	MaxConnectionsForHealthChecks       int          `yaml:"max_connections_for_health_checks" mapstructure:"max_connections_for_health_checks" json:"max_connections_for_health_checks,omitempty"`
 	CheckBatchSize                      int          `yaml:"check_batch_size" mapstructure:"check_batch_size" json:"check_batch_size,omitempty"`
 	MaxConcurrentJobs                   int          `yaml:"max_concurrent_jobs" mapstructure:"max_concurrent_jobs" json:"max_concurrent_jobs,omitempty"`
@@ -677,6 +689,17 @@ func (c *Config) Validate() error {
 		c.Import.ReadTimeoutSeconds = 300
 	}
 
+	// Empty preserves source compatibility for configurations written before
+	// damage_policy existed, but normalizes to the safety-first PR5 default.
+	if c.Import.DamagePolicy == "" {
+		c.Import.DamagePolicy = string(ImportDamagePolicyStrict)
+	}
+	switch ImportDamagePolicy(c.Import.DamagePolicy) {
+	case ImportDamagePolicyStrict, ImportDamagePolicyTolerant:
+	default:
+		return fmt.Errorf("import damage_policy must be one of: strict, tolerant")
+	}
+
 	// Validate import strategy
 	validStrategies := map[ImportStrategy]bool{
 		ImportStrategyNone:    true,
@@ -765,6 +788,9 @@ func (c *Config) Validate() error {
 	// Validate health configuration (always active)
 	if c.Health.CheckIntervalSeconds <= 0 {
 		return fmt.Errorf("health check_interval_seconds must be greater than 0")
+	}
+	if c.Health.GapConfirmationDelayMinutes < 0 {
+		return fmt.Errorf("health gap_confirmation_delay_minutes must be non-negative")
 	}
 	if c.Health.MaxConnectionsForHealthChecks <= 0 {
 		return fmt.Errorf("health max_connections_for_health_checks must be greater than 0")
@@ -1637,6 +1663,7 @@ func DefaultConfig(configDir ...string) *Config {
 			WatchIntervalSeconds:     &watchIntervalSeconds,
 			FailedItemRetentionHours: &failedItemRetentionHours,
 			HistoryRetentionDays:     &historyRetentionDays,
+			DamagePolicy:             string(ImportDamagePolicyStrict),
 		},
 		Log: LogConfig{
 			File:       logPath, // Default log file path
@@ -1650,6 +1677,7 @@ func DefaultConfig(configDir ...string) *Config {
 			Enabled:                             &healthEnabled,           // Disabled by default
 			CleanupOrphanedMetadata:             &cleanupOrphanedMetadata, // Disabled by default
 			CheckIntervalSeconds:                5,
+			GapConfirmationDelayMinutes:         10,
 			MaxConnectionsForHealthChecks:       100,
 			CheckBatchSize:                      50,
 			MaxConcurrentJobs:                   1,                      // Default: 1 concurrent job

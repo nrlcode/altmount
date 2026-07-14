@@ -193,6 +193,29 @@ export function ImportConfigSection({
 
 						<div className="divider my-1 text-base-content/70" />
 
+						<label className="flex min-w-0 cursor-pointer items-start gap-3 rounded-xl border border-warning/30 bg-warning/5 p-4">
+							<input
+								type="checkbox"
+								className="toggle toggle-warning toggle-sm mt-0.5 shrink-0"
+								checked={formData.damage_policy === "tolerant"}
+								disabled={isReadOnly}
+								onChange={(e) =>
+									handleInputChange("damage_policy", e.target.checked ? "tolerant" : "strict")
+								}
+							/>
+							<div className="min-w-0">
+								<span className="block break-words font-bold text-xs">Allow Degraded Imports</span>
+								<span className="mt-0.5 block break-words text-[11px] text-base-content/60 leading-snug">
+									After both complete all-provider availability passes, admit only eligible
+									standalone files whose unresolved bytes remain inside the playback safety limits.
+									They enter as health-pending; archives, complicated layouts, and larger gaps are
+									still rejected.
+								</span>
+							</div>
+						</label>
+
+						<div className="divider my-1 text-base-content/70" />
+
 						<div className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2">
 							<label className="flex min-w-0 cursor-pointer items-start gap-3 rounded-xl border border-base-300/60 bg-base-100/40 p-4">
 								<input
