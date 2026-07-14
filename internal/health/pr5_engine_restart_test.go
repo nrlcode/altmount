@@ -140,6 +140,7 @@ func presentChunkCommit(f pr5StateFixture, lease *database.HealthRun, chunkID st
 		CorruptBitmap:       []byte{0},
 		TemporaryBitmap:     []byte{0},
 		InconclusiveBitmap:  []byte{0},
+		ResolvedBitmap:      []byte{bitmap},
 		CursorSegment:       start + count,
 		ResolvedDelta:       count,
 		ProviderChecksDelta: count,
