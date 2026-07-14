@@ -267,6 +267,36 @@ func TestPR5AuditTolerantImportRequiresUncomplicatedStandaloneProvenance(t *test
 	}
 }
 
+func TestPR5AuditComplicatedImportUsesPhysicalPositionDomainWithoutDegradedAdmission(t *testing.T) {
+	t.Parallel()
+
+	t.Run("clean strict nested-style layout remains importable", func(t *testing.T) {
+		input := pr5AuditInput([]ImportAvailabilityPosition{
+			pr5AuditPosition(0, []ImportProviderCheck{pr5AuditSuccess(pr5AuditPrimaryProvider, 2)}, nil),
+		}, []int64{12_500})
+		input.UncomplicatedStandalone = false
+
+		decision, err := DecideImportAdmission(context.Background(), input)
+		require.NoError(t, err)
+		assert.Equal(t, ImportAdmissionAccept, decision.Status,
+			"physical outer-article bytes need not equal a nested or encrypted virtual file size")
+	})
+
+	t.Run("tolerant cannot admit unresolved complicated layout", func(t *testing.T) {
+		input := pr5AuditInput([]ImportAvailabilityPosition{
+			pr5AuditPosition(0, pr5AuditUnavailableChecks(2), pr5AuditUnavailableChecks(2)),
+		}, []int64{12_500})
+		input.DamagePolicy = "tolerant"
+		input.SecondPassComplete = true
+		input.UncomplicatedStandalone = false
+
+		decision, err := DecideImportAdmission(context.Background(), input)
+		require.NoError(t, err)
+		assert.Equal(t, ImportAdmissionReject, decision.Status,
+			"a non-comparable byte domain must fail closed rather than enter health_pending")
+	})
+}
+
 func TestPR5AuditImportProviderChecksRejectMalformedTerminalEvidence(t *testing.T) {
 	t.Parallel()
 
