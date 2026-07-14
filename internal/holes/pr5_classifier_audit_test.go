@@ -37,6 +37,12 @@ func TestPR5AuditClassifyPositionsRejectsIncompleteCanonicalDomain(t *testing.T)
 			segmentBytes: []int64{1},
 			fileBytes:    0,
 		},
+		{
+			name:         "canonical spans must equal the virtual size",
+			missing:      []int{0},
+			segmentBytes: []int64{40, 50},
+			fileBytes:    100,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			impact, err := ClassifyPositions(tt.missing, tt.segmentBytes, tt.fileBytes)
@@ -54,6 +60,7 @@ func TestPR5AuditClassifyPositionsEnforcesExactTotalBoundary(t *testing.T) {
 	for i := range segmentBytes {
 		segmentBytes[i] = 1
 	}
+	segmentBytes[127] += 10_000 - int64(len(segmentBytes))
 	missing64 := make([]int, 0, 64)
 	for position := 0; position < 128; position += 2 {
 		missing64 = append(missing64, position)
@@ -77,8 +84,9 @@ func TestPR5AuditClassifyPositionsEnforcesExactRunBoundary(t *testing.T) {
 
 	segmentBytes := make([]int64, 10)
 	for i := range segmentBytes {
-		segmentBytes[i] = 10
+		segmentBytes[i] = 1
 	}
+	segmentBytes[9] += 10_000 - int64(len(segmentBytes))
 
 	impact, err := ClassifyPositions([]int{0, 1, 2, 3}, segmentBytes, 10_000)
 	require.NoError(t, err)

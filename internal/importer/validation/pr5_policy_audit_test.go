@@ -125,6 +125,16 @@ func TestPR5AuditImportAdmissionRequiresCompleteFingerprintBoundLayout(t *testin
 		require.Error(t, err)
 		assert.NotEqual(t, ImportAdmissionAccept, decision.Status)
 	})
+
+	t.Run("canonical usable spans must match final virtual size", func(t *testing.T) {
+		input := pr5AuditInput([]ImportAvailabilityPosition{
+			pr5AuditPosition(0, []ImportProviderCheck{pr5AuditSuccess(pr5AuditPrimaryProvider, 2)}, nil),
+		}, []int64{9_999})
+
+		decision, err := DecideImportAdmission(context.Background(), input)
+		require.Error(t, err)
+		assert.NotEqual(t, ImportAdmissionAccept, decision.Status)
+	})
 }
 
 func TestPR5AuditImportConfirmationUsesTerminalCheckNotNestedAttempt(t *testing.T) {
@@ -158,7 +168,7 @@ func TestPR5AuditImportConfirmationUsesTerminalCheckNotNestedAttempt(t *testing.
 
 	input := pr5AuditInput([]ImportAvailabilityPosition{
 		pr5AuditPosition(0, pr5AuditUnavailableChecks(2), []ImportProviderCheck{primary, backup}),
-	}, []int64{100})
+	}, []int64{10_000})
 	input.SecondPassComplete = true
 
 	decision, err := DecideImportAdmission(context.Background(), input)
@@ -172,6 +182,28 @@ func TestPR5AuditImportConfirmationUsesTerminalCheckNotNestedAttempt(t *testing.
 			ProviderActivationEpoch: 2,
 		},
 	}, decision.ConfirmationTargets)
+}
+
+func TestPR5AuditImportPassCompletionIsDerivedFromTerminalChecks(t *testing.T) {
+	t.Parallel()
+
+	input := pr5AuditInput([]ImportAvailabilityPosition{
+		pr5AuditPosition(0, []ImportProviderCheck{
+			pr5AuditCheck(
+				pr5AuditPrimaryProvider,
+				2,
+				nntppool.OutcomeHardArticleAbsence,
+				ImportCheckDispositionAttempted,
+			),
+		}, nil),
+	}, []int64{10_000})
+	input.InitialPassComplete = true
+
+	decision, err := DecideImportAdmission(context.Background(), input)
+	require.NoError(t, err)
+	assert.Equal(t, ImportAdmissionAwaitConfirmation, decision.Status)
+	assert.Zero(t, decision.RetryAfter,
+		"a lying completion flag cannot skip unfinished initial provider work and start the 30-second wait")
 }
 
 func TestPR5AuditImportEvidenceHonorsProviderActivationEpoch(t *testing.T) {
@@ -191,7 +223,7 @@ func TestPR5AuditImportEvidenceHonorsProviderActivationEpoch(t *testing.T) {
 	)
 	input := pr5AuditInput([]ImportAvailabilityPosition{
 		pr5AuditPosition(0, pr5AuditUnavailableChecks(2), []ImportProviderCheck{stale, currentBackup}),
-	}, []int64{100})
+	}, []int64{10_000})
 	input.SecondPassComplete = true
 
 	decision, err := DecideImportAdmission(context.Background(), input)
@@ -285,7 +317,7 @@ func TestPR5AuditImportProviderChecksRejectMalformedTerminalEvidence(t *testing.
 		t.Run(tt.name, func(t *testing.T) {
 			input := pr5AuditInput([]ImportAvailabilityPosition{
 				pr5AuditPosition(0, pr5AuditUnavailableChecks(2), tt.checks),
-			}, []int64{100})
+			}, []int64{10_000})
 			input.SecondPassComplete = true
 
 			decision, err := DecideImportAdmission(context.Background(), input)

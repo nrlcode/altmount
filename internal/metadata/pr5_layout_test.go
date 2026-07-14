@@ -13,7 +13,7 @@ func TestPR5ResolveCanonicalSegmentLayoutMatchesFingerprintOrder(t *testing.T) {
 	t.Parallel()
 
 	meta := &metapb.FileMetadata{
-		FileSize: 175,
+		FileSize: 85,
 		SegmentData: []*metapb.SegmentData{
 			{Id: "fixture-duplicate", SegmentSize: 100, StartOffset: 10, EndOffset: 59},
 			{Id: "fixture-duplicate", SegmentSize: 100, StartOffset: 60, EndOffset: 99},
@@ -37,7 +37,7 @@ func TestPR5ResolveCanonicalSegmentLayoutMatchesFingerprintOrder(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, layout)
 	assert.Equal(t, wantFingerprint, layout.Fingerprint)
-	assert.Equal(t, int64(175), layout.VirtualSize)
+	assert.Equal(t, int64(85), layout.VirtualSize)
 	require.Len(t, layout.Segments, 1)
 	assert.Equal(t, "fixture-nested", layout.Segments[0].MessageID,
 		"nested sources are the authoritative playback representation")
