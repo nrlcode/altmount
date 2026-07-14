@@ -152,6 +152,37 @@ func TestPR3UntypedErrorTextDoesNotBecomeCorruptBody(t *testing.T) {
 	}
 }
 
+func TestPR3TypedCorruptBodyRemainsCorruptNotAbsent(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	fp := fakepool.New()
+	typed := &nntppool.TransportError{
+		Kind:  nntppool.OutcomeCorruptBody,
+		Cause: nntppool.ErrBodyCorrupt,
+		Attempts: []nntppool.AttemptEvidence{{
+			ProviderID:     "provider-a",
+			Operation:      nntppool.OperationBody,
+			Outcome:        nntppool.OutcomeCorruptBody,
+			BodyValidation: nntppool.BodyValidationInvalid,
+			Cause:          nntppool.ErrBodyCorrupt,
+		}},
+	}
+	fp.SetBehavior(segments.MessageID(0), fakepool.SegmentBehavior{Err: typed})
+	rg := buildEagerRange(ctx, t, 1, 16)
+	ur := newReaderForTest(t, ctx, fp, rg, 1)
+
+	_, err := ur.downloadSegmentWithRetry(ctx, rg.segments[0])
+	var corruption *DataCorruptionError
+	if !errors.As(err, &corruption) {
+		t.Fatalf("typed corrupt BODY error = %T %v, want DataCorruptionError", err, err)
+	}
+	if errors.Is(err, nntppool.ErrArticleNotFound) {
+		t.Fatalf("typed corrupt BODY was converted to hard article absence: %v", err)
+	}
+}
+
 // TestMissingSegment_EmitsDebugLog verifies that a DebugContext log with
 // message "missing segment" is emitted when a segment permanently fails
 // with ErrArticleNotFound.

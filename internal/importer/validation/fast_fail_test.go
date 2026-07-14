@@ -161,6 +161,54 @@ func TestFastFailReleaseProbeOmittedResultIsIncomplete(t *testing.T) {
 	}
 }
 
+func TestPR3FastFailReleaseProbeUsesTypedOutcomes(t *testing.T) {
+	tests := []struct {
+		name        string
+		kind        nntppool.OutcomeKind
+		cause       error
+		wantMissing bool
+		wantErr     bool
+	}{
+		{name: "hard absence", kind: nntppool.OutcomeHardArticleAbsence, cause: nntppool.ErrArticleNotFound, wantMissing: true},
+		{name: "temporary", kind: nntppool.OutcomeTemporaryFailure, cause: fmt.Errorf("temporary"), wantErr: true},
+		{name: "unavailable", kind: nntppool.OutcomeProviderUnavailable, cause: nntppool.ErrServiceUnavailable, wantErr: true},
+		{name: "canceled", kind: nntppool.OutcomeCancellation, cause: context.Canceled, wantErr: true},
+		{name: "corrupt", kind: nntppool.OutcomeCorruptBody, cause: nntppool.ErrBodyCorrupt, wantErr: true},
+		{name: "transport", kind: nntppool.OutcomeTransportFailure, cause: fmt.Errorf("transport"), wantErr: true},
+		{name: "inconclusive", kind: nntppool.OutcomeInconclusive, cause: fmt.Errorf("inconclusive"), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &scriptedFastFailClient{
+				Client: fakepool.New(),
+				results: []nntppool.StatManyResult{{
+					MessageID: "typed-0",
+					Err: &nntppool.TransportError{
+						Kind:  tt.kind,
+						Cause: tt.cause,
+					},
+				}},
+			}
+			missing, err := FastFailReleaseProbe(
+				context.Background(),
+				[]FastFailFile{{Filename: "movie.mkv", Segments: makeTestSegments("typed", 1)}},
+				fastFailPoolManager{client: client},
+				100, 1, 100*time.Millisecond,
+			)
+			if tt.wantErr && err == nil {
+				t.Fatal("typed non-conclusive outcome returned nil error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("hard absence returned error: %v", err)
+			}
+			if missing != tt.wantMissing {
+				t.Fatalf("missing = %v, want %v", missing, tt.wantMissing)
+			}
+		})
+	}
+}
+
 func TestFastFailReleaseProbePoolUnavailableReturnsError(t *testing.T) {
 	missing, err := FastFailReleaseProbe(
 		context.Background(),

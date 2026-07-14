@@ -169,6 +169,58 @@ func TestValidateSegmentAvailabilityBatch_OmittedResultIsIncomplete(t *testing.T
 		"TotalChecked must count results received, not work requested")
 }
 
+func TestPR3ValidateSegmentAvailabilityBatchUsesTypedOutcomes(t *testing.T) {
+	tests := []struct {
+		name        string
+		kind        nntppool.OutcomeKind
+		cause       error
+		wantMissing int
+		wantErr     bool
+	}{
+		{name: "hard absence", kind: nntppool.OutcomeHardArticleAbsence, cause: nntppool.ErrArticleNotFound, wantMissing: 1},
+		{name: "temporary", kind: nntppool.OutcomeTemporaryFailure, cause: errors.New("synthetic temporary failure"), wantErr: true},
+		{name: "unavailable", kind: nntppool.OutcomeProviderUnavailable, cause: nntppool.ErrServiceUnavailable, wantErr: true},
+		{name: "canceled", kind: nntppool.OutcomeCancellation, cause: context.Canceled, wantErr: true},
+		{name: "corrupt", kind: nntppool.OutcomeCorruptBody, cause: nntppool.ErrBodyCorrupt, wantErr: true},
+		{name: "transport", kind: nntppool.OutcomeTransportFailure, cause: errors.New("synthetic transport failure"), wantErr: true},
+		{name: "inconclusive", kind: nntppool.OutcomeInconclusive, cause: errors.New("synthetic inconclusive response"), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transportErr := &nntppool.TransportError{
+				Kind:  tt.kind,
+				Cause: tt.cause,
+				Attempts: []nntppool.AttemptEvidence{{
+					ProviderID: "provider-a",
+					Operation:  nntppool.OperationStat,
+					Outcome:    tt.kind,
+					Cause:      tt.cause,
+				}},
+			}
+			client := &scriptedStatClient{
+				Client: fakepool.New(),
+				results: []nntppool.StatManyResult{{
+					MessageID: "typed@test",
+					Err:       transportErr,
+				}},
+			}
+			mgr := &validationTestPoolManager{client: client}
+
+			results, err := ValidateSegmentAvailabilityBatch(
+				context.Background(), [][]string{{"typed@test"}}, mgr, 1, time.Second,
+			)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Len(t, results, 1)
+			assert.Equal(t, tt.wantMissing, results[0].MissingCount)
+		})
+	}
+}
+
 func TestValidateSegmentAvailabilityBatch_PoolUnavailable(t *testing.T) {
 	mgr := &failingPoolManager{}
 	_, err := ValidateSegmentAvailabilityBatch(context.Background(), [][]string{idList("a", 2)}, mgr, 2, time.Second)
