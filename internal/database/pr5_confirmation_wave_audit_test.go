@@ -169,6 +169,73 @@ func TestPR5OneRunCanSupplyTimeSeparatedStageWaves(t *testing.T) {
 	}
 }
 
+func TestPR5GapConfirmationDelayDefaultsToTenMinutes(t *testing.T) {
+	f := newPR5ConfirmationWaveFixture(t)
+	ctx := context.Background()
+	position := int64(5)
+	firstAt := f.now.Add(time.Minute)
+
+	run, lease := f.createWaveRun(t, "default-delay-run", firstAt)
+	f.commitWaveStage(t, run, lease, "default-delay-first", f.providers, []int64{position}, firstAt)
+	f.commitWaveStage(
+		t, run, lease, "default-delay-too-soon", f.providers, []int64{position},
+		firstAt.Add(10*time.Minute-time.Nanosecond),
+	)
+
+	write := f.confirmedGapWrite("default-delay-gap", position, 1)
+	_, err := f.repo.UpsertGapRange(ctx, write)
+	require.Error(t, err, "the default must not accept a wave even one nanosecond before ten minutes")
+
+	secondAt := firstAt.Add(10 * time.Minute)
+	f.commitWaveStage(t, run, lease, "default-delay-boundary", f.providers, []int64{position}, secondAt)
+	gap, err := f.repo.UpsertGapRange(ctx, write)
+	require.NoError(t, err, "the default must accept a distinct coherent wave at exactly ten minutes")
+	for _, cause := range gap.Causes {
+		assert.Equal(t, 2, cause.ConfirmationCount)
+		assert.Equal(t, secondAt, cause.ConfirmedAt)
+	}
+}
+
+func TestPR5GapConfirmationDelayOverrideIsValidatedAndRepositoryLocal(t *testing.T) {
+	f := newPR5ConfirmationWaveFixture(t)
+	ctx := context.Background()
+	position := int64(6)
+	firstAt := f.now.Add(time.Minute)
+	secondAt := firstAt.Add(2 * time.Minute)
+
+	run, lease := f.createWaveRun(t, "override-delay-run", firstAt)
+	f.commitWaveStage(t, run, lease, "override-delay-first", f.providers, []int64{position}, firstAt)
+	f.commitWaveStage(t, run, lease, "override-delay-second", f.providers, []int64{position}, secondAt)
+
+	defaultRepo := NewHealthStateRepository(f.db.Connection(), DialectSQLite)
+	_, err := defaultRepo.UpsertGapRange(
+		ctx, f.confirmedGapWrite("default-repository-gap", position, 1),
+	)
+	require.Error(t, err, "an override on another repository must not alter the default")
+
+	require.Error(t, f.repo.SetGapConfirmationMinimumDelay(0))
+	require.Error(t, f.repo.SetGapConfirmationMinimumDelay(-time.Second))
+	_, err = f.repo.UpsertGapRange(
+		ctx, f.confirmedGapWrite("invalid-override-gap", position, 1),
+	)
+	require.Error(t, err, "an invalid override must leave the ten-minute default intact")
+
+	require.NoError(t, f.repo.SetGapConfirmationMinimumDelay(2*time.Minute))
+	gap, err := f.repo.UpsertGapRange(
+		ctx, f.confirmedGapWrite("override-repository-gap", position, 1),
+	)
+	require.NoError(t, err)
+	for _, cause := range gap.Causes {
+		assert.Equal(t, 2, cause.ConfirmationCount)
+		assert.Equal(t, secondAt, cause.ConfirmedAt)
+	}
+
+	_, err = defaultRepo.UpsertGapRange(
+		ctx, f.confirmedGapWrite("still-default-repository-gap", position, 1),
+	)
+	require.Error(t, err, "the configured minimum must remain local to its repository")
+}
+
 func TestPR5OneRunStageCannotCombineAsynchronousProviderPairs(t *testing.T) {
 	f := newPR5ConfirmationWaveFixture(t)
 	ctx := context.Background()
