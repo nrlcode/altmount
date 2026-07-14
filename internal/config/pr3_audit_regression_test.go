@@ -42,6 +42,14 @@ func TestPR3ProviderValidationMatchesTransportConstruction(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "explicit id collides with legacy fallback id",
+			providers: []ProviderConfig{
+				{ID: "legacy.invalid:119", Host: "explicit.invalid", Port: 119, MaxConnections: 1, Enabled: &enabled, IsBackupProvider: &primary},
+				{Host: "legacy.invalid", Port: 119, MaxConnections: 1, Enabled: &enabled, IsBackupProvider: &primary},
+			},
+			wantErr: true,
+		},
+		{
 			name: "duplicate disabled pool identity is inert",
 			providers: []ProviderConfig{
 				{ID: "provider-1", Host: "same.invalid", Port: 119, Username: "account", MaxConnections: 1, Enabled: &enabled, IsBackupProvider: &primary},
