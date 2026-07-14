@@ -32,6 +32,13 @@ type ARRsRepairService interface {
 	DiscoverFileMetadata(ctx context.Context, filePath, relativePath, nzbName, libraryPath string) (*model.WebhookMetadata, error)
 }
 
+// PlaybackActivitySource is the narrow admission signal used by the temporary
+// PR3 health-sweep pause. Repair notifications and manual checks are not
+// blocked by this source.
+type PlaybackActivitySource interface {
+	ActiveStreams() int
+}
+
 // WorkerStatus represents the current status of the health worker
 type WorkerStatus string
 
@@ -66,6 +73,7 @@ type HealthWorker struct {
 	importerService     importer.ImportService
 	configGetter        config.ConfigGetter
 	progressBroadcaster *progress.ProgressBroadcaster // optional, may be nil
+	playbackSource      PlaybackActivitySource
 
 	// Worker state
 	status       WorkerStatus
@@ -85,6 +93,24 @@ type HealthWorker struct {
 
 	// Singleflight for metadata discovery
 	discoverySF singleflight.Group
+}
+
+// SetPlaybackActivitySource supplies the live stream counter used for ordinary
+// health admission. It is safe to replace while the worker is running.
+func (hw *HealthWorker) SetPlaybackActivitySource(source PlaybackActivitySource) {
+	hw.mu.Lock()
+	hw.playbackSource = source
+	hw.mu.Unlock()
+}
+
+func (hw *HealthWorker) shouldPauseForPlayback() bool {
+	if !hw.configGetter().GetPauseHealthDuringPlayback() {
+		return false
+	}
+	hw.mu.RLock()
+	source := hw.playbackSource
+	hw.mu.RUnlock()
+	return source != nil && source.ActiveStreams() > 0
 }
 
 // NewHealthWorker creates a new health worker
@@ -430,6 +456,23 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 	}
 	update.ErrorMessage = errorMsg
 	update.ErrorDetails = event.Details
+
+	// Incomplete, cancelled, unavailable, and otherwise inconclusive checks do
+	// not consume corruption/repair authority, regardless of prior retry count
+	// or delete-on-corruption configuration.
+	if event.Type == EventTypeCheckFailed {
+		exponent := min(max(fh.RetryCount, 0), 6)
+		nextCheck := time.Now().UTC().Add(time.Duration(15*(1<<exponent)) * time.Minute)
+		update.Type = database.UpdateTypeRetry
+		update.Status = database.HealthStatusPending
+		update.ScheduledCheckAt = nextCheck
+		return update, func() error {
+			slog.InfoContext(ctx, "Incomplete health check deferred without repair authority",
+				"file_path", fh.FilePath,
+				"next_check", nextCheck)
+			return nil
+		}
+	}
 
 	// Degraded verdict: the confirmed holes are within the padding caps, so
 	// the file still plays (streaming zero-fills the gaps). Record it as
@@ -806,9 +849,15 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 	// (CheckFilesBatch), so NNTP throughput no longer depends on per-file job
 	// concurrency. maxJobs still bounds the per-file result handling below
 	// (repair side effects, ARR API calls).
-	unhealthyFiles, err := hw.healthRepo.GetUnhealthyFiles(ctx, cfg.GetCheckBatchSize(), strategy, libraryDir, hw.configGetter().GetMaxRetries())
-	if err != nil {
-		return fmt.Errorf("failed to get unhealthy files: %w", err)
+	var unhealthyFiles []*database.FileHealth
+	var err error
+	if hw.shouldPauseForPlayback() {
+		slog.InfoContext(ctx, "Pausing admission of ordinary health checks during active playback")
+	} else {
+		unhealthyFiles, err = hw.healthRepo.GetUnhealthyFiles(ctx, cfg.GetCheckBatchSize(), strategy, libraryDir, hw.configGetter().GetMaxRetries())
+		if err != nil {
+			return fmt.Errorf("failed to get unhealthy files: %w", err)
+		}
 	}
 
 	// Get files that need repair notifications. Only when automatic repair is enabled —
@@ -841,24 +890,13 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 		"total", totalFiles,
 		"max_concurrent_jobs", maxJobs)
 
-	// Transition the whole batch to 'checking' in one write instead of one UPDATE per
-	// file: under SQLite's single writer N per-file transitions would serialize against
-	// each other and the final bulk status write. Crash recovery is unchanged
-	// (ResetFileAllChecking at startup re-arms stranded 'checking' rows).
-	checkingPaths := make([]string, len(unhealthyFiles))
-	for i, fh := range unhealthyFiles {
-		checkingPaths[i] = fh.FilePath
-	}
-	if err := hw.healthRepo.SetFilesCheckingBulk(ctx, checkingPaths); err != nil {
-		slog.ErrorContext(ctx, "Failed to bulk-set files to checking", "count", len(checkingPaths), "error", err)
-	}
-
 	// Process files in parallel with bounded concurrency
 	p := pool.New().WithMaxGoroutines(maxJobs)
 	var results []database.HealthStatusUpdate
 	var resultsMu sync.Mutex
 
-	// The regular-check writes are based on the record being 'checking' (set just above);
+	// The regular-check writes are based on the record being 'checking' (set at
+	// the final admission boundary below);
 	// guard them on that status so a concurrent webhook relink / re-import / manual
 	// recheck that lands mid-check is not silently clobbered by a stale check result.
 	checkingStatus := database.HealthStatusChecking
@@ -875,6 +913,26 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 		})
 	}
 	discover.Wait()
+
+	// Re-check at the actual sweep boundary. Playback may have started while
+	// metadata discovery was running; dropping the ordinary batch here leaves
+	// every record pending and consumes no retry. Repair notifications continue.
+	if len(unhealthyFiles) > 0 && hw.shouldPauseForPlayback() {
+		slog.InfoContext(ctx, "Deferring prepared ordinary health batch because playback became active",
+			"files", len(unhealthyFiles))
+		unhealthyFiles = nil
+	}
+	totalFiles = len(unhealthyFiles) + len(repairFiles)
+
+	// Transition the admitted batch to 'checking' in one write instead of one
+	// UPDATE per file. This happens only after the final playback admission check.
+	checkingPaths := make([]string, len(unhealthyFiles))
+	for i, fh := range unhealthyFiles {
+		checkingPaths[i] = fh.FilePath
+	}
+	if err := hw.healthRepo.SetFilesCheckingBulk(ctx, checkingPaths); err != nil {
+		slog.ErrorContext(ctx, "Failed to bulk-set files to checking", "count", len(checkingPaths), "error", err)
+	}
 
 	paths := make([]string, len(unhealthyFiles))
 	for i, fh := range unhealthyFiles {

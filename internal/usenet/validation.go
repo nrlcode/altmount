@@ -32,12 +32,27 @@ type MissingSegment struct {
 	End   int64
 }
 
-// ValidationResult holds detailed validation results
+// ValidationTarget identifies one requested STAT position. Index is kept
+// independently of ID because duplicate message IDs still represent distinct
+// file positions.
+type ValidationTarget struct {
+	ID    string
+	Index int
+	Start int64
+	End   int64
+}
+
+// ValidationResult holds detailed validation results. TotalExpected is the
+// requested work while TotalChecked is the number of recognized results
+// actually received. IncompleteCount covers returned non-conclusive outcomes
+// plus requested work omitted when StatMany closes early.
 type ValidationResult struct {
+	TotalExpected   int
 	TotalChecked    int
+	IncompleteCount int
 	MissingCount    int
 	MissingIDs      []string
-	MissingSegments []MissingSegment // same 50-entry cap as MissingIDs
+	MissingSegments []MissingSegment // complete positional set; only MissingIDs is capped
 }
 
 // ValidateSegmentAvailabilityDetailed validates segments and returns detailed results
@@ -51,86 +66,41 @@ func ValidateSegmentAvailabilityDetailed(
 	progressTracker progress.ProgressTracker,
 	timeout time.Duration,
 ) (ValidationResult, error) {
-	result := ValidationResult{
-		MissingIDs: []string{},
-	}
-
 	if len(segments) == 0 {
-		return result, nil
-	}
-
-	usenetPool, err := poolManager.GetPool()
-	if err != nil {
-		return result, fmt.Errorf("cannot validate segments: usenet connection pool unavailable: %w", err)
-	}
-
-	if usenetPool == nil {
-		return result, fmt.Errorf("cannot validate segments: usenet connection pool is nil")
+		return ValidationResult{MissingIDs: []string{}}, nil
 	}
 
 	segmentsToValidate := selectSegmentsForValidation(segments, samplePercentage)
-	result.TotalChecked = len(segmentsToValidate)
-
-	if maxConnections <= 0 {
-		maxConnections = 1
-	}
-
-	ids := make([]string, len(segmentsToValidate))
-	for i, seg := range segmentsToValidate {
-		ids[i] = seg.Id
-	}
-
-	// Segment identity (by message ID) → original index, so misses reported
-	// by StatMany can be mapped back to their file-coordinate byte range via
-	// the prefix-sum offset table.
-	indexByID := make(map[string]int, len(segments))
+	indexBySegment := make(map[*metapb.SegmentData]int, len(segments))
 	fileOffsets := make([]int64, len(segments))
 	var pos int64
 	for i, seg := range segments {
-		indexByID[seg.Id] = i
+		indexBySegment[seg] = i
 		fileOffsets[i] = pos
 		pos += seg.EndOffset - seg.StartOffset + 1
 	}
 
-	statCtx, cancel := context.WithTimeout(ctx, pool.StatManyTimeout(len(ids), maxConnections, timeout))
-	defer cancel()
-
-	var validatedCount int
-	for r := range usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections}) {
-		if r.Err != nil {
-			slog.DebugContext(ctx, "missing segment",
-				"segment_id", r.MessageID,
-				"error", r.Err,
-			)
-			result.MissingCount++
-			if len(result.MissingIDs) < 50 { // cap stored entries to avoid huge metadata blobs
-				result.MissingIDs = append(result.MissingIDs, r.MessageID)
-				if idx, ok := indexByID[r.MessageID]; ok {
-					seg := segments[idx]
-					result.MissingSegments = append(result.MissingSegments, MissingSegment{
-						Index: idx,
-						ID:    r.MessageID,
-						Start: fileOffsets[idx],
-						End:   fileOffsets[idx] + (seg.EndOffset - seg.StartOffset),
-					})
-				}
-			}
-			continue
-		}
-
-		poolManager.IncArticlesDownloaded()
-		poolManager.UpdateDownloadProgress("", 100)
-
-		if progressTracker != nil {
-			validatedCount++
-			progressTracker.Update(validatedCount, result.TotalChecked)
-		}
+	targets := make([]ValidationTarget, 0, len(segmentsToValidate))
+	for _, seg := range segmentsToValidate {
+		idx := indexBySegment[seg]
+		targets = append(targets, ValidationTarget{
+			ID:    seg.Id,
+			Index: idx,
+			Start: fileOffsets[idx],
+			End:   fileOffsets[idx] + (seg.EndOffset - seg.StartOffset),
+		})
 	}
-	sort.Slice(result.MissingSegments, func(i, j int) bool {
-		return result.MissingSegments[i].Index < result.MissingSegments[j].Index
-	})
 
-	return result, nil
+	results, err := ValidateSegmentAvailabilityTargetsBatch(
+		ctx, [][]ValidationTarget{targets}, poolManager, maxConnections, timeout,
+	)
+	if len(results) == 0 {
+		return ValidationResult{MissingIDs: []string{}}, err
+	}
+	if progressTracker != nil {
+		progressTracker.Update(results[0].TotalChecked, results[0].TotalExpected)
+	}
+	return results[0], err
 }
 
 // ValidateSegmentAvailabilityBatch checks pre-sampled segment IDs for many files
@@ -147,18 +117,44 @@ func ValidateSegmentAvailabilityBatch(
 	maxConnections int,
 	timeout time.Duration,
 ) ([]ValidationResult, error) {
-	results := make([]ValidationResult, len(perFileIDs))
-	for i := range results {
-		results[i].MissingIDs = []string{}
-		results[i].TotalChecked = len(perFileIDs[i])
+	perFileTargets := make([][]ValidationTarget, len(perFileIDs))
+	for fileIdx, ids := range perFileIDs {
+		perFileTargets[fileIdx] = make([]ValidationTarget, len(ids))
+		for idx, id := range ids {
+			perFileTargets[fileIdx][idx] = ValidationTarget{ID: id, Index: idx}
+		}
 	}
+	return ValidateSegmentAvailabilityTargetsBatch(ctx, perFileTargets, poolManager, maxConnections, timeout)
+}
 
+type validationOwner struct {
+	fileIdx int
+	target  ValidationTarget
+}
+
+// ValidateSegmentAvailabilityTargetsBatch is the positional form of the batch
+// sweep. It preserves every hard-missing position for classification while
+// limiting MissingIDs to diagnostic examples.
+func ValidateSegmentAvailabilityTargetsBatch(
+	ctx context.Context,
+	perFileTargets [][]ValidationTarget,
+	poolManager pool.Manager,
+	maxConnections int,
+	timeout time.Duration,
+) ([]ValidationResult, error) {
+	results := make([]ValidationResult, len(perFileTargets))
 	total := 0
 	maxSamples := 0
-	for _, ids := range perFileIDs {
-		total += len(ids)
-		if len(ids) > maxSamples {
-			maxSamples = len(ids)
+	nonEmptyFiles := 0
+	for i, targets := range perFileTargets {
+		results[i].MissingIDs = []string{}
+		results[i].TotalExpected = len(targets)
+		total += len(targets)
+		if len(targets) > maxSamples {
+			maxSamples = len(targets)
+		}
+		if len(targets) > 0 {
+			nonEmptyFiles++
 		}
 	}
 	if total == 0 {
@@ -172,36 +168,25 @@ func ValidateSegmentAvailabilityBatch(
 	if usenetPool == nil {
 		return results, fmt.Errorf("cannot validate segments: usenet connection pool is nil")
 	}
-
 	if maxConnections <= 0 {
 		maxConnections = 1
 	}
 
-	// Round-robin interleave IDs across files. Results stream out of order from
-	// StatMany, so ownership is resolved by ID: owners maps each message-id to
-	// the file indexes that reference it (FIFO pop per result, so duplicate IDs
-	// shared across files each get their own attribution).
 	ids := make([]string, 0, total)
-	owners := make(map[string][]int, total)
+	owners := make(map[string][]validationOwner, total)
 	for round := 0; round < maxSamples; round++ {
-		for fileIdx, fileIDs := range perFileIDs {
-			if round < len(fileIDs) {
-				id := fileIDs[round]
-				ids = append(ids, id)
-				owners[id] = append(owners[id], fileIdx)
+		for fileIdx, targets := range perFileTargets {
+			if round >= len(targets) {
+				continue
 			}
+			target := targets[round]
+			ids = append(ids, target.ID)
+			owners[target.ID] = append(owners[target.ID], validationOwner{fileIdx: fileIdx, target: target})
 		}
 	}
 
 	statCtx, cancel := context.WithTimeout(ctx, pool.StatManyTimeout(len(ids), maxConnections, timeout))
 	defer cancel()
-
-	nonEmptyFiles := 0
-	for _, fileIDs := range perFileIDs {
-		if len(fileIDs) > 0 {
-			nonEmptyFiles++
-		}
-	}
 
 	sweepStart := time.Now()
 	slog.InfoContext(ctx, "Starting STAT sweep",
@@ -210,42 +195,95 @@ func ValidateSegmentAvailabilityBatch(
 		"concurrency", maxConnections,
 	)
 
+	var firstIncomplete error
+	unexpectedResults := 0
 	for r := range usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections}) {
-		owner := owners[r.MessageID]
-		if len(owner) == 0 {
-			// Unknown ID — should not happen, but never panic on pool output.
-			continue
-		}
-		fileIdx := owner[0]
-		owners[r.MessageID] = owner[1:]
-
-		if r.Err != nil {
-			slog.DebugContext(ctx, "missing segment",
-				"segment_id", r.MessageID,
-				"error", r.Err,
-			)
-			results[fileIdx].MissingCount++
-			if len(results[fileIdx].MissingIDs) < 50 { // cap stored IDs to avoid huge metadata blobs
-				results[fileIdx].MissingIDs = append(results[fileIdx].MissingIDs, r.MessageID)
+		ownerQueue := owners[r.MessageID]
+		if len(ownerQueue) == 0 {
+			unexpectedResults++
+			if firstIncomplete == nil {
+				firstIncomplete = fmt.Errorf("provider returned an unrequested STAT result")
 			}
 			continue
 		}
+		owner := ownerQueue[0]
+		owners[r.MessageID] = ownerQueue[1:]
+		result := &results[owner.fileIdx]
+		result.TotalChecked++
 
-		poolManager.IncArticlesDownloaded()
-		poolManager.UpdateDownloadProgress("", 100)
+		outcome := ClassifyNNTPOutcome(r.Err)
+		if r.Err == nil && r.Result == nil {
+			outcome = nntppool.OutcomeInconclusive
+		}
+		switch outcome {
+		case nntppool.OutcomeSuccess:
+			poolManager.IncArticlesDownloaded()
+			poolManager.UpdateDownloadProgress("", 100)
+		case nntppool.OutcomeHardArticleAbsence:
+			result.MissingCount++
+			if len(result.MissingIDs) < 50 {
+				result.MissingIDs = append(result.MissingIDs, owner.target.ID)
+			}
+			result.MissingSegments = append(result.MissingSegments, MissingSegment{
+				Index: owner.target.Index,
+				ID:    owner.target.ID,
+				Start: owner.target.Start,
+				End:   owner.target.End,
+			})
+		default:
+			result.IncompleteCount++
+			if firstIncomplete == nil {
+				if r.Err != nil {
+					firstIncomplete = r.Err
+				} else {
+					firstIncomplete = fmt.Errorf("provider returned an empty STAT result")
+				}
+			}
+		}
 	}
 
 	missingTotal := 0
-	for _, r := range results {
-		missingTotal += r.MissingCount
+	globalIncomplete := unexpectedResults > 0
+	incompleteTotal := unexpectedResults
+	conclusiveTotal := 0
+	checkedTotal := 0
+	for i := range results {
+		omitted := results[i].TotalExpected - results[i].TotalChecked
+		if omitted > 0 {
+			results[i].IncompleteCount += omitted
+		}
+		incompleteTotal += results[i].IncompleteCount
+		conclusiveTotal += results[i].TotalExpected - results[i].IncompleteCount
+		checkedTotal += results[i].TotalChecked
+		missingTotal += results[i].MissingCount
+		sort.Slice(results[i].MissingSegments, func(left, right int) bool {
+			return results[i].MissingSegments[left].Index < results[i].MissingSegments[right].Index
+		})
 	}
+	if statErr := statCtx.Err(); statErr != nil {
+		globalIncomplete = true
+		if firstIncomplete == nil {
+			firstIncomplete = statErr
+		}
+	}
+	if incompleteTotal > 0 && firstIncomplete == nil {
+		firstIncomplete = fmt.Errorf("StatMany omitted requested work")
+	}
+
 	slog.InfoContext(ctx, "STAT sweep completed",
 		"files", nonEmptyFiles,
-		"segments", len(ids),
+		"expected", total,
+		"checked", checkedTotal,
 		"missing", missingTotal,
+		"incomplete", incompleteTotal,
 		"duration", time.Since(sweepStart),
 	)
 
+	if firstIncomplete != nil {
+		return results, &IncompleteError{
+			Expected: total, Completed: conclusiveTotal, Cause: firstIncomplete, Global: globalIncomplete,
+		}
+	}
 	return results, nil
 }
 

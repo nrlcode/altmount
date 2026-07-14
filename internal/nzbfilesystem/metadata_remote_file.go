@@ -30,6 +30,7 @@ import (
 	"github.com/javi11/altmount/internal/usenet"
 	"github.com/javi11/altmount/internal/utils"
 	"github.com/javi11/altmount/pkg/rclonecli"
+	"github.com/javi11/nntppool/v4"
 	"github.com/spf13/afero"
 )
 
@@ -776,8 +777,8 @@ type fileHandleMeta struct {
 	// feature. Non-empty enables the continuous-timeline TS remux on reads;
 	// empty (every other file) bypasses it entirely.
 	ClipBoundaries []*metapb.ClipBoundary
-	// KnownHoles is the persisted hole map: segments confirmed missing on all
-	// providers, zero-filled during streaming without a fetch round-trip.
+	// KnownHoles is a legacy, unverified hole map retained only for migration.
+	// PR3 deliberately ignores it for classification and playback padding.
 	KnownHoles []*metapb.HoleRun
 }
 
@@ -855,9 +856,9 @@ type MetadataVirtualFile struct {
 	// segment. Lazily initialized; held under mvf.mu.
 	randomReadCache *lru.Cache[int, []byte]
 
-	// Hole padding state (see holes.go). holeAcc accumulates confirmed
-	// missing segments for this handle, seeded from meta.KnownHoles; holeMu
-	// guards it (hole hooks run on download goroutines).
+	// Hole padding state (see holes.go). holeAcc accumulates freshly confirmed
+	// missing segments for this handle only; holeMu guards it (hole hooks run
+	// on download goroutines).
 	holeMu       sync.Mutex
 	holeAcc      *holes.Accumulator
 	holeHooksVal *usenet.HoleHooks
@@ -2070,6 +2071,42 @@ func (mvf *MetadataVirtualFile) wrapWithEncryption(start, end int64) (io.ReadClo
 // of corrupt files) cannot fan out into one DB write + one rclone VFS refresh
 // per call. See issue #539 for the failure mode this guards against.
 func (mvf *MetadataVirtualFile) updateFileHealthOnError(dataCorruptionErr *usenet.DataCorruptionError, noRetry bool) {
+	// A transport-validated corrupt BODY is evidence about one bounded read, not
+	// proof that the file is absent or durably corrupt across the active provider
+	// set. Preserve the file and schedule an ordinary health recheck; never let
+	// this isolated outcome enter masking, padding, delete, safety-move, or Arr
+	// repair paths.
+	if dataCorruptionErr != nil && dataCorruptionErr.Outcome == nntppool.OutcomeCorruptBody {
+		ctx, cancel := context.WithTimeout(mvf.ctx, 5*time.Second)
+		defer cancel()
+
+		cfg := mvf.configGetter()
+		errorMsg := dataCorruptionErr.Error()
+		sourceNzbPath := &mvf.meta.SourceNzbPath
+		if *sourceNzbPath == "" {
+			sourceNzbPath = nil
+		}
+		details := (&database.HealthErrorDetails{
+			ErrorType:       "CorruptBodyUnconfirmed",
+			MissingArticles: 0,
+			TotalArticles:   len(mvf.meta.SegmentData),
+		}).Marshal()
+		nextCheck := time.Now().UTC().Add(cfg.GetCheckInterval())
+		if err := mvf.healthRepository.UpdateFileHealthScheduled(
+			ctx,
+			mvf.name,
+			database.HealthStatusPending,
+			&errorMsg,
+			sourceNzbPath,
+			details,
+			false,
+			nextCheck,
+		); err != nil {
+			slog.WarnContext(ctx, "Failed to schedule verification for unconfirmed corrupt body", "file", mvf.name, "error", err)
+		}
+		return
+	}
+
 	// Per-path debounce: short-circuit if this file already triggered a repair
 	// inside the debounce window. ShouldTrigger handles a nil coalescer
 	// (test harness) by returning true.

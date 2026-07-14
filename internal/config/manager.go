@@ -359,6 +359,7 @@ type HealthConfig struct {
 	ResolveRepairOnImport               *bool        `yaml:"resolve_repair_on_import" mapstructure:"resolve_repair_on_import" json:"resolve_repair_on_import,omitempty"`
 	VerifyData                          *bool        `yaml:"verify_data" mapstructure:"verify_data" json:"verify_data,omitempty"`
 	CheckAllSegments                    *bool        `yaml:"check_all_segments" mapstructure:"check_all_segments" json:"check_all_segments,omitempty"`
+	PauseDuringPlayback                 *bool        `yaml:"pause_during_playback" mapstructure:"pause_during_playback" json:"pause_during_playback,omitempty"`
 	ReadTimeoutSeconds                  int          `yaml:"read_timeout_seconds" mapstructure:"read_timeout_seconds" json:"read_timeout_seconds,omitempty"`
 	AcceptableMissingSegmentsPercentage float64      `yaml:"acceptable_missing_segments_percentage" mapstructure:"acceptable_missing_segments_percentage" json:"acceptable_missing_segments_percentage"`
 	Repair                              RepairConfig `yaml:"repair" mapstructure:"repair" json:"repair"`
@@ -1035,6 +1036,7 @@ func (p *ProviderConfig) ToNNTPProvider() nntppool.Provider {
 	}
 
 	return nntppool.Provider{
+		ID:                p.ID,
 		Host:              host,
 		TLSConfig:         tlsCfg,
 		Auth:              nntppool.Auth{Username: p.Username, Password: p.Password},
@@ -1459,6 +1461,7 @@ func DefaultConfig(configDir ...string) *Config {
 	failureMaskingEnabled := false
 	repairEnabled := true
 	repairExponentialBackoff := true
+	pauseHealthDuringPlayback := true
 
 	// Set paths based on whether we're running in Docker or have a specific config directory
 	var dbPath, metadataPath, logPath, rclonePath, cachePath, backupPath string
@@ -1611,7 +1614,8 @@ func DefaultConfig(configDir ...string) *Config {
 			SegmentSamplePercentage:             5,                      // Default: 5% segment sampling
 			LibrarySyncIntervalMinutes:          360,                    // Default: sync every 6 hours
 			ResolveRepairOnImport:               &resolveRepairOnImport, // Enabled by default
-			AcceptableMissingSegmentsPercentage: 0,                      // Default: no missing segments allowed
+			PauseDuringPlayback:                 &pauseHealthDuringPlayback,
+			AcceptableMissingSegmentsPercentage: 0, // Default: no missing segments allowed
 			Repair: RepairConfig{
 				Enabled:            &repairEnabled,
 				IntervalMinutes:    60,

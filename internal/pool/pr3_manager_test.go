@@ -28,7 +28,10 @@ func responsiveStatFactory(t *testing.T, calls *atomic.Int32) nntppool.ConnFacto
 				}
 				if strings.HasPrefix(line, "STAT ") {
 					calls.Add(1)
-					_, _ = server.Write([]byte("223 1 <synthetic@test.invalid>\r\n"))
+					// Let the client register the pipelined request before the
+					// in-memory server produces its response.
+					time.Sleep(time.Millisecond)
+					_, _ = server.Write([]byte("223 1 <synthetic@test.invalid> article exists\r\n"))
 				}
 			}
 		}()
@@ -61,12 +64,25 @@ func TestPR3ManagerSelectsFIFOProviders(t *testing.T) {
 	client, err := mgr.GetPool()
 	require.NoError(t, err)
 
+	// Let each provider establish its one cold connection. Capacity-aware FIFO
+	// may use the second primary while the preferred primary's only connection
+	// slot is being established; once both are hot, configured order must win.
+	for range 2 {
+		statCtx, statCancel := context.WithTimeout(ctx, time.Second)
+		_, statErr := client.Stat(statCtx, "synthetic@test.invalid")
+		statCancel()
+		require.NoError(t, statErr)
+	}
+	firstCalls.Store(0)
+	secondCalls.Store(0)
+
 	for range 6 {
 		statCtx, statCancel := context.WithTimeout(ctx, time.Second)
 		result, statErr := client.Stat(statCtx, "synthetic@test.invalid")
 		statCancel()
 		require.NoError(t, statErr)
-		require.Equal(t, "primary-a", result.ProviderID)
+		require.Equal(t, "primary-a", result.ProviderID,
+			"calls: primary-a=%d primary-b=%d attempts=%+v stats=%+v", firstCalls.Load(), secondCalls.Load(), result.Attempts, client.Stats().Providers)
 	}
 	require.Equal(t, int32(6), firstCalls.Load())
 	require.Zero(t, secondCalls.Load())

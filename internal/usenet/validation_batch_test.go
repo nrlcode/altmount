@@ -169,6 +169,26 @@ func TestValidateSegmentAvailabilityBatch_OmittedResultIsIncomplete(t *testing.T
 		"TotalChecked must count results received, not work requested")
 }
 
+func TestPR3ValidateSegmentAvailabilityBatchUnexpectedOutputIsGlobal(t *testing.T) {
+	client := &scriptedStatClient{
+		Client: fakepool.New(),
+		results: []nntppool.StatManyResult{
+			{MessageID: "requested@test", Result: &nntppool.StatResult{MessageID: "requested@test"}},
+			{MessageID: "unexpected@test", Result: &nntppool.StatResult{MessageID: "unexpected@test"}},
+		},
+	}
+	mgr := &validationTestPoolManager{client: client}
+
+	_, err := ValidateSegmentAvailabilityBatch(
+		context.Background(), [][]string{{"requested@test"}}, mgr, 1, time.Second,
+	)
+	require.Error(t, err)
+	var incomplete *IncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	assert.True(t, incomplete.Global,
+		"unrequested transport output must invalidate the shared sweep")
+}
+
 func TestPR3ValidateSegmentAvailabilityBatchUsesTypedOutcomes(t *testing.T) {
 	tests := []struct {
 		name        string

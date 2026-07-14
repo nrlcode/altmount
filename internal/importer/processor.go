@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/javi11/nntppool/v4"
 	"github.com/javi11/nzbparser"
 
 	"github.com/javi11/altmount/internal/config"
@@ -31,6 +30,7 @@ import (
 	"github.com/javi11/altmount/internal/nzbfile"
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/progress"
+	"github.com/javi11/altmount/internal/usenet"
 )
 
 const (
@@ -282,9 +282,10 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 		if result.Broken && !isPar2 {
 			// Tolerant damage policy: a standalone video file with SMALL
 			// confirmed damage imports as degraded rather than being dropped.
-			// Streaming zero-fills the gaps and the immediate post-import
-			// health check discovers + persists the holes and flags it
-			// degraded. Archive-set members (GroupKey != "") stay binary — a
+			// Playback may zero-fill only after a fresh hard-absence result, and
+			// a subsequent health check classifies current positional damage.
+			// No legacy .meta hole authority is created. Archive-set members
+			// (GroupKey != "") stay binary — a
 			// holed volume corrupts extraction and cannot be padded.
 			if tolerant && fastFailFiles[i].GroupKey == "" && holes.EligibleFile(f.Filename) {
 				verdict := holes.ClassifyProjected(
@@ -445,7 +446,7 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 		var fastFailErr error
 		brokenIdx, missingIDs, fastFailErr = proc.preParseFastFail(ctx, n, cfg, queueID)
 		if fastFailErr != nil {
-			return "", nil, NewNonRetryableError("fast-fail segment check failed", fastFailErr)
+			return "", nil, fmt.Errorf("fast-fail segment check incomplete: %w", fastFailErr)
 		}
 
 		parseTracker := progress.NewTracker(proc.broadcaster, queueID, 2, 10)
@@ -454,6 +455,9 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			KnownMissingSegmentIDs: missingIDs,
 		})
 		if err != nil {
+			if usenet.IsIncomplete(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return "", nil, fmt.Errorf("NZB network parsing incomplete: %w", err)
+			}
 			return "", nil, NewNonRetryableError("failed to parse NZB file", err)
 		}
 
@@ -677,7 +681,7 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 	// Update progress: complete
 	if err == nil {
 		proc.updateProgress(queueID, 100)
-	} else if errors.Is(err, nntppool.ErrArticleNotFound) {
+	} else if usenet.IsHardArticleAbsence(err) {
 		return result, writtenPaths, ErrArticlesNotFound
 	}
 

@@ -16,6 +16,7 @@ import (
 	"github.com/javi11/altmount/internal/metadata"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/pool"
+	"github.com/javi11/altmount/internal/testsupport/fakepool"
 	nntppool "github.com/javi11/nntppool/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -55,6 +56,16 @@ func (m *mockPoolManager) SetImportConnCapacity(_ int)                 {}
 func (m *mockPoolManager) ImportConnCapacity() int                     { return 0 }
 func (m *mockPoolManager) SetStreamSource(_ pool.StreamActivitySource) {}
 func (m *mockPoolManager) NotifyStreamChange()                         {}
+
+// hardMissingPoolManager is the destructive-repair fixture: unlike a pool
+// outage, it supplies conclusive hard-absence evidence for every STAT.
+type hardMissingPoolManager struct {
+	mockPoolManager
+	client *fakepool.Client
+}
+
+func (m *hardMissingPoolManager) GetPool() (pool.NntpClient, error) { return m.client, nil }
+func (m *hardMissingPoolManager) HasPool() bool                     { return true }
 
 // mockARRsService captures TriggerFileRescan calls and returns a configurable error.
 type mockARRsService struct {
@@ -161,11 +172,13 @@ func newRepairTestEnv(t *testing.T, tempDir string, arrsErr error, configure ...
 
 	mockARRs := &mockARRsService{returnErr: arrsErr}
 	mockImporter := &mockImportService{}
+	missingClient := fakepool.New()
+	missingClient.SetDefaultBehavior(fakepool.SegmentBehavior{Err: nntppool.ErrArticleNotFound})
 
 	healthChecker := NewHealthChecker(
 		healthRepo,
 		metadataService,
-		&mockPoolManager{},
+		&hardMissingPoolManager{client: missingClient},
 		configManager.GetConfig,
 		&MockRcloneClient{},
 	)
@@ -191,7 +204,8 @@ func newRepairTestEnv(t *testing.T, tempDir string, arrsErr error, configure ...
 }
 
 // validSegmentMeta creates a FileMetadata with one segment that covers the full fileSize,
-// so CheckMetadataIntegrity passes. Pool failure then causes EventTypeCheckFailed.
+// so CheckMetadataIntegrity passes. The test pool then returns conclusive hard
+// absence, allowing repair/delete behavior to be exercised legitimately.
 func validSegmentMeta(ms *metadata.MetadataService, fileSize int64) *metapb.FileMetadata {
 	seg := &metapb.SegmentData{
 		Id:          "test-article-001@test.example.com",

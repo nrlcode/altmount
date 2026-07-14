@@ -29,6 +29,7 @@ import (
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/progress"
 	"github.com/javi11/altmount/internal/slogutil"
+	"github.com/javi11/altmount/internal/usenet"
 	"github.com/javi11/nntppool/v4"
 	"github.com/javi11/nzbparser"
 	concpool "github.com/sourcegraph/conc/pool"
@@ -388,7 +389,7 @@ func (p *Parser) parseFile(ctx context.Context, meta map[string]string, nzbFilen
 
 		err := p.normalizeSegmentSizesWithYenc(ctx, info.NzbFile.Segments, cachedFirstSegment, nzbStandardPartSize, notFoundIDs)
 		if err != nil {
-			if stderrors.Is(err, nntppool.ErrArticleNotFound) {
+			if usenet.IsHardArticleAbsence(err) {
 				// A segment required to determine the real (decoded) sizes is missing
 				// from every provider. Importing the file with the NZB's un-normalized
 				// (yEnc-encoded) byte counts would compute wrong segment offsets and
@@ -396,6 +397,9 @@ func (p *Parser) parseFile(ctx context.Context, meta map[string]string, nzbFilen
 				// caller's aggregation loop logs and continues, so the rest of the
 				// release still imports normally.
 				return nil, fmt.Errorf("failed to normalize segment sizes for %q: %w", info.Filename, err)
+			}
+			if usenet.IsIncomplete(err) {
+				return nil, err
 			}
 			// Any other normalization failure (e.g. a present but non-yEnc article that
 			// yields no part size) is non-fatal: the NZB-declared segment sizes remain
@@ -691,13 +695,19 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 	cp, err := p.poolManager.GetPool()
 	if err != nil {
 		p.log.DebugContext(context.Background(), "Failed to get connection pool for first segment fetching", "error", err)
-		return cache, notFoundIDs, nil
+		return nil, notFoundIDs, &usenet.IncompleteError{Expected: len(files), Cause: err}
+	}
+	if cp == nil {
+		return nil, notFoundIDs, &usenet.IncompleteError{
+			Expected: len(files), Cause: fmt.Errorf("usenet connection pool is nil"),
+		}
 	}
 
 	// Use conc pool for parallel fetching — I/O-bound, so use more than NumCPU
 	type fetchResult struct {
 		segmentID  string
 		isNotFound bool // true when 430 Not Found (permanent)
+		incomplete bool // true for every non-conclusive transport outcome
 		data       *FirstSegmentData
 		err        error
 	}
@@ -777,7 +787,7 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 			// per-attempt timeout starts, so queue wait never burns the deadline.
 			releaseConn, err := p.poolManager.AcquireImportConnection(ctx)
 			if err != nil {
-				return fetchResult{}, err
+				return fetchResult{incomplete: true, err: err}, nil
 			}
 			defer releaseConn()
 
@@ -788,14 +798,15 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 			// Get body for the first segment (v4 returns decoded bytes + YEnc metadata)
 			result, err := cp.Body(c, firstSegment.ID)
 			if err != nil {
-				p.log.DebugContext(ctx, "missing segment",
-					"segment_id", firstSegment.ID,
+				notFound := usenet.IsHardArticleAbsence(err)
+				p.log.DebugContext(ctx, "first segment fetch failed",
+					"outcome", usenet.ClassifyNNTPOutcome(err),
 					"error", err,
 				)
-				notFound := stderrors.Is(err, nntppool.ErrArticleNotFound)
 				return fetchResult{
 					segmentID:  firstSegment.ID,
 					isNotFound: notFound,
+					incomplete: !notFound,
 					data: &FirstSegmentData{
 						File:                fileToFetch,
 						MissingFirstSegment: true,
@@ -838,11 +849,24 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 	// Wait for all fetches to complete
 	results, err := concPool.Wait()
 	if err != nil {
-		if stderrors.Is(err, context.Canceled) {
-			return nil, notFoundIDs, errors.NewNonRetryableError("fetching first segments canceled", err)
-		}
+		return nil, notFoundIDs, &usenet.IncompleteError{Expected: len(files), Cause: err}
+	}
 
-		return nil, notFoundIDs, errors.NewNonRetryableError("failed to fetch first segments", err)
+	completed := 0
+	var incompleteCause error
+	for _, result := range results {
+		if result.incomplete {
+			if incompleteCause == nil {
+				incompleteCause = result.err
+			}
+			continue
+		}
+		completed++
+	}
+	if incompleteCause != nil {
+		return nil, notFoundIDs, &usenet.IncompleteError{
+			Expected: len(results), Completed: completed, Cause: incompleteCause,
+		}
 	}
 
 	// Build cache from all fetches (successful and failed)
@@ -1107,48 +1131,59 @@ func (p *Parser) fetchYencHeaders(ctx context.Context, segment nzbparser.NzbSegm
 
 	cp, err := p.poolManager.GetPool()
 	if err != nil {
-		return nntppool.YEncMeta{}, errors.NewNonRetryableError("no connection pool available", err)
+		return nntppool.YEncMeta{}, &usenet.IncompleteError{Expected: 1, Cause: err}
+	}
+	if cp == nil {
+		return nntppool.YEncMeta{}, &usenet.IncompleteError{Expected: 1, Cause: fmt.Errorf("usenet connection pool is nil")}
 	}
 
-	// onMeta fires after =ybegin/=ypart parsing (~first 2 lines),
-	// while the body continues draining to io.Discard in the background.
+	// onMeta fires after =ybegin/=ypart parsing (~first 2 lines), while the
+	// body continues draining to io.Discard. Keep it only as provisional data:
+	// nothing may consume it until BodyAsync reports terminal validation success.
 	metaCh := make(chan nntppool.YEncMeta, 1)
 	resultCh := cp.BodyAsync(ctx, segment.ID, io.Discard, func(meta nntppool.YEncMeta) {
-		metaCh <- meta
+		select {
+		case metaCh <- meta:
+		default:
+		}
 	})
 
-	// Wait for either: headers via onMeta (fast), full result (error or no yEnc), or context cancel.
+	// Wait for the complete result even when onMeta has already fired. The
+	// corrected transport validates framing, decoded size, and CRC only at the
+	// terminal result boundary.
 	select {
-	case headers := <-metaCh:
-		if headers.PartSize <= 0 {
-			return nntppool.YEncMeta{}, errors.NewNonRetryableError("invalid part size from yenc header", nil)
-		}
-
-		if p.poolManager != nil {
-			p.poolManager.IncArticlesDownloaded()
-			p.poolManager.UpdateDownloadProgress("", int64(headers.PartSize))
-		}
-
-		return headers, nil
 	case result := <-resultCh:
-		// BodyAsync completed before onMeta fired — either error or non-yEnc article
 		if result.Err != nil {
-			return nntppool.YEncMeta{}, errors.NewNonRetryableError("failed to get body", result.Err)
+			if usenet.IsHardArticleAbsence(result.Err) {
+				return nntppool.YEncMeta{}, fmt.Errorf("failed to get body: %w", result.Err)
+			}
+			return nntppool.YEncMeta{}, &usenet.IncompleteError{Expected: 1, Cause: result.Err}
+		}
+		if result.Body == nil {
+			return nntppool.YEncMeta{}, &usenet.IncompleteError{
+				Expected: 1, Cause: fmt.Errorf("BODY completed without a result"),
+			}
 		}
 
-		if p.poolManager != nil {
-			p.poolManager.IncArticlesDownloaded()
-			p.poolManager.UpdateDownloadProgress("", int64(result.Body.YEnc.PartSize))
-		}
-
-		// onMeta didn't fire but body completed — use headers from result
 		headers := result.Body.YEnc
 		if headers.PartSize <= 0 {
+			select {
+			case headers = <-metaCh:
+			default:
+			}
+		}
+		if headers.PartSize <= 0 {
 			return nntppool.YEncMeta{}, errors.NewNonRetryableError("invalid part size from yenc header", nil)
 		}
+
+		if p.poolManager != nil {
+			p.poolManager.IncArticlesDownloaded()
+			p.poolManager.UpdateDownloadProgress("", int64(result.Body.BytesDecoded))
+		}
+
 		return headers, nil
 	case <-ctx.Done():
-		return nntppool.YEncMeta{}, errors.NewNonRetryableError("context canceled", ctx.Err())
+		return nntppool.YEncMeta{}, &usenet.IncompleteError{Expected: 1, Cause: ctx.Err()}
 	}
 }
 

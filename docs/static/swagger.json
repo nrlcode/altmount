@@ -6575,6 +6575,9 @@
                 "max_connections_for_health_checks": {
                     "type": "integer"
                 },
+                "pause_during_playback": {
+                    "type": "boolean"
+                },
                 "repair": {
                     "$ref": "#/definitions/config.RepairConfig"
                 },

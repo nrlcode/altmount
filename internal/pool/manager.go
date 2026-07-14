@@ -239,7 +239,13 @@ func (m *manager) SetProviders(providers []nntppool.Provider) error {
 
 	// Create new pool with providers
 	m.logger.InfoContext(m.ctx, "Creating NNTP connection pool", "provider_count", len(providers))
-	pool, err := nntppool.NewClient(m.ctx, providers)
+	pool, err := nntppool.NewClient(
+		m.ctx,
+		providers,
+		nntppool.WithDispatchStrategy(nntppool.DispatchFIFO),
+		nntppool.WithStatProbe(false),
+		nntppool.WithProviderCircuitBreaker(true),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create NNTP connection pool: %w", err)
 	}
@@ -398,7 +404,13 @@ func (m *manager) AddProvider(provider nntppool.Provider) error {
 	if m.pool == nil {
 		// No pool yet — create one with this single provider
 		m.logger.InfoContext(m.ctx, "Creating NNTP connection pool for first provider", "provider", provider.Host)
-		pool, err := nntppool.NewClient(m.ctx, []nntppool.Provider{provider}, nntppool.WithDispatchStrategy(nntppool.DispatchRoundRobin))
+		pool, err := nntppool.NewClient(
+			m.ctx,
+			[]nntppool.Provider{provider},
+			nntppool.WithDispatchStrategy(nntppool.DispatchFIFO),
+			nntppool.WithStatProbe(false),
+			nntppool.WithProviderCircuitBreaker(true),
+		)
 		if err != nil {
 			return fmt.Errorf("failed to create NNTP connection pool: %w", err)
 		}

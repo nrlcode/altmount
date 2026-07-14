@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,8 +85,11 @@ func WithImportProfile(budget ConnBudget) ReaderOption {
 
 type DataCorruptionError struct {
 	UnderlyingErr error
-	BytesRead     int64
-	NoRetry       bool
+	// Outcome is the transport-owned classification when the error originated
+	// at the NNTP boundary. Zero means local file/metadata corruption.
+	Outcome   nntppool.OutcomeKind
+	BytesRead int64
+	NoRetry   bool
 	// FileOffset is the absolute file-coordinate position where the failure
 	// surfaced (-1 when unknown), enabling playback-impact classification.
 	FileOffset int64
@@ -291,12 +293,14 @@ func (b *UsenetReader) Read(p []byte) (int, error) {
 			if totalRead > 0 {
 				return 0, &DataCorruptionError{
 					UnderlyingErr: err,
+					Outcome:       nntppool.OutcomeHardArticleAbsence,
 					BytesRead:     totalRead,
 					FileOffset:    rg.start + totalRead,
 				}
 			} else {
 				return 0, &DataCorruptionError{
 					UnderlyingErr: err,
+					Outcome:       nntppool.OutcomeHardArticleAbsence,
 					BytesRead:     0,
 					FileOffset:    rg.start,
 				}
@@ -341,6 +345,7 @@ func (b *UsenetReader) Read(p []byte) (int, error) {
 						if totalRead > 0 {
 							return n, &DataCorruptionError{
 								UnderlyingErr: err,
+								Outcome:       nntppool.OutcomeHardArticleAbsence,
 								BytesRead:     totalRead,
 								FileOffset:    rg.start + totalRead,
 							}
@@ -352,6 +357,7 @@ func (b *UsenetReader) Read(p []byte) (int, error) {
 				if b.isArticleNotFoundError(err) {
 					return n, &DataCorruptionError{
 						UnderlyingErr: err,
+						Outcome:       nntppool.OutcomeHardArticleAbsence,
 						BytesRead:     totalRead,
 						FileOffset:    rg.start + totalRead,
 					}
@@ -366,14 +372,14 @@ func (b *UsenetReader) Read(p []byte) (int, error) {
 
 // isArticleNotFoundError checks if the error indicates articles were not found in providers
 func (b *UsenetReader) isArticleNotFoundError(err error) bool {
-	return errors.Is(err, nntppool.ErrArticleNotFound)
+	return IsHardArticleAbsence(err)
 }
 
 // IsArticleNotFound reports whether err stems from an article missing on all
 // providers (permanent, never retried) — the only failure the hole model
 // treats as a hole.
 func IsArticleNotFound(err error) bool {
-	return errors.Is(err, nntppool.ErrArticleNotFound)
+	return IsHardArticleAbsence(err)
 }
 
 func (b *UsenetReader) GetBufferedOffset() int64 {
@@ -473,9 +479,10 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 					bytesWritten = int64(result.BytesDecoded)
 				}
 
-				if strings.Contains(err.Error(), "data corruption detected") {
+				if IsCorruptBody(err) {
 					return &DataCorruptionError{
 						UnderlyingErr: err,
+						Outcome:       nntppool.OutcomeCorruptBody,
 						BytesRead:     bytesWritten,
 						FileOffset:    -1,
 						SegmentID:     seg.Id,
@@ -509,7 +516,7 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 			return retry.CombineDelay(retry.BackOffDelay, retry.RandomDelay)(n, err, config)
 		}),
 		retry.RetryIf(func(err error) bool {
-			if errors.Is(err, nntppool.ErrArticleNotFound) {
+			if IsHardArticleAbsence(err) {
 				return false // permanent failure — do not retry
 			}
 			return true
@@ -532,7 +539,7 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 		_ = b.segmentStore.Put(seg.Id, resultBytes)
 	}
 
-	if errors.Is(err, nntppool.ErrArticleNotFound) {
+	if IsHardArticleAbsence(err) {
 		b.log.DebugContext(ctx, "missing segment",
 			"segment_id", seg.Id,
 		)
@@ -605,8 +612,9 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 
 			taskCtx := slogutil.With(ctx, "segment_id", s.Id, "segment_idx", segIdx)
 
-			// Replay pre-pad: a segment already known missing (persisted hole
-			// map) zero-fills immediately, with no fetch round-trip.
+			// Optional pre-pad hook for externally verified durable evidence.
+			// PR3 AltMount deliberately supplies no hook while legacy .meta
+			// holes remain quarantined.
 			if b.holeHooks != nil && b.holeHooks.KnownHoles != nil && b.holeHooks.KnownHoles(s.loaderIdx) {
 				b.log.DebugContext(taskCtx, "zero-filling known-missing segment without fetch")
 				s.SetData(make([]byte, s.End+1))
@@ -619,7 +627,7 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 				// A confirmed-missing article may be zero-filled instead of
 				// failing the stream, when the owner's hole hook approves.
 				if b.holeHooks != nil && b.holeHooks.OnHole != nil &&
-					errors.Is(err, nntppool.ErrArticleNotFound) &&
+					IsHardArticleAbsence(err) &&
 					b.holeHooks.OnHole(s.loaderIdx, s.Id) == holes.DecisionPad {
 					b.log.InfoContext(taskCtx, "zero-filling missing segment",
 						"file_segment_index", s.loaderIdx)

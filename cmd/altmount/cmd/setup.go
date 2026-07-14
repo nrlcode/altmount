@@ -380,6 +380,7 @@ func startHealthWorker(
 	arrsService *arrs.Service,
 	importerService importer.ImportService,
 	broadcaster *progress.ProgressBroadcaster,
+	playbackSource health.PlaybackActivitySource,
 ) (*health.HealthWorker, *health.LibrarySyncWorker, error) {
 	// Create metadata service for health worker
 	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
@@ -402,6 +403,7 @@ func startHealthWorker(
 		configManager.GetConfigGetter(),
 		broadcaster,
 	)
+	healthWorker.SetPlaybackActivitySource(playbackSource)
 
 	// Create library sync worker (always create, but only start if enabled)
 	librarySyncWorker := health.NewLibrarySyncWorker(

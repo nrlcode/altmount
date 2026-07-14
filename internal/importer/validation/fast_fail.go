@@ -72,15 +72,12 @@ type FastFailFile struct {
 // It flattens all candidate segments across the release and Stats a single
 // sample (usenet.SelectSegmentsForValidation: first 3 + last 2 + random middle,
 // min 5 / max 55 for the whole release), cancelling the remaining Stats on the
-// first miss.
+// first conclusive hard absence.
 //
 // Returns (missing, err):
-//   - err is reserved for infrastructure failures (pool unavailable/nil).
-//   - missing reports whether any sampled segment was unreachable. A 430 / Stat
-//     failure / timeout yields (true, nil) — not an error — so the caller can
-//     escalate to the per-file FastFailCheckFiles sweep to map exactly which
-//     files are broken. A clean release returns (false, nil) and the caller
-//     proceeds straight to parsing, paying only this sample's worth of Stats.
+//   - missing reports whether any sampled segment was conclusively absent.
+//   - err reports infrastructure, cancellation, temporary, corrupt, unknown,
+//     or omitted work. Those outcomes are retryable and never become absence.
 func FastFailReleaseProbe(
 	ctx context.Context,
 	files []FastFailFile,
@@ -127,17 +124,50 @@ func FastFailReleaseProbe(
 		ids[i] = seg.Id
 	}
 
-	// Stat the sample via a single bulk sweep, cancelling the rest on the
-	// first miss. Infrastructure failures are handled above, so any error
-	// streamed back here indicates an unreachable segment.
+	// Stat the sample via a single bulk sweep, cancelling the rest on the first
+	// hard absence. Result count and IDs are verified because StatMany may omit
+	// undispatched work when its context completes.
 	statCtx, cancel := context.WithTimeout(ctx, pool.StatManyTimeout(len(ids), maxConnections, timeout))
 	defer cancel()
 
+	owners := make(map[string]int, len(ids))
+	for _, id := range ids {
+		owners[id]++
+	}
+	checked := 0
 	for r := range usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections}) {
-		if r.Err != nil {
+		if owners[r.MessageID] == 0 {
+			return false, &usenet.IncompleteError{
+				Expected: len(ids), Completed: checked,
+				Cause: fmt.Errorf("provider returned an unrequested STAT result"),
+			}
+		}
+		owners[r.MessageID]--
+		outcome := usenet.ClassifyNNTPOutcome(r.Err)
+		if r.Err == nil && r.Result == nil {
+			outcome = nntppool.OutcomeInconclusive
+		}
+		switch outcome {
+		case nntppool.OutcomeHardArticleAbsence:
 			cancel()
 			return true, nil
+		case nntppool.OutcomeSuccess:
+			checked++
+		default:
+			cancel()
+			cause := r.Err
+			if cause == nil {
+				cause = fmt.Errorf("provider returned an empty STAT result")
+			}
+			return false, &usenet.IncompleteError{Expected: len(ids), Completed: checked, Cause: cause}
 		}
+	}
+	if checked != len(ids) || statCtx.Err() != nil {
+		cause := statCtx.Err()
+		if cause == nil {
+			cause = fmt.Errorf("StatMany omitted requested work")
+		}
+		return false, &usenet.IncompleteError{Expected: len(ids), Completed: checked, Cause: cause}
 	}
 	return false, nil
 }
@@ -159,9 +189,10 @@ type FastFailFileResult struct {
 // nil Segments for files that should be skipped (e.g. PAR2/sidecars) to keep
 // index alignment while avoiding wasted Stat round-trips.
 // Returns one result per input file (index-aligned). Files with no segments
-// are skipped. Infrastructure failures (pool unavailable) are returned as an
-// error; per-segment Stat failures mark the owning file Broken. progressTracker
-// may be nil; when set it reports completed Stats as work progresses.
+// are skipped. Infrastructure and non-conclusive results are returned as a
+// retryable incomplete error; only hard absence marks the owning file Broken.
+// progressTracker may be nil; when set it reports completed Stats as work
+// progresses.
 func FastFailCheckFiles(
 	ctx context.Context,
 	files []FastFailFile,
@@ -280,21 +311,67 @@ func FastFailCheckFiles(
 		}
 
 		statCtx, cancel := context.WithTimeout(ctx, pool.StatManyTimeout(len(ids), maxConnections, timeout))
-		errByID := make(map[string]error, len(ids))
-		for r := range usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections}) {
-			errByID[r.MessageID] = r.Err
+		owners := make(map[string][]int, len(ids))
+		for idx, job := range toCheck {
+			owners[job.segID] = append(owners[job.segID], idx)
 		}
-		cancel()
+		seen := make([]bool, len(toCheck))
+		var incompleteErr error
+		conclusive := 0
+		for r := range usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections}) {
+			queue := owners[r.MessageID]
+			if len(queue) == 0 {
+				if incompleteErr == nil {
+					incompleteErr = fmt.Errorf("provider returned an unrequested STAT result")
+				}
+				continue
+			}
+			jobIdx := queue[0]
+			owners[r.MessageID] = queue[1:]
+			seen[jobIdx] = true
 
-		for _, job := range toCheck {
-			if statErr := errByID[job.segID]; statErr != nil {
+			job := toCheck[jobIdx]
+			outcome := usenet.ClassifyNNTPOutcome(r.Err)
+			if r.Err == nil && r.Result == nil {
+				outcome = nntppool.OutcomeInconclusive
+			}
+			switch outcome {
+			case nntppool.OutcomeSuccess:
+				conclusive++
+			case nntppool.OutcomeHardArticleAbsence:
+				conclusive++
 				results[job.fileIdx].Broken = true
 				results[job.fileIdx].MissingSegmentIDs = append(results[job.fileIdx].MissingSegmentIDs, job.segID)
 				if job.groupKey != "" {
 					brokenGroups[job.groupKey] = struct{}{}
 				}
+			default:
+				if incompleteErr == nil {
+					incompleteErr = r.Err
+					if incompleteErr == nil {
+						incompleteErr = fmt.Errorf("provider returned an empty STAT result")
+					}
+				}
 			}
+		}
+		statErr := statCtx.Err()
+		cancel()
+
+		for range toCheck {
 			advance()
+		}
+		for _, wasSeen := range seen {
+			if !wasSeen && incompleteErr == nil {
+				incompleteErr = fmt.Errorf("StatMany omitted requested work")
+			}
+		}
+		if statErr != nil && incompleteErr == nil {
+			incompleteErr = statErr
+		}
+		if incompleteErr != nil {
+			return results, &usenet.IncompleteError{
+				Expected: len(toCheck), Completed: conclusive, Cause: incompleteErr,
+			}
 		}
 	}
 

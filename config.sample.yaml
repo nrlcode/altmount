@@ -168,6 +168,7 @@ health:
   check_interval_seconds: 5 # Health check interval in seconds (default: 5)
   max_connections_for_health_checks: 100 # Max concurrent STAT checks within a single sweep (default: 100)
   check_batch_size: 50 # Number of due files fetched and swept together per health-check cycle (default: 50)
+  pause_during_playback: true # Temporary PR3 safeguard: do not admit new ordinary health sweeps while playback is active (PR6 replaces this with adaptive admission)
   segment_sample_percentage: 5 # Percentage of segments to sample for health validation (1-100, default: 5)
   acceptable_missing_segments_percentage: 0 # Percentage of missing segments allowed before a file is marked as corrupted (0-100, default: 0)
   library_sync_interval_minutes: 360 # Library synchronization interval in minutes (default: 360 = 6 hours)

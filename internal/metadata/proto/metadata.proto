@@ -66,10 +66,9 @@ message ClipBoundary {
   int64 delta_90k = 2;
 }
 
-// HoleRun is a run of consecutive segments confirmed missing on every
-// provider (a "hole"). Persisted so streaming can zero-fill known holes
-// without a wasted network round-trip (replay pre-pad) and so health checks
-// accumulate damage across sweeps. Empty for undamaged files (zero overhead).
+// HoleRun is the legacy pre-PR3 persisted hole representation. Existing rows
+// are unverified and quarantined: they must not authorize padding or health
+// classification until the planned migration establishes durable evidence.
 message HoleRun {
   int64 start_segment = 1;  // first missing segment index
   int64 count = 2;          // number of consecutive missing segments
@@ -115,7 +114,7 @@ message FileMetadata {
   string store_ref = 18;               // id/path of the shared NzbStore
   repeated SegmentRef segment_refs = 19; // v3 replacement for segment_data
   repeated SegmentRun segment_runs = 20; // compact run encoding; preferred over segment_refs when present
-  repeated HoleRun known_holes = 21;    // segments confirmed missing on all providers (zero-filled during playback)
+  repeated HoleRun known_holes = 21;    // legacy unverified holes; quarantined pending migration
 }
 
 // --- v3 shared-store types ---
@@ -157,4 +156,3 @@ message SegmentRun {
   int64 count = 2;            // number of consecutive segments
   int64 decoded_bytes = 3;    // decoded size shared by every segment in the run; 0 = use NzbSeg.bytes
 }
-  

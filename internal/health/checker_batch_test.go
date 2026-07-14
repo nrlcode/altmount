@@ -2,13 +2,16 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"testing"
 
+	"github.com/javi11/altmount/internal/database"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/testsupport/fakepool"
+	"github.com/javi11/altmount/internal/usenet"
 	"github.com/javi11/nntppool/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -135,6 +138,13 @@ func TestCheckFilesBatch(t *testing.T) {
 
 	t.Run("pool down fails all non-early files", func(t *testing.T) {
 		env := newRepairTestEnv(t, t.TempDir(), nil) // mockPoolManager: GetPool errors
+		env.healthChecker = NewHealthChecker(
+			env.healthRepo,
+			env.metadataService,
+			&mockPoolManager{},
+			env.hw.configGetter,
+			&MockRcloneClient{},
+		)
 
 		paths := []string{"complete/a.mkv", "complete/b.mkv"}
 		for _, p := range paths {
@@ -192,6 +202,40 @@ func TestCheckFile_ParityWithBatch(t *testing.T) {
 		event := env.healthChecker.CheckFile(context.Background(), "complete/never-written.mkv")
 		assert.Equal(t, EventTypeFileRemoved, event.Type)
 	})
+}
+
+func TestPR3BatchCancellationDoesNotPublishCompletedSiblingVerdict(t *testing.T) {
+	hc := &HealthChecker{}
+	prep := preparedCheck{filePath: "complete/sibling.mkv", totalSegments: 1}
+	result := usenet.ValidationResult{TotalExpected: 1, TotalChecked: 1}
+	aggregate := &usenet.IncompleteError{
+		Expected:  2,
+		Completed: 1,
+		Cause:     context.Canceled,
+	}
+
+	event := hc.judgeValidation(context.Background(), prep, result, aggregate)
+	assert.Equal(t, EventTypeCheckFailed, event.Type,
+		"a canceled batch cannot publish a healthy sibling verdict")
+	assert.Equal(t, database.HealthStatusPending, event.Status)
+}
+
+func TestPR3PerFileTemporaryOutcomeDoesNotPoisonCompletedSibling(t *testing.T) {
+	hc := &HealthChecker{}
+	prep := preparedCheck{filePath: "complete/sibling.mkv", totalSegments: 1}
+	result := usenet.ValidationResult{TotalExpected: 1, TotalChecked: 1}
+	aggregate := &usenet.IncompleteError{
+		Expected:  2,
+		Completed: 1,
+		Cause: &nntppool.TransportError{
+			Kind:  nntppool.OutcomeTemporaryFailure,
+			Cause: errors.New("synthetic sibling failure"),
+		},
+	}
+
+	event := hc.judgeValidation(context.Background(), prep, result, aggregate)
+	assert.Equal(t, EventTypeFileHealthy, event.Type,
+		"one file's attributed temporary result must not erase a completed sibling")
 }
 
 // TestRunHealthCheckCycle_BatchExceedsMaxJobs verifies one cycle processes far

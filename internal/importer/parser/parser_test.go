@@ -167,11 +167,10 @@ func TestDetermineNzbType_ExcludesPar2Files(t *testing.T) {
 	}
 }
 
-// TestFetchAllFirstSegments_MissingSegmentEmitsDebugLog verifies that a
-// "missing segment" debug log is emitted when Body() returns ErrArticleNotFound
-// while fetching the first segment of a file.
+// TestFetchAllFirstSegments_MissingSegmentLogIsSanitized verifies that hard
+// absence remains observable without retaining the provider article ID.
 // NOT parallel: we inject p.log directly.
-func TestFetchAllFirstSegments_MissingSegmentEmitsDebugLog(t *testing.T) {
+func TestFetchAllFirstSegments_MissingSegmentLogIsSanitized(t *testing.T) {
 	segID := segments.MessageID(0)
 
 	var mu sync.Mutex
@@ -219,11 +218,12 @@ func TestFetchAllFirstSegments_MissingSegmentEmitsDebugLog(t *testing.T) {
 	defer mu.Unlock()
 	found := false
 	for _, r := range captured {
-		if r.msg == "missing segment" && r.segID == segID {
+		if r.msg == "first segment fetch failed" {
 			found = true
 		}
+		assert.NotEqual(t, segID, r.segID, "raw segment ID leaked in parser log")
 	}
-	assert.True(t, found, "expected 'missing segment' debug log for segment_id=%q, got: %+v", segID, captured)
+	assert.True(t, found, "expected sanitized first-segment failure log, got: %+v", captured)
 }
 
 // parserCaptureLogHandler is a minimal slog.Handler for parser tests.

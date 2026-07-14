@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -83,9 +84,6 @@ type healthCheckInput struct {
 	sourceNzbPath string
 	segments      []*metapb.SegmentData
 	encryption    metapb.Encryption
-	// knownHoles is the file's persisted hole map (segments confirmed
-	// missing by earlier sweeps or playback padding).
-	knownHoles []*metapb.HoleRun
 	// hasNestedOrRemuxedSources marks files whose bytes are not a plain
 	// segment concatenation (nested RAR sources, BD clip remux) — those are
 	// never zero-filled, so hole classification does not apply.
@@ -94,14 +92,14 @@ type healthCheckInput struct {
 
 // preparedCheck is the outcome of the per-file preparation stage shared by the
 // single-file and batch check paths: either an early terminal event (metadata
-// missing/corrupt, no segments) or the sampled segment IDs to Stat. Only the
-// ID strings survive past preparation, so the proto segment slice is
+// missing/corrupt, no segments) or the sampled positional targets to Stat.
+// Only copied target values survive past preparation, so the proto slice is
 // collectible before the network sweep begins.
 type preparedCheck struct {
-	filePath      string
-	sourceNzbPath string
-	sampledIDs    []string
-	earlyEvent    *HealthEvent
+	filePath       string
+	sourceNzbPath  string
+	sampledTargets []usenet.ValidationTarget
+	earlyEvent     *HealthEvent
 	// totalSegments is the full (unsampled) segment count, kept as a scalar so
 	// it survives past preparation for error reporting without holding onto
 	// the segment slice itself during the network sweep.
@@ -123,7 +121,7 @@ func baseResultEvent(filePath, sourceNzbPath string) HealthEvent {
 
 // prepareCheck runs the local (non-network) stages of a health check: metadata
 // read, integrity verification, and segment sampling. It returns either an
-// early terminal event or the sampled segment IDs for the network sweep.
+// early terminal event or sampled positional targets for the network sweep.
 func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts ...CheckOptions) preparedCheck {
 	prep := preparedCheck{filePath: filePath}
 
@@ -168,7 +166,6 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 		sourceNzbPath: fileMeta.SourceNzbPath,
 		segments:      fileMeta.SegmentData,
 		encryption:    fileMeta.Encryption,
-		knownHoles:    fileMeta.KnownHoles,
 		hasNestedOrRemuxedSources: len(fileMeta.NestedSources) > 0 ||
 			len(fileMeta.SharedOuterSources) > 0 ||
 			len(fileMeta.ClipBoundaries) > 0,
@@ -179,7 +176,7 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 
 	if len(input.segments) == 0 {
 		event := baseResultEvent(filePath, input.sourceNzbPath)
-		event.Type = EventTypeCheckFailed
+		event.Type = EventTypeFileCorrupted
 		event.Status = database.HealthStatusCorrupted
 		event.Error = fmt.Errorf("no segment data available")
 		prep.earlyEvent = &event
@@ -220,12 +217,16 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 		return prep
 	}
 
-	// Sample and copy the message IDs so the proto segment slice becomes
-	// collectible before the network sweep begins.
+	// Sample and copy message IDs with their original positions so the proto
+	// segment slice becomes collectible before the network sweep begins.
 	selected := usenet.SelectSegmentsForValidation(input.segments, samplePercentage)
-	prep.sampledIDs = make([]string, len(selected))
+	indexBySegment := make(map[*metapb.SegmentData]int, len(input.segments))
+	for idx, segment := range input.segments {
+		indexBySegment[segment] = idx
+	}
+	prep.sampledTargets = make([]usenet.ValidationTarget, len(selected))
 	for i, seg := range selected {
-		prep.sampledIDs[i] = seg.Id
+		prep.sampledTargets[i] = usenet.ValidationTarget{ID: seg.Id, Index: indexBySegment[seg]}
 	}
 
 	return prep
@@ -239,10 +240,30 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 func (hc *HealthChecker) judgeValidation(ctx context.Context, prep preparedCheck, result usenet.ValidationResult, valErr error) HealthEvent {
 	event := baseResultEvent(prep.filePath, prep.sourceNzbPath)
 
-	if valErr != nil {
+	incomplete := result.IncompleteCount > 0 || result.TotalChecked < result.TotalExpected
+	if valErr != nil && usenet.IsIncomplete(valErr) && !incomplete {
+		var aggregate *usenet.IncompleteError
+		if errors.As(valErr, &aggregate) &&
+			!aggregate.Global &&
+			!errors.Is(valErr, context.Canceled) &&
+			!errors.Is(valErr, context.DeadlineExceeded) &&
+			aggregate.Completed < aggregate.Expected {
+			// The aggregate may describe an incomplete sibling in this batch;
+			// this file still has enough positional evidence for a verdict.
+			valErr = nil
+		}
+	}
+	if valErr != nil || incomplete {
 		event.Type = EventTypeCheckFailed
-		event.Status = database.HealthStatusCorrupted
-		event.Error = fmt.Errorf("failed to validate segments: %w", valErr)
+		event.Status = database.HealthStatusPending
+		if valErr != nil {
+			event.Error = fmt.Errorf("failed to validate segments: %w", valErr)
+		} else {
+			event.Error = &usenet.IncompleteError{
+				Expected:  result.TotalExpected,
+				Completed: result.TotalExpected - result.IncompleteCount,
+			}
+		}
 		return event
 	}
 
@@ -263,9 +284,7 @@ func (hc *HealthChecker) judgeValidation(ctx context.Context, prep preparedCheck
 		return event
 	}
 
-	// All checked segments are available - record will be deleted.
-	// Persisted known holes (from playback padding) survive on purpose: a
-	// clean STAT sample never overrides observed misses.
+	// All requested segments produced conclusive available results.
 	event.Type = EventTypeFileHealthy
 	// Status not needed as the record will be deleted from database
 
@@ -280,16 +299,16 @@ func (hc *HealthChecker) CheckFile(ctx context.Context, filePath string, opts ..
 	}
 
 	cfg := hc.configGetter()
-	results, err := usenet.ValidateSegmentAvailabilityBatch(
+	results, err := usenet.ValidateSegmentAvailabilityTargetsBatch(
 		ctx,
-		[][]string{prep.sampledIDs},
+		[][]usenet.ValidationTarget{prep.sampledTargets},
 		hc.poolManager,
 		cfg.GetMaxConnectionsForHealthChecks(),
 		cfg.GetHealthReadTimeout(),
 	)
 
 	var result usenet.ValidationResult
-	if err == nil {
+	if len(results) > 0 {
 		result = results[0]
 	}
 	return hc.judgeValidation(ctx, prep, result, err)
@@ -320,17 +339,17 @@ func (hc *HealthChecker) CheckFilesBatch(ctx context.Context, filePaths []string
 	}
 	pl.Wait()
 
-	perFileIDs := make([][]string, len(preps))
+	perFileTargets := make([][]usenet.ValidationTarget, len(preps))
 	for i := range preps {
 		if preps[i].earlyEvent == nil {
-			perFileIDs[i] = preps[i].sampledIDs
+			perFileTargets[i] = preps[i].sampledTargets
 		}
 	}
 
 	cfg := hc.configGetter()
-	results, valErr := usenet.ValidateSegmentAvailabilityBatch(
+	results, valErr := usenet.ValidateSegmentAvailabilityTargetsBatch(
 		ctx,
-		perFileIDs,
+		perFileTargets,
 		hc.poolManager,
 		cfg.GetMaxConnectionsForHealthChecks(),
 		cfg.GetHealthReadTimeout(),
@@ -343,7 +362,7 @@ func (hc *HealthChecker) CheckFilesBatch(ctx context.Context, filePaths []string
 			continue
 		}
 		var result usenet.ValidationResult
-		if valErr == nil {
+		if i < len(results) {
 			result = results[i]
 		}
 		events[i] = hc.judgeValidation(ctx, preps[i], result, valErr)
