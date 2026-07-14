@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/javi11/altmount/internal/importer/admissionctx"
 	"github.com/javi11/altmount/internal/importer/filesystem"
 	"github.com/javi11/altmount/internal/importer/parser"
 	"github.com/javi11/altmount/internal/importer/utils"
@@ -23,6 +24,14 @@ import (
 )
 
 var ErrNoFilesProcessed = errors.New("no regular files were successfully processed (all files failed validation)")
+
+type durableProcessingError struct {
+	message string
+	cause   error
+}
+
+func (e *durableProcessingError) Error() string { return e.message }
+func (e *durableProcessingError) Unwrap() error { return e.cause }
 
 // ProcessRegularFiles processes multiple regular files.
 // Returns the virtual paths of all metadata files successfully written, plus any error.
@@ -40,14 +49,20 @@ func ProcessRegularFiles(
 	storeIndex map[string]int64,
 	storeRef string,
 ) ([]string, error) {
+	_, durableAdmission := admissionctx.FromContext(ctx)
 	if len(files) == 0 {
 		return nil, nil
 	}
 
 	if !utils.HasAllowedFilesInRegular(files, allowedFileExtensions, filterSamples) {
-		slog.WarnContext(ctx, "No files with allowed extensions found",
-			"allowed_extensions", allowedFileExtensions,
-			"file_count", len(files))
+		if !durableAdmission {
+			slog.WarnContext(ctx, "No files with allowed extensions found",
+				"allowed_extensions", allowedFileExtensions,
+				"file_count", len(files))
+		}
+		if durableAdmission {
+			return nil, fmt.Errorf("no files with allowed extensions found")
+		}
 		return nil, fmt.Errorf("no files with allowed extensions found (allowed: %v)", allowedFileExtensions)
 	}
 
@@ -98,16 +113,17 @@ func ProcessRegularFiles(
 			parentPath, filename := filesystem.DetermineFileLocation(file, virtualDir)
 
 			if err := filesystem.EnsureDirectoryExists(parentPath, metadataService); err != nil {
+				if durableAdmission {
+					return &durableProcessingError{
+						message: "failed to create final-layout directory", cause: err,
+					}
+				}
 				return fmt.Errorf("failed to create parent directory %s: %w", parentPath, err)
 			}
 
 			virtualPath := filepath.Join(parentPath, filename)
 			virtualPath = strings.ReplaceAll(virtualPath, string(filepath.Separator), "/")
-
-			// Atomically pick and reserve a unique path, checking both on-disk
-			// healthy metadata and paths already claimed by sibling goroutines.
-			virtualPath = reserver.Reserve(virtualPath)
-			defer reserver.Release(virtualPath)
+			desiredVirtualPath := virtualPath
 
 			if !utils.IsAllowedFile(filename, file.Size, allowedFileExtensions, filterSamples) {
 				return nil
@@ -120,7 +136,9 @@ func ProcessRegularFiles(
 				file.Segments,
 				file.Encryption,
 			); err != nil {
-				slog.WarnContext(ctx, "Skipping file due to segment validation error", "error", err, "file", filename)
+				if !durableAdmission {
+					slog.WarnContext(ctx, "Skipping file due to segment validation error", "error", err, "file", filename)
+				}
 				return nil
 			}
 
@@ -139,12 +157,50 @@ func ProcessRegularFiles(
 				file.NzbdavID,
 			)
 
+			reuseAcceptedPath := false
+			var reusableBinding admissionctx.ReusableLayoutBinding
+			if binding, reusable := admissionctx.ReusableLayout(ctx, desiredVirtualPath); reusable {
+				reusableBinding = binding
+				layout, layoutErr := metadata.ResolveCanonicalSegmentLayout(fileMeta)
+				if layoutErr == nil && layout.Fingerprint == binding.Fingerprint {
+					virtualPath = reserver.ReserveReusable(desiredVirtualPath)
+					reuseAcceptedPath = virtualPath == desiredVirtualPath
+				} else {
+					virtualPath = reserver.Reserve(desiredVirtualPath)
+				}
+			} else {
+				virtualPath = reserver.Reserve(desiredVirtualPath)
+			}
+			defer reserver.Release(virtualPath)
+
+			if reuseAcceptedPath && !reusableBinding.ActivationPending {
+				if existing, readErr := metadataService.ReadFileMetadata(virtualPath); readErr == nil &&
+					existing != nil && existing.Status == metapb.FileStatus_FILE_STATUS_HEALTHY {
+					existingLayout, existingErr := metadata.ResolveCanonicalSegmentLayout(existing)
+					if existingErr == nil && existingLayout.Fingerprint == reusableBinding.Fingerprint {
+						writtenPathsMu.Lock()
+						writtenPaths = append(writtenPaths, virtualPath)
+						writtenPathsMu.Unlock()
+						return nil
+					}
+				}
+			}
+
 			metadataPath := metadataService.GetMetadataFilePath(virtualPath)
-			if _, err := os.Stat(metadataPath); err == nil {
-				_ = metadataService.DeleteFileMetadata(virtualPath)
+			if !reuseAcceptedPath {
+				if _, err := os.Stat(metadataPath); err == nil {
+					_ = metadataService.DeleteFileMetadata(virtualPath)
+				}
+			} else if _, err := os.Stat(metadataPath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("inspect reusable metadata path: %w", err)
 			}
 
 			if err := metadataService.WriteFileMetadataAuto(ctx, virtualPath, fileMeta, storeIndex, storeRef); err != nil {
+				if durableAdmission {
+					return &durableProcessingError{
+						message: "failed to write admitted metadata", cause: err,
+					}
+				}
 				return fmt.Errorf("failed to write metadata for file %s: %w", filename, err)
 			}
 
@@ -152,10 +208,12 @@ func ProcessRegularFiles(
 			writtenPaths = append(writtenPaths, virtualPath)
 			writtenPathsMu.Unlock()
 
-			slog.DebugContext(ctx, "Created metadata file",
-				"file", filename,
-				"virtual_path", virtualPath,
-				"size", file.Size)
+			if !durableAdmission {
+				slog.DebugContext(ctx, "Created metadata file",
+					"file", filename,
+					"virtual_path", virtualPath,
+					"size", file.Size)
+			}
 			return nil
 		})
 	}
@@ -176,12 +234,14 @@ func ProcessRegularFiles(
 	if total > 0 {
 		perFile = elapsed / time.Duration(total)
 	}
-	slog.InfoContext(ctx, "Successfully processed regular files",
-		"virtual_dir", virtualDir,
-		"files", len(files),
-		"written", len(writtenPaths),
-		"duration", elapsed,
-		"avg_per_file", perFile)
+	if !durableAdmission {
+		slog.InfoContext(ctx, "Successfully processed regular files",
+			"virtual_dir", virtualDir,
+			"files", len(files),
+			"written", len(writtenPaths),
+			"duration", elapsed,
+			"avg_per_file", perFile)
+	}
 
 	return writtenPaths, nil
 }

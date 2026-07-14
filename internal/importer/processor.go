@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/javi11/nzbparser"
@@ -22,7 +23,9 @@ import (
 	"github.com/javi11/altmount/internal/importer/filesystem"
 	"github.com/javi11/altmount/internal/importer/multifile"
 	"github.com/javi11/altmount/internal/importer/parser"
+	"github.com/javi11/altmount/internal/importer/parser/fileinfo"
 	"github.com/javi11/altmount/internal/importer/singlefile"
+	importutils "github.com/javi11/altmount/internal/importer/utils"
 	"github.com/javi11/altmount/internal/importer/utils/nzbtrim"
 	"github.com/javi11/altmount/internal/importer/validation"
 	"github.com/javi11/altmount/internal/metadata"
@@ -50,6 +53,12 @@ type Processor struct {
 	log               *slog.Logger
 	broadcaster       *progress.ProgressBroadcaster // WebSocket progress broadcaster
 	recorder          HistoryRecorder
+	// durableAdmissionEnabled demotes the raw-NZB fast-fail sweep once the
+	// fingerprint-bound final-layout validator is installed. Atomic access
+	// keeps config activation race-free without changing Processor's public
+	// constructor.
+	durableAdmissionEnabled atomic.Bool
+	durableRollbackJournal  atomic.Pointer[durableImportRollbackJournal]
 
 	// Pre-compiled regex patterns for RAR file sorting
 	rarPartPattern  *regexp.Regexp // pattern.part###.rar
@@ -89,6 +98,58 @@ func (proc *Processor) getCleanNzbName(nzbPath string, queueID int) string {
 
 func (proc *Processor) SetRecorder(recorder HistoryRecorder) {
 	proc.recorder = recorder
+}
+
+func (proc *Processor) SetDurableAdmissionEnabled(enabled bool) {
+	proc.durableAdmissionEnabled.Store(enabled)
+}
+
+func (proc *Processor) SetDurableRollbackJournal(journal *durableImportRollbackJournal) {
+	proc.durableRollbackJournal.Store(journal)
+}
+
+// durableFinalLayoutOptionalFileIndexes conservatively excludes only files
+// that cannot become a selected output or required archive dependency under
+// the active import policy. Empty, extensionless, and obfuscated names remain
+// required because first-segment inspection may reveal an eligible payload.
+func durableFinalLayoutOptionalFileIndexes(
+	files []nzbparser.NzbFile,
+	allowedExtensions []string,
+	filterSamples bool,
+) map[int]struct{} {
+	optional := make(map[int]struct{})
+	for index := range files {
+		file := &files[index]
+		name := strings.TrimSpace(file.Filename)
+		if name == "" || !importutils.HasPopularExtension(name) || fileinfo.IsProbablyObfuscated(name) {
+			continue
+		}
+		if fileinfo.IsRarFile(name) || fileinfo.Is7zFile(name) {
+			continue
+		}
+		if fileinfo.IsPar2File(name) || !importutils.IsAllowedFile(
+			name, durableDeclaredFileSize(file), allowedExtensions, filterSamples,
+		) {
+			optional[index] = struct{}{}
+		}
+	}
+	return optional
+}
+
+func durableDeclaredFileSize(file *nzbparser.NzbFile) int64 {
+	if file == nil {
+		return 0
+	}
+	if file.Bytes > 0 {
+		return file.Bytes
+	}
+	var size int64
+	for _, segment := range file.Segments {
+		if segment.Bytes > 0 && size <= int64(^uint64(0)>>1)-int64(segment.Bytes) {
+			size += int64(segment.Bytes)
+		}
+	}
+	return size
 }
 
 func (proc *Processor) isCategoryFolder(path string, category *string) bool {
@@ -440,21 +501,42 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 
 		parser.SanitizeNzbFilenames(n)
 
-		// Pre-parse Stat check — runs before any Body fetches.
-		proc.updateProgressWithStage(queueID, 0, "Checking segment availability")
+		durableAdmissionEnabled := proc.durableAdmissionEnabled.Load()
+		filterSamples := true
+		if cfg.Import.FilterSampleFiles != nil {
+			filterSamples = *cfg.Import.FilterSampleFiles
+		}
 		var missingIDs map[string]struct{}
-		var fastFailErr error
-		brokenIdx, missingIDs, fastFailErr = proc.preParseFastFail(ctx, n, cfg, queueID)
-		if fastFailErr != nil {
-			return "", nil, fmt.Errorf("fast-fail segment check incomplete: %w", fastFailErr)
+		if !durableAdmissionEnabled {
+			// Compatibility path for callers that have not installed PR5. Once
+			// durable admission is active this raw-NZB sample is no longer an
+			// authority: only the final canonical layout may accept or reject.
+			proc.updateProgressWithStage(queueID, 0, "Checking segment availability")
+			var fastFailErr error
+			brokenIdx, missingIDs, fastFailErr = proc.preParseFastFail(ctx, n, cfg, queueID)
+			if fastFailErr != nil {
+				return "", nil, fmt.Errorf("fast-fail segment check incomplete: %w", fastFailErr)
+			}
 		}
 
 		parseTracker := progress.NewTracker(proc.broadcaster, queueID, 2, 10)
 		parsed, err = proc.parser.ParseNzb(ctx, n, filePath, parseTracker, parser.ParseOptions{
-			BrokenFileIndexes:      brokenIdx,
-			KnownMissingSegmentIDs: missingIDs,
+			BrokenFileIndexes:          brokenIdx,
+			KnownMissingSegmentIDs:     missingIDs,
+			RequireCompleteFinalLayout: durableAdmissionEnabled,
+			OptionalFileIndexes: durableFinalLayoutOptionalFileIndexes(
+				n.Files, allowedExtensions, filterSamples,
+			),
 		})
 		if err != nil {
+			if durableAdmissionEnabled {
+				switch {
+				case parser.IsFinalLayoutConfirmationRequired(err):
+					return "", nil, &durablePrelayoutValidationError{confirmationRequired: true}
+				case parser.IsFinalLayoutIncomplete(err), usenet.IsIncomplete(err):
+					return "", nil, &durablePrelayoutValidationError{resumeRequired: true}
+				}
+			}
 			if usenet.IsIncomplete(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return "", nil, fmt.Errorf("NZB network parsing incomplete: %w", err)
 			}
@@ -531,11 +613,13 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 
 	// Persist the NzbStore up front so every metadata write below can be emitted
 	// directly in the v3 store-backed format (no read-back conversion pass).
-	// storeRef stays "" on any failure — which makes each write site fall back to
-	// the v1 inline-segment format — so a store problem never blocks the import.
+	// Legacy imports retain their v1 fallback. Durable admission instead parks
+	// before the first metadata candidate: changing storage form across a retry
+	// would conflict with the retained exact candidate intent.
 	var storeRef string
 	var storeIndex map[string]int64
 	if parsed.Store != nil && len(parsed.SegmentIndex) > 0 && parsed.Type != parser.NzbTypeStrm {
+		durableStore := proc.durableAdmissionEnabled.Load()
 		cfg := proc.configGetter()
 		configDir := filepath.Dir(cfg.Database.Path)
 		if !filepath.IsAbs(configDir) {
@@ -564,6 +648,12 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			nzbStoreDir = filepath.Join(configDir, ".nzbs")
 		}
 		if mkErr := os.MkdirAll(nzbStoreDir, 0755); mkErr != nil {
+			if durableStore {
+				retryAt := time.Now().UTC().Add(durablePrelayoutConfirmationDelay)
+				return result, writtenPaths, &durableImportHoldError{
+					retryAt: &retryAt, resumeRequired: true,
+				}
+			}
 			proc.log.WarnContext(ctx, "failed to create nzb store dir; metadata stays v1",
 				"dir", nzbStoreDir, "error", mkErr)
 		} else {
@@ -572,13 +662,39 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 				base = fmt.Sprintf("%d-%s", queueID, base)
 			}
 			ref := filepath.Join(nzbStoreDir, base+".nzbz")
-			if storeErr := proc.metadataService.Store().WriteStore(ref, parsed.Store); storeErr != nil {
+			intentReady := true
+			if durableStore {
+				journal := proc.durableRollbackJournal.Load()
+				intentReady = journal != nil && queueID > 0 &&
+					journal.RecordStoreIntent(ctx, int64(queueID), ref) == nil
+			}
+			var storeErr error
+			if !intentReady {
+				storeErr = errDurableImportRollbackJournal
+			} else if durableStore {
+				storeErr = proc.metadataService.Store().WriteStoreDurable(ref, parsed.Store)
+			} else {
+				storeErr = proc.metadataService.Store().WriteStore(ref, parsed.Store)
+			}
+			if storeErr != nil {
+				if durableStore {
+					retryAt := time.Now().UTC().Add(durablePrelayoutConfirmationDelay)
+					return result, writtenPaths, &durableImportHoldError{
+						retryAt: &retryAt, resumeRequired: true,
+					}
+				}
 				proc.log.ErrorContext(ctx, "failed to write NZB store; metadata stays v1",
-					"store_ref", ref, "error", storeErr)
-			} else if _, integrityErr := proc.metadataService.Store().ReadStore(ref); integrityErr != nil {
+					"error", storeErr)
+			} else if _, integrityErr := proc.metadataService.Store().ReadStoreFromDisk(ref); integrityErr != nil {
+				_ = proc.metadataService.Store().RemoveStoreDurable(ref)
+				if durableStore {
+					retryAt := time.Now().UTC().Add(durablePrelayoutConfirmationDelay)
+					return result, writtenPaths, &durableImportHoldError{
+						retryAt: &retryAt, resumeRequired: true,
+					}
+				}
 				proc.log.ErrorContext(ctx, "NZB store integrity check failed; removing store",
-					"store_ref", ref, "error", integrityErr)
-				_ = os.Remove(ref)
+					"error", integrityErr)
 			} else {
 				storeRef = ref
 				storeIndex = parsed.SegmentIndex
@@ -620,6 +736,9 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			isoTracker = proc.broadcaster.CreateTracker(queueID, 10, 30).WithStage("Analyzing ISO")
 		}
 
+		isoWriteContext := withDurableImportIntent(
+			ctx, int64(queueID), validation.FinalLayoutProvenanceISOExpansion,
+		)
 		isoWritten, expandedRegularFiles, isoErr := expandBareISOFiles(ctx, expandBareISODeps{
 			enabled: expandEnabled,
 			expand: func(ctx context.Context, enabled bool, contents []archive.Content) ([]archive.Content, error) {
@@ -627,7 +746,7 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 					proc.poolManager, isoMaxPrefetch, isoReadTimeout, cfg.GetIsoAnalyzeTimeout(), allowedExtensions, isoTracker)
 			},
 			writeMetadata: func(virtualPath string, meta *metapb.FileMetadata) error {
-				return proc.metadataService.WriteFileMetadataAuto(ctx, virtualPath, meta, storeIndex, storeRef)
+				return proc.metadataService.WriteFileMetadataAuto(isoWriteContext, virtualPath, meta, storeIndex, storeRef)
 			},
 		}, regularFiles, virtualDir, proc.getCleanNzbName(parsed.Path, queueID), parsed.Path, isoReleaseDate)
 		if isoErr != nil {
@@ -655,23 +774,38 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 	switch parsed.Type {
 	case parser.NzbTypeSingleFile:
 		proc.updateProgressWithStage(queueID, 30, "Validating segments")
-		result, dispatchPaths, err = proc.processSingleFile(ctx, virtualDir, regularFiles, par2Files, parsed.Path, queueID, allowedExtensions, category, metadata, downloadID, storeIndex, storeRef)
+		writeContext := withDurableImportIntent(
+			ctx, int64(queueID), validation.FinalLayoutProvenanceStandalone,
+		)
+		result, dispatchPaths, err = proc.processSingleFile(writeContext, virtualDir, regularFiles, par2Files, parsed.Path, queueID, allowedExtensions, category, metadata, downloadID, storeIndex, storeRef)
 
 	case parser.NzbTypeMultiFile:
 		proc.updateProgressWithStage(queueID, 30, "Writing metadata")
-		result, dispatchPaths, err = proc.processMultiFile(ctx, virtualDir, regularFiles, par2Files, parsed.Path, queueID, allowedExtensions, category, metadata, downloadID, storeIndex, storeRef)
+		writeContext := withDurableImportIntent(
+			ctx, int64(queueID), validation.FinalLayoutProvenanceStandalone,
+		)
+		result, dispatchPaths, err = proc.processMultiFile(writeContext, virtualDir, regularFiles, par2Files, parsed.Path, queueID, allowedExtensions, category, metadata, downloadID, storeIndex, storeRef)
 
 	case parser.NzbTypeRarArchive:
 		proc.updateProgressWithStage(queueID, 15, "Analyzing archive")
-		result, dispatchPaths, err = proc.processRarArchive(ctx, virtualDir, regularFiles, archiveFiles, parsed, queueID, allowedExtensions, parsed.ExtractedFiles, category, metadata, downloadID, storeIndex, storeRef)
+		writeContext := withDurableImportIntent(
+			ctx, int64(queueID), validation.FinalLayoutProvenanceArchiveMember,
+		)
+		result, dispatchPaths, err = proc.processRarArchive(writeContext, virtualDir, regularFiles, archiveFiles, parsed, queueID, allowedExtensions, parsed.ExtractedFiles, category, metadata, downloadID, storeIndex, storeRef)
 
 	case parser.NzbType7zArchive:
 		proc.updateProgressWithStage(queueID, 15, "Analyzing archive")
-		result, dispatchPaths, err = proc.processSevenZipArchive(ctx, virtualDir, regularFiles, archiveFiles, parsed, queueID, allowedExtensions, parsed.ExtractedFiles, category, metadata, downloadID, storeIndex, storeRef)
+		writeContext := withDurableImportIntent(
+			ctx, int64(queueID), validation.FinalLayoutProvenanceArchiveMember,
+		)
+		result, dispatchPaths, err = proc.processSevenZipArchive(writeContext, virtualDir, regularFiles, archiveFiles, parsed, queueID, allowedExtensions, parsed.ExtractedFiles, category, metadata, downloadID, storeIndex, storeRef)
 
 	case parser.NzbTypeStrm:
 		proc.updateProgressWithStage(queueID, 30, "Validating segments")
-		result, dispatchPaths, err = proc.processSingleFile(ctx, virtualDir, regularFiles, par2Files, parsed.Path, queueID, allowedExtensions, category, metadata, downloadID, storeIndex, storeRef)
+		writeContext := withDurableImportIntent(
+			ctx, int64(queueID), validation.FinalLayoutProvenanceStandalone,
+		)
+		result, dispatchPaths, err = proc.processSingleFile(writeContext, virtualDir, regularFiles, par2Files, parsed.Path, queueID, allowedExtensions, category, metadata, downloadID, storeIndex, storeRef)
 
 	default:
 		return "", writtenPaths, NewNonRetryableError(fmt.Sprintf("unknown file type: %s", parsed.Type), nil)
@@ -953,8 +1087,11 @@ func (proc *Processor) processRarArchive(
 			return nzbFolder, writtenPaths, err
 		}
 
+		regularWriteContext := withDurableImportIntent(
+			ctx, int64(queueID), validation.FinalLayoutProvenanceStandalone,
+		)
 		if _, err := multifile.ProcessRegularFiles(
-			ctx,
+			regularWriteContext,
 			nzbFolder,
 			regularFiles,
 			nil, // No PAR2 files for archive imports
@@ -966,7 +1103,9 @@ func (proc *Processor) processRarArchive(
 			storeIndex,
 			storeRef,
 		); err != nil {
-			slog.DebugContext(ctx, "Failed to process regular files", "error", err)
+			if !proc.durableAdmissionEnabled.Load() {
+				slog.DebugContext(ctx, "Failed to process regular files", "error", err)
+			}
 		}
 	}
 
@@ -1086,8 +1225,11 @@ func (proc *Processor) processSevenZipArchive(
 			return nzbFolder, writtenPaths, err
 		}
 
+		regularWriteContext := withDurableImportIntent(
+			ctx, int64(queueID), validation.FinalLayoutProvenanceStandalone,
+		)
 		if _, err := multifile.ProcessRegularFiles(
-			ctx,
+			regularWriteContext,
 			nzbFolder,
 			regularFiles,
 			nil, // No PAR2 files for archive imports
@@ -1099,7 +1241,9 @@ func (proc *Processor) processSevenZipArchive(
 			storeIndex,
 			storeRef,
 		); err != nil {
-			slog.DebugContext(ctx, "Failed to process regular files", "error", err)
+			if !proc.durableAdmissionEnabled.Load() {
+				slog.DebugContext(ctx, "Failed to process regular files", "error", err)
+			}
 		}
 	}
 

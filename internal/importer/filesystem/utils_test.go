@@ -233,3 +233,19 @@ func TestEnsureUniqueVirtualPath_UnhealthyNotDeduplicated(t *testing.T) {
 	result := EnsureUniqueVirtualPath("/complete/tv/show.S01E01.mkv", ms)
 	assert.Equal(t, "/complete/tv/show.S01E01.mkv", result)
 }
+
+func TestPR5PathReserverReusesOnePriorAdmissionWithoutCollapsingSiblingCollision(t *testing.T) {
+	ms := newTestMetadataService(t)
+	desired := "/complete/tv/show.S01E01.mkv"
+	writeHealthyMeta(t, ms, desired)
+	reserver := NewPathReserver(ms)
+
+	first := reserver.ReserveReusable(desired)
+	assert.Equal(t, desired, first,
+		"one fingerprint-bound path from the prior queue attempt must be reusable")
+	reserver.Release(first)
+
+	second := reserver.ReserveReusable(desired)
+	assert.Equal(t, "/complete/tv/show.S01E01_1.mkv", second,
+		"a second sibling in this attempt must not collapse onto the reused path")
+}

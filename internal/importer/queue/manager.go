@@ -235,11 +235,7 @@ func (m *Manager) ExecuteItem(ctx context.Context, itemID int64) error {
 
 		resultingPath, processingErr := m.processor.ProcessItem(itemCtx, item)
 
-		if processingErr != nil {
-			m.processor.HandleFailure(itemCtx, item, processingErr)
-		} else {
-			m.processor.HandleSuccess(itemCtx, item, resultingPath)
-		}
+		m.finishProcessing(itemCtx, item, resultingPath, processingErr)
 	}()
 
 	return nil
@@ -354,9 +350,20 @@ func (m *Manager) processNextItem(ctx context.Context, workerID int) {
 
 	resultingPath, processingErr := m.processor.ProcessItem(itemCtx, item)
 
+	m.finishProcessing(ctx, item, resultingPath, processingErr)
+}
+
+func (m *Manager) finishProcessing(
+	ctx context.Context,
+	item *database.ImportQueueItem,
+	resultingPath string,
+	processingErr error,
+) {
 	if processingErr != nil {
 		m.processor.HandleFailure(ctx, item, processingErr)
-	} else {
-		m.processor.HandleSuccess(ctx, item, resultingPath)
+		return
+	}
+	if successErr := m.processor.HandleSuccess(ctx, item, resultingPath); successErr != nil {
+		m.processor.HandleFailure(ctx, item, successErr)
 	}
 }

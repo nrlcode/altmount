@@ -28,7 +28,11 @@ type Coordinator struct {
 	healthRepo      *database.HealthRepository
 	arrsService     *arrs.Service
 	userRepo        *database.UserRepository
-	log             *slog.Logger
+	// reuseDurableImportCoverage suppresses the legacy immediate 100% health
+	// schedule after PR5 has already completed a fingerprint-bound full import
+	// STAT run. Later milestone/revalidation schedules remain health-engine work.
+	reuseDurableImportCoverage bool
+	log                        *slog.Logger
 }
 
 // Config holds configuration for the Coordinator
@@ -66,6 +70,14 @@ func (c *Coordinator) SetArrsService(service *arrs.Service) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.arrsService = service
+}
+
+// SetReuseDurableImportCoverage records that successful import admission is
+// already ordinary health coverage. It is safe to toggle during config setup.
+func (c *Coordinator) SetReuseDurableImportCoverage(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reuseDurableImportCoverage = enabled
 }
 
 // ProcessingResult holds the result of post-processing operations

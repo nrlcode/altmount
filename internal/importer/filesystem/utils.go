@@ -261,6 +261,7 @@ type PathReserver struct {
 	ms      *metadata.MetadataService
 	mu      sync.Mutex
 	claimed map[string]struct{} // final paths claimed but not yet on disk
+	reused  map[string]struct{} // prior-attempt paths consumed once in this batch
 	nextIdx map[string]int      // desired base path -> next suffix index to try
 }
 
@@ -269,6 +270,7 @@ func NewPathReserver(ms *metadata.MetadataService) *PathReserver {
 	return &PathReserver{
 		ms:      ms,
 		claimed: make(map[string]struct{}),
+		reused:  make(map[string]struct{}),
 		nextIdx: make(map[string]int),
 	}
 }
@@ -285,6 +287,27 @@ func (r *PathReserver) Reserve(desired string) string {
 		return desired
 	}
 
+	return r.reserveUniqueLocked(desired)
+}
+
+// ReserveReusable consumes one path that this same queue item admitted on a
+// prior attempt. It bypasses the healthy-on-disk collision exactly once; later
+// siblings still receive suffixes, even if the first caller already released
+// its in-flight claim.
+func (r *PathReserver) ReserveReusable(desired string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, claimed := r.claimed[desired]; !claimed {
+		if _, consumed := r.reused[desired]; !consumed {
+			r.claimed[desired] = struct{}{}
+			r.reused[desired] = struct{}{}
+			return desired
+		}
+	}
+	return r.reserveUniqueLocked(desired)
+}
+
+func (r *PathReserver) reserveUniqueLocked(desired string) string {
 	ext := filepath.Ext(desired)
 	stem := strings.TrimSuffix(desired, ext)
 	i := max(r.nextIdx[desired], 1)
