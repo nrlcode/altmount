@@ -67,14 +67,97 @@ type LibrarySyncWorker struct {
 	healthRepo      *database.HealthRepository
 	configGetter    config.ConfigGetter
 	configManager   *config.Manager
-	cancelFunc      context.CancelFunc
-	mu              sync.Mutex
-	running         bool
-	progressMu      sync.RWMutex
-	progress        *internalSyncProgress
-	lastSyncResult  *SyncResult
-	manualTrigger   chan struct{}
-	rcloneClient    rclonecli.RcloneRcClient
+	// observationRetainHistory makes discovery additive/non-destructive for
+	// PR5 observation mode. In particular, file_health rows cannot be removed:
+	// migration 035 deliberately cascades such removal into durable revisions,
+	// runs, observations, and gap history.
+	observationRetainHistory bool
+	cancelFunc               context.CancelFunc
+	mu                       sync.Mutex
+	running                  bool
+	stopping                 bool
+	done                     chan struct{}
+	syncCancel               context.CancelFunc
+	syncDone                 chan struct{}
+	syncLibraryHook          func(context.Context, bool)
+	progressMu               sync.RWMutex
+	progress                 *internalSyncProgress
+	lastSyncResult           *SyncResult
+	manualTrigger            chan struct{}
+	rcloneClient             rclonecli.RcloneRcClient
+}
+
+// ErrLibrarySyncScanAlreadyRunning is returned when a scheduled, manual, or
+// dry-run scan tries to overlap the single active discovery generation.
+var ErrLibrarySyncScanAlreadyRunning = errors.New("library sync scan already running")
+
+type discoveryBatchConsumer struct {
+	records   chan database.AutomaticHealthCheckRecord
+	done      chan struct{}
+	closeOnce sync.Once
+	added     int
+}
+
+func newDiscoveryBatchConsumer(
+	ctx context.Context,
+	batchSize int,
+	dryRun bool,
+	upsert func(context.Context, []database.AutomaticHealthCheckRecord) error,
+) *discoveryBatchConsumer {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	consumer := &discoveryBatchConsumer{
+		records: make(chan database.AutomaticHealthCheckRecord, 100),
+		done:    make(chan struct{}),
+	}
+	go func() {
+		defer close(consumer.done)
+		batch := make([]database.AutomaticHealthCheckRecord, 0, batchSize)
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			if !dryRun && upsert != nil {
+				if err := upsert(ctx, batch); err != nil {
+					slog.ErrorContext(ctx, "Failed to batch add automatic health checks",
+						"count", len(batch))
+				}
+			}
+			consumer.added += len(batch)
+			batch = batch[:0]
+		}
+		for record := range consumer.records {
+			batch = append(batch, record)
+			if len(batch) >= batchSize {
+				flush()
+			}
+		}
+		flush()
+	}()
+	return consumer
+}
+
+func (c *discoveryBatchConsumer) Records() chan<- database.AutomaticHealthCheckRecord {
+	return c.records
+}
+
+func (c *discoveryBatchConsumer) CloseAndWait() {
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() { close(c.records) })
+	<-c.done
+}
+
+func (c *discoveryBatchConsumer) Added() int {
+	if c == nil {
+		return 0
+	}
+	return c.added
 }
 
 // NewLibrarySyncWorker creates a new library sync worker
@@ -100,7 +183,28 @@ func NewLibrarySyncWorker(
 	return worker
 }
 
+// NewObservationLibrarySyncWorker creates the additive discovery worker used
+// by PR5 observation mode. It can add/update discoverable health records, but
+// cannot delete file-health history, metadata, library files/directories,
+// rewrite mount symlinks, or register malformed metadata as repair work.
+//
+// The legacy constructor remains unchanged for callers that explicitly use
+// the cleanup-capable library synchronization workflow.
+func NewObservationLibrarySyncWorker(
+	metadataService *metadata.MetadataService,
+	healthRepo *database.HealthRepository,
+	configGetter config.ConfigGetter,
+) *LibrarySyncWorker {
+	worker := NewLibrarySyncWorker(metadataService, healthRepo, configGetter, nil, nil)
+	worker.observationRetainHistory = true
+	return worker
+}
+
 const lastLibrarySyncResultKey = "last_library_sync_result"
+
+// ErrLibrarySyncAlreadyRunning means the caller still owns an earlier
+// discovery generation and must join it before starting another one.
+var ErrLibrarySyncAlreadyRunning = errors.New("library sync worker already running")
 
 // LoadLastResult loads the last sync result from the database
 func (lsw *LibrarySyncWorker) LoadLastResult(ctx context.Context) error {
@@ -126,38 +230,109 @@ func (lsw *LibrarySyncWorker) LoadLastResult(ctx context.Context) error {
 
 // StartLibrarySync starts the library sync worker in a background goroutine
 func (lsw *LibrarySyncWorker) StartLibrarySync(ctx context.Context) {
-	lsw.mu.Lock()
-	defer lsw.mu.Unlock()
+	if err := lsw.StartLibrarySyncChecked(ctx); err != nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		slog.WarnContext(ctx, "Library sync worker did not start", "error", err)
+	}
+}
 
+// StartLibrarySyncChecked starts a new library-sync generation and reports
+// whether ownership was acquired. StartLibrarySync remains as the compatible
+// fire-and-forget API for existing callers; lifecycle coordinators use this
+// checked form so they can roll back a partially started runtime.
+func (lsw *LibrarySyncWorker) StartLibrarySyncChecked(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	lsw.mu.Lock()
 	if lsw.running {
-		slog.WarnContext(ctx, "Library sync worker already running")
-		return
+		lsw.mu.Unlock()
+		return ErrLibrarySyncAlreadyRunning
 	}
 
 	// Create cancellable context
 	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	lsw.cancelFunc = cancel
+	lsw.done = done
 	lsw.running = true
+	lsw.stopping = false
+	lsw.mu.Unlock()
 
-	go lsw.run(ctx)
+	go lsw.run(ctx, done)
+	return nil
 }
 
 // Stop stops the library sync worker
 func (lsw *LibrarySyncWorker) Stop(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := lsw.StopAndWait(ctx); err != nil {
+		slog.WarnContext(ctx, "Library sync worker did not stop before the deadline")
+	}
+}
+
+// StopAndWait cancels and joins both the periodic supervisor and the one active
+// scan generation, including an API dry run started without the supervisor.
+func (lsw *LibrarySyncWorker) StopAndWait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	lsw.mu.Lock()
-	defer lsw.mu.Unlock()
-
-	if !lsw.running {
-		slog.WarnContext(ctx, "Library sync worker not running")
-		return
+	running := lsw.running
+	cancel := lsw.cancelFunc
+	done := lsw.done
+	if running {
+		lsw.stopping = true
 	}
+	lsw.mu.Unlock()
 
-	if lsw.cancelFunc != nil {
-		lsw.cancelFunc()
-		lsw.cancelFunc = nil
+	if running && cancel != nil {
+		cancel()
 	}
-	lsw.running = false
-	slog.InfoContext(ctx, "Library sync worker stopped")
+	if running && done == nil {
+		return fmt.Errorf("library sync generation has no completion signal")
+	}
+	if done != nil {
+		select {
+		case <-done:
+			slog.InfoContext(ctx, "Library sync worker stopped")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return lsw.CancelActiveSync(ctx)
+}
+
+// CancelActiveSync cancels and joins only the in-progress scan. The periodic
+// supervisor remains alive, so a later manual trigger or interval can safely
+// start another scan without overlapping the canceled generation.
+func (lsw *LibrarySyncWorker) CancelActiveSync(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lsw.mu.Lock()
+	cancel := lsw.syncCancel
+	done := lsw.syncDone
+	lsw.mu.Unlock()
+	if done == nil {
+		return nil
+	}
+	if cancel != nil {
+		cancel()
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // IsRunning returns whether the library sync worker is currently running
@@ -218,10 +393,16 @@ func (lsw *LibrarySyncWorker) TriggerManualSync(ctx context.Context) error {
 }
 
 // run is the main library sync loop
-func (lsw *LibrarySyncWorker) run(ctx context.Context) {
+func (lsw *LibrarySyncWorker) run(ctx context.Context, done chan struct{}) {
 	defer func() {
 		lsw.mu.Lock()
-		lsw.running = false
+		if lsw.done == done {
+			lsw.running = false
+			lsw.stopping = false
+			lsw.cancelFunc = nil
+			lsw.done = nil
+		}
+		close(done)
 		lsw.mu.Unlock()
 	}()
 
@@ -259,14 +440,57 @@ func (lsw *LibrarySyncWorker) run(ctx context.Context) {
 	}
 }
 
-// safeSyncLibrary executes SyncLibrary with panic recovery
-func (lsw *LibrarySyncWorker) safeSyncLibrary(ctx context.Context, dryRun bool) {
+// RunLibrarySyncChecked owns the one active scan generation shared by
+// scheduled, manual, and API dry-run entry points.
+func (lsw *LibrarySyncWorker) RunLibrarySyncChecked(
+	ctx context.Context,
+	dryRun bool,
+) (result *DryRunResult, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	syncCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	lsw.mu.Lock()
+	if lsw.syncDone != nil {
+		lsw.mu.Unlock()
+		cancel()
+		return nil, ErrLibrarySyncScanAlreadyRunning
+	}
+	lsw.syncCancel = cancel
+	lsw.syncDone = done
+	hook := lsw.syncLibraryHook
+	lsw.mu.Unlock()
+
 	defer func() {
-		if r := recover(); r != nil {
-			slog.ErrorContext(ctx, "Panic in library sync", "panic", r)
+		cancel()
+		lsw.mu.Lock()
+		if lsw.syncDone == done {
+			lsw.syncCancel = nil
+			lsw.syncDone = nil
+		}
+		close(done)
+		lsw.mu.Unlock()
+	}()
+	defer func() {
+		if recover() != nil {
+			result = nil
+			err = errors.New("library sync scan failed")
 		}
 	}()
-	lsw.SyncLibrary(ctx, dryRun)
+	if hook != nil {
+		hook(syncCtx, dryRun)
+		return nil, nil
+	}
+	return lsw.syncLibrary(syncCtx, dryRun), nil
+}
+
+// safeSyncLibrary executes the checked scan entry point for the supervisor.
+func (lsw *LibrarySyncWorker) safeSyncLibrary(ctx context.Context, dryRun bool) {
+	if _, err := lsw.RunLibrarySyncChecked(ctx, dryRun); err != nil &&
+		!errors.Is(err, ErrLibrarySyncScanAlreadyRunning) {
+		slog.ErrorContext(ctx, "Library sync scan failed")
+	}
 }
 
 // syncMaps holds the metadata and database record maps used during synchronization
@@ -387,7 +611,7 @@ func (lsw *LibrarySyncWorker) syncDatabaseRecords(
 	// Batch add new files
 	if len(filesToAdd) > 0 {
 		if !dryRun {
-			if err := lsw.healthRepo.BatchAddAutomaticHealthChecks(ctx, filesToAdd); err != nil {
+			if err := lsw.upsertDiscoveredHealthRecords(ctx, filesToAdd); err != nil {
 				slog.ErrorContext(ctx, "Failed to batch add automatic health checks",
 					"count", len(filesToAdd),
 					"error", err)
@@ -401,8 +625,10 @@ func (lsw *LibrarySyncWorker) syncDatabaseRecords(
 		}
 	}
 
-	// Batch delete orphaned files
-	if len(filesToDelete) > 0 {
+	// Observation discovery is additive. Deleting a file_health row would
+	// cascade through the durable PR5 history bound to that file, so even a
+	// dry-run must not advertise or authorize deletion in this mode.
+	if len(filesToDelete) > 0 && !lsw.observationRetainHistory {
 		if !dryRun {
 			if _, err := lsw.healthRepo.DeleteHealthRecordsBulk(ctx, filesToDelete); err != nil {
 				slog.ErrorContext(ctx, "Failed to delete orphaned health records",
@@ -419,6 +645,16 @@ func (lsw *LibrarySyncWorker) syncDatabaseRecords(
 	}
 
 	return counts
+}
+
+func (lsw *LibrarySyncWorker) upsertDiscoveredHealthRecords(
+	ctx context.Context,
+	records []database.AutomaticHealthCheckRecord,
+) error {
+	if lsw.observationRetainHistory {
+		return lsw.healthRepo.BatchUpsertObservationDiscoveries(ctx, records)
+	}
+	return lsw.healthRepo.BatchAddAutomaticHealthChecks(ctx, records)
 }
 
 // buildSyncMaps constructs the lookup maps for metadata files and database records
@@ -463,18 +699,27 @@ func (lsw *LibrarySyncWorker) initializeProgressTracking(startTime time.Time) fu
 	}
 }
 
-// SyncLibrary performs a full library synchronization. If dryRun is true,
+// SyncLibrary retains the v4-compatible call shape while routing every caller
+// through the shared single-generation admission gate. A conflicting legacy
+// call returns nil because the historical signature has no error result.
+func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *DryRunResult {
+	result, _ := lsw.RunLibrarySyncChecked(ctx, dryRun)
+	return result
+}
+
+// syncLibrary performs a full library synchronization. If dryRun is true,
 // it will count what would be deleted without actually deleting anything,
 // and return a DryRunResult. If dryRun is false, it performs the sync normally
 // and returns nil.
-func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *DryRunResult {
+func (lsw *LibrarySyncWorker) syncLibrary(ctx context.Context, dryRun bool) *DryRunResult {
 	startTime := time.Now()
 	cfg := lsw.configGetter()
 	slog.InfoContext(ctx, "Starting library sync")
 
 	// Determine mount paths for symlink updates
 	var oldMountPath, newMountPath string
-	if lsw.configManager != nil && lsw.configManager.NeedsLibrarySync() && !dryRun {
+	if !lsw.observationRetainHistory && lsw.configManager != nil &&
+		lsw.configManager.NeedsLibrarySync() && !dryRun {
 		oldMountPath = lsw.configManager.GetPreviousMountPath()
 		newMountPath = cfg.MountPath
 		slog.InfoContext(ctx, "Will update symlinks during filesystem walk",
@@ -559,7 +804,8 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 	totalFilesFound := len(libraryFiles.Symlinks) + len(libraryFiles.StrmFiles) +
 		len(importDirFiles.Symlinks) + len(importDirFiles.StrmFiles)
 
-	shouldCleanup := cfg.Health.CleanupOrphanedMetadata != nil && *cfg.Health.CleanupOrphanedMetadata
+	shouldCleanup := !lsw.observationRetainHistory &&
+		cfg.Health.CleanupOrphanedMetadata != nil && *cfg.Health.CleanupOrphanedMetadata
 	if shouldCleanup && totalFilesFound == 0 && len(metadataFiles) > 0 {
 		slog.WarnContext(ctx, "Library scan returned zero files while metadata exists. Possible mount failure? Aborting cleanup for safety.",
 			"metadata_count", len(metadataFiles))
@@ -618,39 +864,8 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 
 	// Find files to add (in filesystem but not in database)
 	// Collect results via channel to avoid large slice allocations and lock contention
-	filesToAddChan := make(chan database.AutomaticHealthCheckRecord, 100)
-	var totalAdded int
-
-	// Start a goroutine to process results from the channel in batches to save RAM
-	done := make(chan struct{})
-	go func() {
-		const batchSize = 1000
-		batch := make([]database.AutomaticHealthCheckRecord, 0, batchSize)
-
-		flushBatch := func() {
-			if len(batch) == 0 {
-				return
-			}
-			if !dryRun {
-				if err := lsw.healthRepo.BatchAddAutomaticHealthChecks(ctx, batch); err != nil {
-					slog.ErrorContext(ctx, "Failed to batch add automatic health checks",
-						"count", len(batch),
-						"error", err)
-				}
-			}
-			totalAdded += len(batch)
-			batch = batch[:0]
-		}
-
-		for record := range filesToAddChan {
-			batch = append(batch, record)
-			if len(batch) >= batchSize {
-				flushBatch()
-			}
-		}
-		flushBatch()
-		close(done)
-	}()
+	consumer := newDiscoveryBatchConsumer(ctx, 1000, dryRun, lsw.upsertDiscoveredHealthRecords)
+	filesToAddChan := consumer.Records()
 
 	concurrency := cfg.GetLibrarySyncConcurrency()
 
@@ -661,7 +876,7 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 		select {
 		case <-ctx.Done():
 			p.Wait()
-			close(filesToAddChan)
+			consumer.CloseAndWait()
 			return nil
 		default:
 		}
@@ -742,11 +957,12 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 						"mount_relative_path", path,
 						"error", err)
 
-					// Register as corrupted so HealthWorker can pick it up and trigger repair
-					// Even if libraryPath is nil, we want to track this metadata corruption
-					regErr := lsw.healthRepo.RegisterCorruptedFile(ctx, path, libraryPath, err.Error())
-					if regErr != nil {
-						slog.ErrorContext(ctx, "Failed to register corrupted file", "path", path, "error", regErr)
+					if !lsw.observationRetainHistory {
+						// Cleanup-capable legacy mode retains its historical repair handoff.
+						regErr := lsw.healthRepo.RegisterCorruptedFile(ctx, path, libraryPath, err.Error())
+						if regErr != nil {
+							slog.ErrorContext(ctx, "Failed to register corrupted file", "path", path, "error", regErr)
+						}
 					}
 					return
 				}
@@ -767,8 +983,8 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 
 	// Wait for all workers to complete and close results channel
 	p.Wait()
-	close(filesToAddChan)
-	<-done
+	consumer.CloseAndWait()
+	totalAdded := consumer.Added()
 
 	// Two-pass soft delete for orphaned metadata files
 	// Only delete metadata if it was orphaned in BOTH the current AND previous sync run.
@@ -850,7 +1066,7 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 	}
 
 	// If cleanup was disabled (e.g. by ratio guard), clear the pending metadata set
-	if !shouldCleanup {
+	if !shouldCleanup && !lsw.observationRetainHistory {
 		_ = lsw.healthRepo.UpdateSystemState(ctx, pendingMetaDeletionKey, "")
 	}
 
@@ -980,7 +1196,7 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 	}
 
 	// If cleanup was disabled, clear the pending library set
-	if !shouldCleanup {
+	if !shouldCleanup && !lsw.observationRetainHistory {
 		_ = lsw.healthRepo.UpdateSystemState(ctx, pendingLibraryDeletionKey, "")
 	}
 
@@ -991,7 +1207,10 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 	if !shouldCleanup {
 		effectiveFilesInLibrary = nil
 	}
-	filesToDelete := lsw.findFilesToDelete(ctx, dbRecords, metaFileSet, effectiveFilesInLibrary)
+	var filesToDelete []string
+	if !lsw.observationRetainHistory {
+		filesToDelete = lsw.findFilesToDelete(ctx, dbRecords, metaFileSet, effectiveFilesInLibrary)
+	}
 
 	// Perform batch operations for deletions (additions were already streamed)
 	dbCounts := lsw.syncDatabaseRecords(ctx, nil, filesToDelete, dryRun)
@@ -1009,7 +1228,8 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 
 	// Return dry run results or record sync results
 	if dryRun {
-		wouldCleanup := cfg.Health.CleanupOrphanedMetadata != nil && *cfg.Health.CleanupOrphanedMetadata
+		wouldCleanup := !lsw.observationRetainHistory &&
+			cfg.Health.CleanupOrphanedMetadata != nil && *cfg.Health.CleanupOrphanedMetadata
 		return &DryRunResult{
 			OrphanedMetadataCount:  metadataDeletedCount,
 			OrphanedLibraryFiles:   libraryFilesDeletedCount,
@@ -1117,16 +1337,20 @@ func (lsw *LibrarySyncWorker) processMetadataForSync(
 	releaseDate := fileMeta.ReleaseDate
 	if releaseDate == 0 {
 		releaseDate = fileMeta.CreatedAt
-		// Update metadata file with the CreatedAt as release date
-		fileMeta.ReleaseDate = releaseDate
-		if writeErr := lsw.metadataService.WriteFileMetadata(path, fileMeta); writeErr != nil {
-			slog.ErrorContext(ctx, "Failed to update metadata with release date",
-				"path", path,
-				"error", writeErr)
-		} else {
-			slog.InfoContext(ctx, "Set release date from CreatedAt",
-				"path", path,
-				"release_date", time.Unix(releaseDate, 0))
+		// Observation discovery is read-only with respect to visible metadata.
+		// It can project CreatedAt into SQL scheduling state without rewriting a
+		// file that may currently be fenced by import admission.
+		if !lsw.observationRetainHistory {
+			fileMeta.ReleaseDate = releaseDate
+			if writeErr := lsw.metadataService.WriteFileMetadata(path, fileMeta); writeErr != nil {
+				slog.ErrorContext(ctx, "Failed to update metadata with release date",
+					"path", path,
+					"error", writeErr)
+			} else {
+				slog.InfoContext(ctx, "Set release date from CreatedAt",
+					"path", path,
+					"release_date", time.Unix(releaseDate, 0))
+			}
 		}
 	}
 
@@ -1748,6 +1972,7 @@ func (lsw *LibrarySyncWorker) syncMetadataOnly(ctx context.Context, startTime ti
 	for mountRelativePath := range metaFileSet {
 		select {
 		case <-ctx.Done():
+			p.Wait()
 			return nil
 		default:
 		}
@@ -1766,10 +1991,11 @@ func (lsw *LibrarySyncWorker) syncMetadataOnly(ctx context.Context, startTime ti
 						"mount_relative_path", path,
 						"error", err)
 
-					// Register as corrupted so HealthWorker can pick it up and trigger repair
-					regErr := lsw.healthRepo.RegisterCorruptedFile(ctx, path, nil, err.Error())
-					if regErr != nil {
-						slog.ErrorContext(ctx, "Failed to register corrupted file", "path", path, "error", regErr)
+					if !lsw.observationRetainHistory {
+						regErr := lsw.healthRepo.RegisterCorruptedFile(ctx, path, nil, err.Error())
+						if regErr != nil {
+							slog.ErrorContext(ctx, "Failed to register corrupted file", "path", path, "error", regErr)
+						}
 					}
 					return
 				}
@@ -1792,14 +2018,18 @@ func (lsw *LibrarySyncWorker) syncMetadataOnly(ctx context.Context, startTime ti
 
 	// Find files to delete (in database but not in filesystem)
 	// Pass nil for filesInUse since metadata-only sync doesn't check library usage
-	filesToDelete := lsw.findFilesToDelete(ctx, dbRecords, metaFileSet, nil)
+	var filesToDelete []string
+	if !lsw.observationRetainHistory {
+		filesToDelete = lsw.findFilesToDelete(ctx, dbRecords, metaFileSet, nil)
+	}
 
 	// Perform batch operations
 	dbCounts := lsw.syncDatabaseRecords(ctx, filesToAdd, filesToDelete, dryRun)
 
 	// Return dry run results or record sync results
 	if dryRun {
-		wouldCleanup := cfg.Health.CleanupOrphanedMetadata != nil && *cfg.Health.CleanupOrphanedMetadata
+		wouldCleanup := !lsw.observationRetainHistory &&
+			cfg.Health.CleanupOrphanedMetadata != nil && *cfg.Health.CleanupOrphanedMetadata
 		return &DryRunResult{
 			OrphanedMetadataCount:  0, // No orphaned metadata in NONE strategy
 			OrphanedLibraryFiles:   0, // No library files in NONE strategy

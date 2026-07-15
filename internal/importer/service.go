@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -190,13 +191,24 @@ type Service struct {
 	userRepo        *database.UserRepository      // User repository for API key lookup
 	poolManager     pool.Manager                  // Pool manager — used to push admission caps on config change
 	log             *slog.Logger
+	// PR5 final-layout admission is deliberately additive to NewService's
+	// public constructor. The state repository is shared by the metadata gate
+	// and the restart resumer; the narrow interface keeps resumer tests
+	// deterministic.
+	durableImportStateRepository  *database.HealthStateRepository
+	durableImportRepository       dueImportValidationRepository
+	durableImportRollbackJournal  *durableImportRollbackJournal
+	durableImportAdmissionEnabled bool
 
 	// Runtime state
-	mu      sync.RWMutex
-	running bool
-	paused  bool
-	ctx     context.Context
-	cancel  context.CancelFunc
+	// lifecycleMu preserves Start/Stop serialization while durable startup
+	// recovery runs outside mu (recovery itself needs to read service state).
+	lifecycleMu sync.Mutex
+	mu          sync.RWMutex
+	running     bool
+	paused      bool
+	ctx         context.Context
+	cancel      context.CancelFunc
 
 	// Cancellation tracking for processing items
 	cancelFuncs map[int64]context.CancelFunc
@@ -258,6 +270,14 @@ func NewService(config ServiceConfig, metadataService *metadata.MetadataService,
 		paused:          false,
 	}
 
+	// Activate PR5 admission whenever at least one provider is enabled. Empty-
+	// provider installations retain their historical ability to start and be
+	// configured later; the config-change handler enables the gate at that time.
+	if err := service.configureDurableImportAdmission(configGetter()); err != nil {
+		cancel()
+		return nil, err
+	}
+
 	// Push the initial admission cap to the pool so imports are gated from the
 	// start. Zero keeps the controller disabled, matching prior behaviour.
 	if poolManager != nil && configGetter != nil {
@@ -308,12 +328,15 @@ func (s *Service) AddImportHistory(ctx context.Context, history *database.Import
 
 // Start starts the NZB import service (queue workers only, manual scanning available via API)
 func (s *Service) Start(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 
+	s.mu.Lock()
 	if s.running {
+		s.mu.Unlock()
 		return fmt.Errorf("service is already started")
 	}
+	s.mu.Unlock()
 
 	// Update database connection pool to match worker count
 	// This prevents connection starvation when multiple workers try to claim items
@@ -321,6 +344,11 @@ func (s *Service) Start(ctx context.Context) error {
 	s.log.InfoContext(ctx, "Updated database connection pool",
 		"workers", s.config.Workers,
 		"max_connections", s.config.Workers+4)
+
+	if err := s.recoverDurableImportRollbackJournals(ctx); err != nil {
+		s.log.ErrorContext(ctx, "Failed to recover durable import rollback state")
+		return fmt.Errorf("failed to recover durable import rollback state: %w", err)
+	}
 
 	// Reset any stale queue items from processing back to pending
 	if err := s.database.Repository.ResetStaleItems(ctx); err != nil {
@@ -345,7 +373,14 @@ func (s *Service) Start(ctx context.Context) error {
 	// Start background sweeper for grabbed indexers cache
 	go s.runGrabbedIndexerSweeper(s.ctx)
 
+	// Resume durable 30-second confirmation holds, including rows left paused
+	// by a prior process. The conditional queue transition prevents terminal
+	// resurrection when duplicate or stale pollers observe the same row.
+	go s.runDurableImportValidationResumer(s.ctx)
+
+	s.mu.Lock()
 	s.running = true
+	s.mu.Unlock()
 	s.log.InfoContext(ctx, fmt.Sprintf("NZB import service started successfully with %d workers", s.config.Workers))
 
 	return nil
@@ -353,6 +388,26 @@ func (s *Service) Start(ctx context.Context) error {
 
 // ProcessItem implements queue.ItemProcessor - processes a single queue item
 func (s *Service) ProcessItem(ctx context.Context, item *database.ImportQueueItem) (string, error) {
+	s.mu.RLock()
+	durableAdmissionEnabled := s.durableImportAdmissionEnabled
+	s.mu.RUnlock()
+	if durableAdmissionEnabled {
+		if item != nil && item.ErrorMessage != nil &&
+			*item.ErrorMessage == durableTerminalRollbackDueMarker {
+			if err := s.cleanupTerminalImportArtifacts(ctx, item.ID); err != nil {
+				retryAt := time.Now().UTC().Add(durablePrelayoutConfirmationDelay)
+				return "", &durableImportHoldError{
+					retryAt: &retryAt, resumeRequired: true, terminalRollback: true,
+				}
+			}
+			return "", &durableImportRejectedError{}
+		}
+		reusableLayouts, err := s.durableImportReusableLayouts(ctx, item.ID)
+		if err != nil {
+			return "", &durableImportHoldError{resumeRequired: true}
+		}
+		ctx = withDurableImportReusableLayoutBindings(ctx, item.ID, reusableLayouts)
+	}
 	resultPath, writtenPaths, err := s.processNzbItem(ctx, item)
 	// Always store written paths so HandleFailure can clean them up on error.
 	s.writtenPathsCache.Store(item.ID, writtenPaths)
@@ -370,10 +425,49 @@ func (s *Service) HandleSuccess(ctx context.Context, item *database.ImportQueueI
 	return s.handleProcessingSuccess(ctx, item, resultingPath, writtenPaths)
 }
 
+func (s *Service) durableSuccessFinalizationError(err error) error {
+	if err == nil || s == nil {
+		return err
+	}
+	s.mu.RLock()
+	enabled := s.durableImportAdmissionEnabled
+	s.mu.RUnlock()
+	if !enabled {
+		return err
+	}
+	retryAt := time.Now().UTC().Add(durablePrelayoutConfirmationDelay)
+	return &durableImportHoldError{
+		retryAt: &retryAt, resumeRequired: true, successFinalization: true,
+	}
+}
+
 // HandleFailure implements queue.ItemProcessor - handles failed processing
 func (s *Service) HandleFailure(ctx context.Context, item *database.ImportQueueItem, err error) {
-	if paths, ok := s.writtenPathsCache.LoadAndDelete(item.ID); ok {
-		s.cleanupWrittenPaths(ctx, item.ID, paths.([]string))
+	var prelayout *durablePrelayoutValidationError
+	if errors.As(err, &prelayout) && s.handleDurablePrelayoutFailure(ctx, item, prelayout) {
+		return
+	}
+	var hold *durableImportHoldError
+	if errors.As(err, &hold) {
+		s.handleDurableImportHold(ctx, item, hold)
+		return
+	}
+	if markErr := s.markDurableTerminalRollback(ctx, item); markErr != nil {
+		retryAt := time.Now().UTC().Add(durablePrelayoutConfirmationDelay)
+		s.handleDurableImportHold(ctx, item, &durableImportHoldError{
+			retryAt: &retryAt, resumeRequired: true, terminalRollback: true,
+		})
+		return
+	}
+	if cleanupErr := s.cleanupTerminalImportArtifacts(ctx, item.ID); cleanupErr != nil {
+		// Keep metadata visible while its durable revision is still active. The
+		// bounded retry can reconstruct accepted paths from the durable binding;
+		// no repository detail is copied into the queue failure field.
+		retryAt := time.Now().UTC().Add(durablePrelayoutConfirmationDelay)
+		s.handleDurableImportHold(ctx, item, &durableImportHoldError{
+			retryAt: &retryAt, resumeRequired: true, terminalRollback: true,
+		})
+		return
 	}
 	s.handleProcessingFailure(ctx, item, err)
 }
@@ -436,11 +530,18 @@ func (s *Service) RegisterConfigChangeHandler(configManager any) {
 			s.log.InfoContext(s.ctx, "Import admission cap updated",
 				"max_concurrent_imports", cap)
 		}
+
+		if err := s.configureDurableImportAdmission(newConfig); err != nil {
+			s.log.ErrorContext(s.ctx, "Failed to update durable import admission")
+		}
 	})
 }
 
 // Stop stops the NZB import service and all queue workers
 func (s *Service) Stop(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	s.mu.Lock()
 
 	if !s.running {
@@ -1184,7 +1285,7 @@ func (s *Service) handleProcessingSuccess(ctx context.Context, item *database.Im
 	result, err := s.postProcessor.HandleSuccess(ctx, item, resultingPath, writtenPaths)
 	if err != nil {
 		s.log.ErrorContext(ctx, "Post-processing failed", "queue_id", item.ID, "error", err)
-		return err
+		return s.durableSuccessFinalizationError(err)
 	}
 
 	// Log any non-fatal errors from post-processing
@@ -1199,7 +1300,14 @@ func (s *Service) handleProcessingSuccess(ctx context.Context, item *database.Im
 	// Mark as completed in queue database
 	if err := s.database.Repository.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusCompleted, nil); err != nil {
 		s.log.ErrorContext(ctx, "Failed to mark item as completed", "queue_id", item.ID, "error", err)
-		return err
+		return s.durableSuccessFinalizationError(err)
+	}
+	// Queue completion fixes the journal direction to commit. If private-state
+	// cleanup is interrupted, startup retries it idempotently; never turn an
+	// already-completed import into a failure/rollback because cleanup storage
+	// was temporarily unavailable.
+	if err := s.commitDurableImportArtifacts(ctx, item.ID); err != nil && s.log != nil {
+		s.log.ErrorContext(ctx, "Failed to finalize durable import artifacts", "queue_id", item.ID)
 	}
 
 	// Delete the on-disk NZB — the .nzbz store can regenerate it on demand.
@@ -1242,6 +1350,15 @@ func (s *Service) OnItemClaimed(ctx context.Context, item *database.ImportQueueI
 // along with any health records already scheduled for them.
 // Paths prefixed with "DIR:" indicate a whole directory should be removed; others are individual files.
 func (s *Service) cleanupWrittenPaths(ctx context.Context, itemID int64, paths []string) {
+	s.cleanupWrittenPathsWithHealth(ctx, itemID, paths, true)
+}
+
+func (s *Service) cleanupWrittenPathsWithHealth(
+	ctx context.Context,
+	itemID int64,
+	paths []string,
+	cleanupHealth bool,
+) {
 	for _, p := range paths {
 		if after, ok := strings.CutPrefix(p, "DIR:"); ok {
 			dirPath := after
@@ -1255,7 +1372,9 @@ func (s *Service) cleanupWrittenPaths(ctx context.Context, itemID int64, paths [
 					"queue_id", itemID,
 					"dir", dirPath)
 			}
-			s.cleanupHealthRecords(ctx, itemID, dirPath)
+			if cleanupHealth {
+				s.cleanupHealthRecords(ctx, itemID, dirPath)
+			}
 		} else {
 			if delErr := s.metadataService.DeleteFileMetadata(p); delErr != nil {
 				s.log.WarnContext(ctx, "Failed to clean up metadata file after import failure",
@@ -1267,7 +1386,9 @@ func (s *Service) cleanupWrittenPaths(ctx context.Context, itemID int64, paths [
 					"queue_id", itemID,
 					"path", p)
 			}
-			s.cleanupHealthRecords(ctx, itemID, p)
+			if cleanupHealth {
+				s.cleanupHealthRecords(ctx, itemID, p)
+			}
 		}
 	}
 }
@@ -1539,17 +1660,17 @@ func (s *Service) ProcessItemInBackground(ctx context.Context, itemID int64) {
 			s.cancelMu.Unlock()
 		}()
 
-		// Process the NZB file using cancellable context
-		resultingPath, writtenPaths, processingErr := s.processNzbItem(itemCtx, item)
+		// Use the same lifecycle entry points as queue workers so durable
+		// pre-layout and final-layout holds are parked without rollback.
+		resultingPath, processingErr := s.ProcessItem(itemCtx, item)
 
 		// Update queue database with results
 		if processingErr != nil {
-			// Clean up any metadata files written before the failure
-			s.cleanupWrittenPaths(ctx, item.ID, writtenPaths)
-			s.handleProcessingFailure(ctx, item, processingErr)
+			s.HandleFailure(ctx, item, processingErr)
 		} else {
-			// Handle success (storage path, VFS notification, symlinks, status update)
-			s.handleProcessingSuccess(ctx, item, resultingPath, writtenPaths)
+			if successErr := s.HandleSuccess(ctx, item, resultingPath); successErr != nil {
+				s.HandleFailure(ctx, item, successErr)
+			}
 		}
 	}()
 }
@@ -1849,4 +1970,3 @@ func joinPathsMergingOverlap(parent, child string) string {
 	}
 	return result
 }
-

@@ -2,16 +2,19 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-pkgz/auth/v2/token"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
 	fLogger "github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/google/uuid"
 	"github.com/javi11/altmount/internal/api"
 	"github.com/javi11/altmount/internal/arrs"
 	"github.com/javi11/altmount/internal/auth"
@@ -34,6 +37,7 @@ import (
 type repositorySet struct {
 	MainRepo   *database.Repository
 	HealthRepo *database.HealthRepository
+	StateRepo  *database.HealthStateRepository
 	UserRepo   *database.UserRepository
 }
 
@@ -210,8 +214,92 @@ func setupRepositories(ctx context.Context, db *database.DB) *repositorySet {
 	return &repositorySet{
 		MainRepo:   database.NewRepository(dbConn, d),
 		HealthRepo: database.NewHealthRepository(dbConn, d),
+		StateRepo:  database.NewHealthStateRepository(dbConn, d),
 		UserRepo:   database.NewUserRepository(dbConn, d),
 	}
+}
+
+// reconcileHealthProviderConfig gives legacy providers without a configured
+// identity the UUID issued (or unambiguously relinked) by the durable registry.
+// It must run before the NNTP pool is built so transport evidence itself uses
+// the durable ID rather than an endpoint/account-derived fallback.
+func reconcileHealthProviderConfig(
+	ctx context.Context,
+	cfg *config.Config,
+	stateRepo *database.HealthStateRepository,
+	configManager *config.Manager,
+) (*config.Config, error) {
+	if cfg == nil || stateRepo == nil || configManager == nil {
+		return nil, fmt.Errorf("provider registry dependencies are incomplete")
+	}
+
+	next := cfg.DeepCopy()
+	activeIndexes := make([]int, 0, len(next.Providers))
+	specs := make([]database.ProviderSpec, 0, len(next.Providers))
+	changed := false
+	for index := range next.Providers {
+		provider := &next.Providers[index]
+		trimmedID := strings.TrimSpace(provider.ID)
+		if provider.ID != trimmedID {
+			provider.ID = trimmedID
+			changed = true
+		}
+		if provider.Enabled == nil || !*provider.Enabled {
+			continue
+		}
+		role := database.ProviderRolePrimary
+		if provider.IsBackupProvider != nil && *provider.IsBackupProvider {
+			role = database.ProviderRoleBackup
+		}
+		displayName := strings.TrimSpace(provider.Name)
+		if displayName == "" {
+			displayName = strings.TrimSpace(provider.Host)
+		}
+		activeIndexes = append(activeIndexes, index)
+		specs = append(specs, database.ProviderSpec{
+			StableID: provider.ID, DisplayName: displayName,
+			Endpoint: provider.Host, Port: provider.Port, Account: provider.Username,
+			Role: role, Order: len(specs),
+		})
+	}
+
+	registered, err := stateRepo.ReconcileProviders(ctx, specs)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile durable provider registry: %w", err)
+	}
+	if len(registered) != len(activeIndexes) {
+		return nil, fmt.Errorf("durable provider registry returned an incomplete active set")
+	}
+	for offset, index := range activeIndexes {
+		if next.Providers[index].ID != "" {
+			continue
+		}
+		if registered[offset].ID == "" {
+			return nil, fmt.Errorf("durable provider registry returned an empty identity")
+		}
+		next.Providers[index].ID = registered[offset].ID
+		changed = true
+	}
+	for index := range next.Providers {
+		if next.Providers[index].ID == "" {
+			// Disabled providers have no active registry row to relink. Assign the
+			// same UUID form now so enabling them cannot create endpoint-derived
+			// transport evidence.
+			next.Providers[index].ID = uuid.NewString()
+			changed = true
+		}
+	}
+	if !changed {
+		return cfg, nil
+	}
+	if err := configManager.UpdateConfig(next); err != nil {
+		return nil, fmt.Errorf("install durable provider identities: %w", err)
+	}
+	if err := configManager.SaveConfig(); err != nil {
+		_ = configManager.UpdateConfig(cfg)
+		return nil, fmt.Errorf("persist durable provider identities: %w", err)
+	}
+	return next, nil
 }
 
 // setupAuthService creates and initializes the authentication service.
@@ -294,6 +382,10 @@ func setupAPIServer(
 		cacheSource,
 	)
 
+	// The durable repository must be installed before the server can receive
+	// requests. Routes retain the Server pointer, but wiring it here also keeps
+	// setup order explicit and independently testable.
+	apiServer.SetHealthRunRepository(repos.StateRepo)
 	apiServer.SetupRoutes(app)
 
 	// Register RClone handlers
@@ -369,68 +461,293 @@ func setupWebDAV(
 	return webdavHandler, nil
 }
 
-// startHealthWorker creates and starts the health monitoring worker
-func startHealthWorker(
+// observationWorkerOwner is stable for this process but unique across
+// processes sharing a database. AcquireRunLease permits an existing owner to
+// renew an unexpired lease, so a compile-time owner would let two replicas
+// unnecessarily fence each other.
+var observationWorkerOwner = "altmount-health-observation-" + uuid.NewString()
+
+type observationServiceLifecycle interface {
+	Start(context.Context) error
+	StopAndWait(context.Context) error
+}
+
+type librarySyncLifecycle interface {
+	StartLibrarySyncChecked(context.Context) error
+	StopAndWait(context.Context) error
+	IsRunning() bool
+}
+
+// healthObservationRuntime owns the PR5 observation-mode lifecycle. The
+// legacy HealthWorker is intentionally absent: it can repair or delete after
+// a check and therefore must not be started or dynamically re-enabled while
+// observation mode is active.
+type healthObservationRuntime struct {
+	service observationServiceLifecycle
+	library librarySyncLifecycle
+
+	mu      sync.Mutex
+	enabled bool
+}
+
+func (r *healthObservationRuntime) setEnabled(ctx context.Context, enabled bool) error {
+	if r == nil || r.service == nil {
+		return fmt.Errorf("health observation runtime is incomplete")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Enabled idempotence needs no work. Disabled idempotence still runs the
+	// join path: a prior timed-out disable deliberately cleared the logical
+	// flag while the canceled service/discovery generation retained ownership.
+	if r.enabled == enabled && enabled {
+		return nil
+	}
+	if enabled {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// A previous disable can time out while the canceled discovery
+		// generation still owns its goroutine. Join that residual generation
+		// before starting any part of the replacement runtime.
+		if r.library != nil {
+			joinCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			joinErr := r.library.StopAndWait(joinCtx)
+			cancel()
+			if joinErr != nil {
+				return fmt.Errorf("join residual observation discovery: %w", joinErr)
+			}
+		}
+		// The service has the same generation ownership rule as discovery.
+		// StopAndWait is a no-op for the initial stopped state, and joins a
+		// residual stopping generation after an earlier disable timed out.
+		joinCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		joinErr := r.service.StopAndWait(joinCtx)
+		cancel()
+		if joinErr != nil {
+			return fmt.Errorf("join residual observation service: %w", joinErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.service.Start(ctx); err != nil {
+			return err
+		}
+		if r.library != nil {
+			if err := r.library.StartLibrarySyncChecked(ctx); err != nil {
+				rollbackCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				rollbackErr := r.service.StopAndWait(rollbackCtx)
+				cancel()
+				if rollbackErr != nil {
+					rollbackErr = fmt.Errorf("rollback observation service: %w", rollbackErr)
+				}
+				return errors.Join(
+					fmt.Errorf("start observation discovery: %w", err),
+					rollbackErr,
+				)
+			}
+		}
+		r.enabled = true
+		return nil
+	}
+
+	stopBase := ctx
+	if stopBase.Err() != nil {
+		stopBase = context.Background()
+	}
+	stopCtx, cancel := context.WithTimeout(stopBase, 30*time.Second)
+	defer cancel()
+	var stopErrors []error
+	if r.library != nil {
+		if err := r.library.StopAndWait(stopCtx); err != nil {
+			stopErrors = append(stopErrors, fmt.Errorf("stop observation discovery: %w", err))
+		}
+	}
+	if err := r.service.StopAndWait(stopCtx); err != nil {
+		stopErrors = append(stopErrors, fmt.Errorf("stop observation service: %w", err))
+	}
+	r.enabled = false
+	return errors.Join(stopErrors...)
+}
+
+func (r *healthObservationRuntime) stop(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	return r.setEnabled(ctx, false)
+}
+
+func (r *healthObservationRuntime) librarySyncWorker() *health.LibrarySyncWorker {
+	if r == nil {
+		return nil
+	}
+	worker, _ := r.library.(*health.LibrarySyncWorker)
+	return worker
+}
+
+func (r *healthObservationRuntime) observationService() *health.ObservationService {
+	if r == nil {
+		return nil
+	}
+	service, _ := r.service.(*health.ObservationService)
+	return service
+}
+
+// observationServiceConfig maps the existing bounded health settings onto
+// the PR5 observation engine. Provider configuration remains live through the
+// ConfigGetter; the values captured here require a process restart to change.
+func observationServiceConfig(cfg *config.Config) health.ObservationServiceConfig {
+	libraryDir := ""
+	if cfg != nil && cfg.Health.LibraryDir != nil {
+		libraryDir = *cfg.Health.LibraryDir
+	}
+	if cfg == nil {
+		cfg = config.DefaultConfig()
+	}
+	wireCapacity := cfg.GetMaxConnectionsForHealthChecks()
+	return health.ObservationServiceConfig{
+		Owner:                   observationWorkerOwner,
+		WorkerCount:             cfg.GetMaxConcurrentJobs(),
+		GlobalConcurrency:       wireCapacity,
+		PerProviderConcurrency:  wireCapacity,
+		LeaseTTL:                time.Minute,
+		ChunkSize:               256,
+		ConfirmationDelay:       cfg.GetGapConfirmationMinimumDelay(),
+		PlaybackRetryDelay:      time.Second,
+		PauseDuringPlayback:     cfg.GetPauseHealthDuringPlayback(),
+		STATConcurrency:         wireCapacity,
+		PollInterval:            250 * time.Millisecond,
+		ScheduleInterval:        cfg.GetCheckInterval(),
+		ScheduleBatchSize:       cfg.GetCheckBatchSize(),
+		HealthStrategy:          string(cfg.Import.ImportStrategy),
+		LibraryDir:              libraryDir,
+		MaxRetries:              cfg.GetMaxRetries(),
+		OrdinaryRecheckInterval: 24 * time.Hour,
+	}
+}
+
+// observationLibraryConfigGetter preserves discovery while preventing the
+// legacy library worker from deleting metadata/library content or enabling
+// repair side effects during PR5 observation mode. Passing no ConfigManager to
+// the worker separately prevents mount-change symlink rewrites.
+func observationLibraryConfigGetter(getter config.ConfigGetter) config.ConfigGetter {
+	return func() *config.Config {
+		if getter == nil {
+			return config.DefaultConfig()
+		}
+		current := getter()
+		if current == nil {
+			return config.DefaultConfig()
+		}
+		safe := current.DeepCopy()
+		disabled := false
+		safe.Health.CleanupOrphanedMetadata = &disabled
+		safe.Health.Repair.Enabled = &disabled
+		safe.Health.CorruptionAction = "repair"
+		return safe
+	}
+}
+
+func observationRuntimeRestartRequired(oldConfig, newConfig *config.Config) bool {
+	if oldConfig == nil || newConfig == nil {
+		return false
+	}
+	oldSettings := observationServiceConfig(oldConfig)
+	newSettings := observationServiceConfig(newConfig)
+	return oldSettings.WorkerCount != newSettings.WorkerCount ||
+		oldSettings.GlobalConcurrency != newSettings.GlobalConcurrency ||
+		oldSettings.ConfirmationDelay != newSettings.ConfirmationDelay ||
+		oldSettings.PauseDuringPlayback != newSettings.PauseDuringPlayback ||
+		oldSettings.STATConcurrency != newSettings.STATConcurrency ||
+		oldSettings.ScheduleInterval != newSettings.ScheduleInterval ||
+		oldSettings.ScheduleBatchSize != newSettings.ScheduleBatchSize ||
+		oldSettings.HealthStrategy != newSettings.HealthStrategy ||
+		oldSettings.LibraryDir != newSettings.LibraryDir ||
+		oldSettings.MaxRetries != newSettings.MaxRetries ||
+		oldConfig.Health.LibrarySyncIntervalMinutes != newConfig.Health.LibrarySyncIntervalMinutes
+}
+
+func (r *healthObservationRuntime) registerConfigChangeHandler(
+	ctx context.Context,
+	configManager *config.Manager,
+) {
+	if r == nil || configManager == nil {
+		return
+	}
+	configManager.OnConfigChange(func(oldConfig, newConfig *config.Config) {
+		if observationRuntimeRestartRequired(oldConfig, newConfig) {
+			slog.WarnContext(ctx,
+				"Health observation runtime settings changed; restart required to apply bounded worker settings")
+		}
+		oldEnabled := oldConfig != nil && oldConfig.GetHealthEnabled()
+		newEnabled := newConfig != nil && newConfig.GetHealthEnabled()
+		if oldEnabled == newEnabled {
+			return
+		}
+		if err := r.setEnabled(ctx, newEnabled); err != nil {
+			slog.ErrorContext(ctx, "Failed to transition health observation runtime", "error", err)
+		}
+	})
+}
+
+// initializeHealthObservationRuntime creates and conditionally starts the
+// resumable PR5 observation engine. It has no repair, padding, or deletion
+// dependency.
+func initializeHealthObservationRuntime(
 	ctx context.Context,
 	cfg *config.Config,
+	stateRepo *database.HealthStateRepository,
 	healthRepo *database.HealthRepository,
+	metadataService *metadata.MetadataService,
 	poolManager pool.Manager,
 	configManager *config.Manager,
-	rcloneClient rclonecli.RcloneRcClient,
-	arrsService *arrs.Service,
-	importerService importer.ImportService,
 	broadcaster *progress.ProgressBroadcaster,
 	playbackSource health.PlaybackActivitySource,
-) (*health.HealthWorker, *health.LibrarySyncWorker, error) {
-	// Create metadata service for health worker
-	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
-
-	// Create health checker
-	healthChecker := health.NewHealthChecker(
+) (*healthObservationRuntime, error) {
+	if cfg == nil || stateRepo == nil || healthRepo == nil || metadataService == nil ||
+		poolManager == nil || configManager == nil {
+		return nil, fmt.Errorf("health observation dependencies are incomplete")
+	}
+	if err := stateRepo.SetGapConfirmationMinimumDelay(cfg.GetGapConfirmationMinimumDelay()); err != nil {
+		return nil, fmt.Errorf("configure health gap confirmation delay: %w", err)
+	}
+	service, err := health.NewObservationService(
+		stateRepo,
 		healthRepo,
 		metadataService,
 		poolManager,
 		configManager.GetConfigGetter(),
-		rcloneClient,
+		playbackSource,
+		func(health.ObservationProgress) {
+			if broadcaster != nil {
+				broadcaster.BroadcastHealthChanged()
+			}
+		},
+		observationServiceConfig(cfg),
 	)
-
-	healthWorker := health.NewHealthWorker(
-		healthChecker,
-		healthRepo,
-		metadataService,
-		arrsService,
-		importerService,
-		configManager.GetConfigGetter(),
-		broadcaster,
-	)
-	healthWorker.SetPlaybackActivitySource(playbackSource)
-
-	// Create library sync worker (always create, but only start if enabled)
-	librarySyncWorker := health.NewLibrarySyncWorker(
-		metadataService,
-		healthRepo,
-		configManager.GetConfigGetter(),
-		configManager,
-		rcloneClient,
-	)
-
-	// Only start health system if enabled
-	if cfg.Health.Enabled != nil && *cfg.Health.Enabled {
-		// Start health worker with the main context
-		if err := healthWorker.Start(ctx); err != nil {
-			slog.ErrorContext(ctx, "Failed to start health worker", "error", err)
-			return nil, nil, err
-		}
-
-		// Start library sync worker
-		librarySyncWorker.StartLibrarySync(ctx)
-
-		slog.InfoContext(ctx, "Health system started")
-	} else {
-		slog.InfoContext(ctx, "Health system disabled - no health monitoring or repairs will occur")
+	if err != nil {
+		return nil, fmt.Errorf("create health observation service: %w", err)
 	}
 
-	return healthWorker, librarySyncWorker, nil
+	// Retain metadata/library discovery, but clamp destructive legacy options
+	// off and omit ConfigManager so mount-path changes cannot rewrite symlinks.
+	librarySyncWorker := health.NewObservationLibrarySyncWorker(
+		metadataService,
+		healthRepo,
+		observationLibraryConfigGetter(configManager.GetConfigGetter()),
+	)
+	runtime := &healthObservationRuntime{service: service, library: librarySyncWorker}
+	if err := runtime.setEnabled(ctx, cfg.GetHealthEnabled()); err != nil {
+		return nil, fmt.Errorf("start health observation service: %w", err)
+	}
+	if cfg.GetHealthEnabled() {
+		slog.InfoContext(ctx, "Resumable health observation system started")
+	} else {
+		slog.InfoContext(ctx, "Health observation system disabled")
+	}
+	return runtime, nil
 }
 
 // startMountService starts the RClone mount service if enabled

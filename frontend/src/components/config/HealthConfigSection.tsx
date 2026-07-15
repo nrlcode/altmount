@@ -656,6 +656,27 @@ export function HealthConfigSection({
 									</p>
 								</fieldset>
 								<fieldset className="fieldset">
+									<legend className="fieldset-legend font-semibold">
+										Gap Confirmation Delay (Min)
+									</legend>
+									<input
+										type="number"
+										className="input input-bordered w-full bg-base-100 font-mono text-sm"
+										value={formData.gap_confirmation_delay_minutes ?? 10}
+										disabled={isReadOnly}
+										min={1}
+										onChange={(e) =>
+											handleInputChange(
+												"gap_confirmation_delay_minutes",
+												Number.parseInt(e.target.value, 10) || 10,
+											)
+										}
+									/>
+									<p className="label break-words text-base-content/70 text-xs">
+										Minimum separation between two independent all-provider absence confirmations.
+									</p>
+								</fieldset>
+								<fieldset className="fieldset">
 									<legend className="fieldset-legend font-semibold">Sync Concurrency</legend>
 									<input
 										type="number"

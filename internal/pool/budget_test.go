@@ -61,6 +61,218 @@ func TestImportBudget_BlocksAtCapacityAndWakesOnRelease(t *testing.T) {
 	r2()
 }
 
+func TestImportBudget_WeightedAcquireIsAtomicAndCancelable(t *testing.T) {
+	b := NewImportBudget()
+	b.SetCapacity(4)
+
+	hold, err := b.AcquireN(context.Background(), 3)
+	if err != nil {
+		t.Fatalf("weighted hold: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	blocked := make(chan error, 1)
+	go func() {
+		release, acquireErr := b.AcquireN(ctx, 2)
+		if acquireErr == nil {
+			release()
+		}
+		blocked <- acquireErr
+	}()
+
+	if !waitFor(time.Second, func() bool {
+		b.sem.mu.Lock()
+		defer b.sem.mu.Unlock()
+		return b.sem.inFlight == 3 && len(b.sem.waiters) == 1
+	}) {
+		t.Fatal("weighted waiter was partially granted instead of queued atomically")
+	}
+	select {
+	case err := <-blocked:
+		t.Fatalf("weighted request escaped capacity before release: %v", err)
+	default:
+	}
+
+	hold()
+	select {
+	case err := <-blocked:
+		if err != nil {
+			t.Fatalf("weighted request failed after capacity release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("weighted request did not acquire after release")
+	}
+
+	holdOne, err := b.AcquireN(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("fill weighted budget: %v", err)
+	}
+	canceledCtx, cancelQueued := context.WithCancel(context.Background())
+	canceled := make(chan error, 1)
+	go func() {
+		_, acquireErr := b.AcquireN(canceledCtx, 2)
+		canceled <- acquireErr
+	}()
+	requireQueued := waitFor(time.Second, func() bool {
+		b.sem.mu.Lock()
+		defer b.sem.mu.Unlock()
+		return len(b.sem.waiters) == 1
+	})
+	if !requireQueued {
+		t.Fatal("cancelable weighted waiter was not queued")
+	}
+	cancelQueued()
+	select {
+	case err := <-canceled:
+		if err == nil {
+			t.Fatal("cancelable weighted request returned no error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("weighted request did not observe cancellation")
+	}
+	holdOne()
+}
+
+func TestImportBudget_WeightedAcquireHonorsPlaybackHeadroom(t *testing.T) {
+	source := &stubStreamSource{}
+	b := NewImportBudget()
+	b.SetStreamSource(source)
+	b.SetCapacity(8)
+	source.set(2) // effective capacity is four
+	b.NotifyStreamChange()
+
+	hold, err := b.AcquireN(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("acquire effective playback budget: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	blocked := make(chan error, 1)
+	go func() {
+		_, acquireErr := b.AcquireN(ctx, 1)
+		blocked <- acquireErr
+	}()
+	select {
+	case err := <-blocked:
+		t.Fatalf("weighted work consumed playback headroom: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	if err := <-blocked; err == nil {
+		t.Fatal("blocked playback-headroom request ignored cancellation")
+	}
+	hold()
+}
+
+func TestImportBudget_FlexibleBatchFollowsCapacityShrink(t *testing.T) {
+	b := NewImportBudget()
+	b.SetCapacity(4)
+	hold, err := b.AcquireN(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("fill budget: %v", err)
+	}
+
+	type result struct {
+		release func()
+		granted int
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		release, granted, acquireErr := b.AcquireUpTo(context.Background(), 4)
+		done <- result{release: release, granted: granted, err: acquireErr}
+	}()
+	if !waitFor(time.Second, func() bool {
+		b.sem.mu.Lock()
+		defer b.sem.mu.Unlock()
+		return len(b.sem.waiters) == 1
+	}) {
+		t.Fatal("flexible waiter was not queued")
+	}
+
+	b.SetCapacity(2)
+	hold()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("flexible acquire after shrink: %v", got.err)
+		}
+		if got.granted != 2 {
+			t.Fatalf("granted = %d, want shrunken capacity 2", got.granted)
+		}
+		got.release()
+	case <-time.After(time.Second):
+		t.Fatal("flexible waiter stalled above shrunken capacity")
+	}
+}
+
+func TestImportBudget_FlexibleHeadDoesNotStarveLaterBodyAfterShrink(t *testing.T) {
+	b := NewImportBudget()
+	b.SetCapacity(4)
+	hold, err := b.AcquireN(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("fill budget: %v", err)
+	}
+
+	batchGranted := make(chan int, 1)
+	batchRelease := make(chan func(), 1)
+	go func() {
+		release, granted, acquireErr := b.AcquireUpTo(context.Background(), 4)
+		if acquireErr != nil {
+			batchGranted <- 0
+			return
+		}
+		batchRelease <- release
+		batchGranted <- granted
+	}()
+	if !waitFor(time.Second, func() bool {
+		b.sem.mu.Lock()
+		defer b.sem.mu.Unlock()
+		return len(b.sem.waiters) == 1
+	}) {
+		t.Fatal("flexible batch was not queued")
+	}
+
+	bodyGranted := make(chan func(), 1)
+	go func() {
+		release, acquireErr := b.Acquire(context.Background())
+		if acquireErr == nil {
+			bodyGranted <- release
+		}
+	}()
+	if !waitFor(time.Second, func() bool {
+		b.sem.mu.Lock()
+		defer b.sem.mu.Unlock()
+		return len(b.sem.waiters) == 2
+	}) {
+		t.Fatal("later BODY waiter was not queued")
+	}
+
+	b.SetCapacity(2)
+	hold()
+	if granted := <-batchGranted; granted != 2 {
+		t.Fatalf("batch grant after shrink = %d, want 2", granted)
+	}
+	batchDone := <-batchRelease
+	batchDone()
+	select {
+	case release := <-bodyGranted:
+		release()
+	case <-time.After(time.Second):
+		t.Fatal("later BODY waiter was starved behind resized batch")
+	}
+}
+
+func TestAdaptiveSemaphore_FlexibleCancelUndoesActualDynamicGrant(t *testing.T) {
+	s := adaptiveSemaphore{inFlight: 3}
+	// The request originally wanted four slots, but a capacity change reduced
+	// the atomic grant to two before cancellation won the delivery race.
+	w := &waiter{slots: 2, maxSlots: 4, flexible: true}
+	s.undoGrantedWaiterLocked(w)
+	if s.inFlight != 1 {
+		t.Fatalf("inFlight = %d, want unrelated single slot retained", s.inFlight)
+	}
+}
+
 func TestImportBudget_StreamsShrinkEffectiveCap(t *testing.T) {
 	src := &stubStreamSource{}
 	b := NewImportBudget()

@@ -2,6 +2,8 @@ package metadata
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -9,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -47,6 +50,64 @@ type FileMetadataLite struct {
 	Status     metapb.FileStatus
 }
 
+// MetadataWritePermit finalizes admission only after the metadata file's atomic
+// rename succeeds. A nil permit keeps ordinary callers source-compatible.
+type MetadataWritePermit interface {
+	FinalizeMetadataWrite(context.Context) error
+}
+
+// MetadataVisibleReusePermit allows a validator to finish activation against
+// metadata that an earlier atomic write already made visible. The service
+// still verifies the visible canonical layout before skipping the rewrite, so
+// a stale or damaged file cannot be published from the permit alone.
+type MetadataVisibleReusePermit interface {
+	ReuseVisibleMetadata() bool
+}
+
+// MetadataRollbackJournalPermit is implemented by durable import permits that
+// must retain the first pre-write visibility snapshot until the whole queue is
+// committed or rolled back. The raw bytes are confined to a private
+// filesystem journal; implementations must never log or persist them in SQL.
+type MetadataRollbackJournalPermit interface {
+	JournalPriorMetadata(
+		context.Context,
+		string,
+		[]byte,
+		bool,
+		string,
+		string,
+	) error
+	ValidateMetadataRollbackJournal(context.Context, string) error
+}
+
+// MetadataDurableCandidatePermit prepares queue-scoped candidate identity and
+// exact StoreRef accounting before a durable import makes metadata visible.
+// Ordinary metadata callers do not implement this additive capability and
+// retain the legacy best-effort refcount path.
+type MetadataDurableCandidatePermit interface {
+	DurableCandidateMetadata() bool
+	PrepareCandidateMetadata(context.Context, string, string) error
+}
+
+type MetadataDurablePriorSnapshotPermit interface {
+	PriorMetadataSnapshot(context.Context, string) ([]byte, bool, error)
+}
+
+// MetadataVisibilityState is a credential- and article-identity-free
+// projection used to fence journal rollback/compensation decisions.
+type MetadataVisibilityState struct {
+	Exists            bool
+	LayoutFingerprint string
+	StoreRef          string
+}
+
+// MetadataWriteValidator gates import metadata before it becomes visible and
+// may return a permit that activates durable state only after the atomic write.
+// Implementations must not retain or mutate metadata.
+type MetadataWriteValidator interface {
+	PrepareMetadataWrite(context.Context, string, *metapb.FileMetadata) (MetadataWritePermit, error)
+}
+
 // MetadataService provides low-level read/write operations for metadata files.
 //
 // Only a lightweight metadata projection (liteCache) is kept in memory. The
@@ -67,6 +128,17 @@ type MetadataService struct {
 	// storeRefCounter tracks reference counts for shared NzbStore files.
 	// nil means reference counting is disabled.
 	storeRefCounter StoreRefCounter
+	// writeValidator is optional so non-import callers retain the existing
+	// metadata write behavior. The lock permits safe setup/reconfiguration
+	// while imports are running.
+	writeValidatorMu sync.RWMutex
+	writeValidator   MetadataWriteValidator
+	// metadataWriteStripes serialize the complete capture -> publish ->
+	// finalize/restore sequence for a bounded set of virtual paths. Durable
+	// import activation is path-scoped, so allowing two queues to interleave
+	// those steps could let a failed later writer restore bytes over a
+	// successfully activated earlier writer.
+	metadataWriteStripes [64]sync.Mutex
 }
 
 // NewMetadataService creates a new metadata service
@@ -88,6 +160,14 @@ func (ms *MetadataService) Store() *StoreService {
 // NzbStore files are maintained when metadata is deleted or created.
 func (ms *MetadataService) SetStoreRefCounter(c StoreRefCounter) {
 	ms.storeRefCounter = c
+}
+
+// SetWriteValidator installs the admission gate used by import writes. Passing
+// nil restores the historical behavior for callers that do not use PR5.
+func (ms *MetadataService) SetWriteValidator(validator MetadataWriteValidator) {
+	ms.writeValidatorMu.Lock()
+	defer ms.writeValidatorMu.Unlock()
+	ms.writeValidator = validator
 }
 
 // IncStoreRef increments the reference count for a v3 store file.
@@ -129,21 +209,37 @@ func (ms *MetadataService) truncateFilename(filename string) string {
 	fileExt := filepath.Ext(filename)
 	filename = strings.TrimSuffix(filename, fileExt)
 
-	const maxLen = 250 // Leave room for .meta extension
+	const maxLen = 250 // Leave room for the appended .meta extension.
 
-	if len(filename) <= maxLen {
+	if len(filename)+len(fileExt) <= maxLen {
 		return filename + fileExt
 	}
 
-	// Simply truncate to maxLen
-	return filename[:maxLen] + fileExt
+	// Preserve the original extension while keeping the complete basename
+	// (including that extension) within the metadata filename budget.
+	stemLen := maxLen - len(fileExt)
+	if stemLen < 0 {
+		stemLen = 0
+	}
+	return filename[:stemLen] + fileExt
 }
 
 // WriteFileMetadata writes file metadata to disk
 func (ms *MetadataService) WriteFileMetadata(virtualPath string, metadata *metapb.FileMetadata) error {
+	return ms.writeFileMetadata(virtualPath, metadata, false)
+}
+
+// writeFileMetadata makes file and containing-directory durability part of
+// the durable import publication barrier when durable is true. Legacy callers
+// keep their existing atomic-rename behavior.
+func (ms *MetadataService) writeFileMetadata(
+	virtualPath string,
+	metadata *metapb.FileMetadata,
+	durable bool,
+) error {
 	// Ensure the directory exists
 	metadataDir := filepath.Join(ms.rootPath, filepath.Dir(virtualPath))
-	if err := os.MkdirAll(metadataDir, 0755); err != nil {
+	if err := ensureMetadataDirectory(metadataDir, 0o755, durable); err != nil {
 		return fmt.Errorf("failed to create metadata directory: %w", err)
 	}
 
@@ -192,7 +288,10 @@ func (ms *MetadataService) WriteFileMetadata(virtualPath string, metadata *metap
 
 	// Write atomically using a uniquely-named temporary file so concurrent
 	// writes to the same final path don't race on the same .tmp name.
-	tmpFile, err := os.CreateTemp(metadataDir, "."+truncatedFilename+".*.tmp")
+	// Keep the temporary basename independent of the virtual filename. A final
+	// name at the filesystem limit still needs room for CreateTemp's random
+	// suffix before the atomic rename.
+	tmpFile, err := os.CreateTemp(metadataDir, ".metadata-*.tmp")
 	if err != nil {
 		metadata.NzbdavId = nzbdavId
 		return fmt.Errorf("failed to create temporary metadata file: %w", err)
@@ -204,6 +303,14 @@ func (ms *MetadataService) WriteFileMetadata(virtualPath string, metadata *metap
 		metadata.NzbdavId = nzbdavId
 		return fmt.Errorf("failed to write temporary metadata file: %w", writeErr)
 	}
+	if durable {
+		if syncErr := tmpFile.Sync(); syncErr != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+			metadata.NzbdavId = nzbdavId
+			return fmt.Errorf("failed to sync temporary metadata file: %w", syncErr)
+		}
+	}
 	if closeErr := tmpFile.Close(); closeErr != nil {
 		_ = os.Remove(tmpPath)
 		metadata.NzbdavId = nzbdavId
@@ -214,6 +321,12 @@ func (ms *MetadataService) WriteFileMetadata(virtualPath string, metadata *metap
 		_ = os.Remove(tmpPath)
 		metadata.NzbdavId = nzbdavId
 		return fmt.Errorf("failed to rename metadata file: %w", err)
+	}
+	if durable {
+		if err := syncMetadataDirectoryChain(metadataDir, ms.rootPath); err != nil {
+			metadata.NzbdavId = nzbdavId
+			return fmt.Errorf("failed to sync metadata directory: %w", err)
+		}
 	}
 
 	metadata.NzbdavId = nzbdavId // Restore for in-memory use
@@ -229,6 +342,47 @@ func (ms *MetadataService) WriteFileMetadata(virtualPath string, metadata *metap
 	return nil
 }
 
+// prepareFileMetadataV3 converts one metadata value without publishing it or
+// changing its StoreRef count. Durable imports use this split to prove the
+// conversion is valid before they persist and acquire their candidate intent.
+func prepareFileMetadataV3(
+	metadata *metapb.FileMetadata,
+	index map[string]int64,
+	storeRef string,
+) (*metapb.FileMetadata, error) {
+	m := proto.Clone(metadata).(*metapb.FileMetadata)
+
+	if err := ExpandSharedOuterSources(m); err != nil {
+		return nil, fmt.Errorf("expand shared outer sources: %w", err)
+	}
+
+	m.StoreRef = storeRef
+	m.SourceNzbPath = storeRef
+
+	mainRefs, err := segDataToRefs(m.SegmentData, index)
+	if err != nil {
+		return nil, fmt.Errorf("main segments: %w", err)
+	}
+	m.SegmentRuns, m.SegmentRefs = splitRefs(mainRefs)
+
+	for _, p := range m.Par2Files {
+		refs, err := segDataToRefs(p.SegmentData, index)
+		if err != nil {
+			return nil, fmt.Errorf("par2 segments: %w", err)
+		}
+		p.SegmentRuns, p.SegmentRefs = splitRefs(refs)
+	}
+
+	for _, ns := range m.NestedSources {
+		if ns.SegmentRefs, err = segDataToRefs(ns.Segments, index); err != nil {
+			return nil, fmt.Errorf("nested source segments: %w", err)
+		}
+		ns.SharedOuterSourceIndex = 0
+	}
+	m.SharedOuterSources = nil
+	return m, nil
+}
+
 // WriteFileMetadataV3 writes metadata directly in the v3 store-backed format: it
 // converts the inline SegmentData of the main file, PAR2 files, and nested sources
 // into SegmentRefs/SegmentRuns against the release's flat segment index, points the
@@ -240,40 +394,10 @@ func (ms *MetadataService) WriteFileMetadata(virtualPath string, metadata *metap
 // SharedOuterSources dedup, so it is expanded first (mirroring the read path) before
 // each nested source is converted independently and the dedup dissolved.
 func (ms *MetadataService) WriteFileMetadataV3(ctx context.Context, virtualPath string, metadata *metapb.FileMetadata, index map[string]int64, storeRef string) error {
-	m := proto.Clone(metadata).(*metapb.FileMetadata)
-
-	if err := ExpandSharedOuterSources(m); err != nil {
-		return fmt.Errorf("expand shared outer sources: %w", err)
-	}
-
-	m.StoreRef = storeRef
-	// The raw .nzb is deleted after import; the .nzbz store is the persistent source
-	// of truth (NZBs are regenerated from it). Point source_nzb_path at the store so a
-	// single, real artifact is recorded instead of a path to a now-deleted .nzb file.
-	m.SourceNzbPath = storeRef
-
-	mainRefs, err := segDataToRefs(m.SegmentData, index)
+	m, err := prepareFileMetadataV3(metadata, index, storeRef)
 	if err != nil {
-		return fmt.Errorf("main segments: %w", err)
+		return err
 	}
-	m.SegmentRuns, m.SegmentRefs = splitRefs(mainRefs)
-
-	for _, p := range m.Par2Files {
-		refs, err := segDataToRefs(p.SegmentData, index)
-		if err != nil {
-			return fmt.Errorf("par2 segments: %w", err)
-		}
-		p.SegmentRuns, p.SegmentRefs = splitRefs(refs)
-	}
-
-	// Nested sources are archive-sliced (non-trivial offsets): explicit refs only.
-	for _, ns := range m.NestedSources {
-		if ns.SegmentRefs, err = segDataToRefs(ns.Segments, index); err != nil {
-			return fmt.Errorf("nested source segments: %w", err)
-		}
-		ns.SharedOuterSourceIndex = 0
-	}
-	m.SharedOuterSources = nil
 
 	// WriteFileMetadata's v3 branch (StoreRef set) clears inline SegmentData/
 	// SharedOuterSources/NestedSource.Segments and keeps SegmentRefs/SegmentRuns.
@@ -289,15 +413,449 @@ func (ms *MetadataService) WriteFileMetadataV3(ctx context.Context, virtualPath 
 // problem on one file never blocks the import). With an empty storeRef it writes v1.
 // This is the single entry point import processors should use.
 func (ms *MetadataService) WriteFileMetadataAuto(ctx context.Context, virtualPath string, metadata *metapb.FileMetadata, index map[string]int64, storeRef string) error {
-	if storeRef == "" {
-		return ms.WriteFileMetadata(virtualPath, metadata)
+	stripe := ms.metadataWriteStripe(virtualPath)
+	stripe.Lock()
+	defer stripe.Unlock()
+
+	ms.writeValidatorMu.RLock()
+	validator := ms.writeValidator
+	ms.writeValidatorMu.RUnlock()
+	var permit MetadataWritePermit
+	if validator != nil {
+		var err error
+		permit, err = validator.PrepareMetadataWrite(ctx, virtualPath, metadata)
+		if err != nil {
+			return fmt.Errorf("validate metadata write: %w", err)
+		}
 	}
-	if err := ms.WriteFileMetadataV3(ctx, virtualPath, metadata, index, storeRef); err != nil {
-		slog.WarnContext(ctx, "v3 metadata write failed; writing v1",
-			"path", virtualPath, "error", err)
-		return ms.WriteFileMetadata(virtualPath, metadata)
+	if reusePermit, ok := permit.(MetadataVisibleReusePermit); ok && reusePermit.ReuseVisibleMetadata() {
+		if existing, err := ms.ReadFileMetadata(virtualPath); err == nil &&
+			existing != nil && existing.Status == metapb.FileStatus_FILE_STATUS_HEALTHY &&
+			canonicalLayoutsEqual(existing, metadata) {
+			if journalPermit, journaled := permit.(MetadataRollbackJournalPermit); journaled {
+				if err := journalPermit.ValidateMetadataRollbackJournal(ctx, virtualPath); err != nil {
+					return fmt.Errorf("validate metadata rollback journal: %w", err)
+				}
+			}
+			if durablePermit, durable := permit.(MetadataDurableCandidatePermit); durable &&
+				durablePermit.DurableCandidateMetadata() {
+				if err := durablePermit.PrepareCandidateMetadata(
+					ctx, virtualPath, ms.readStoreRef(ms.metadataPath(virtualPath)),
+				); err != nil {
+					return fmt.Errorf("prepare durable metadata candidate: %w", err)
+				}
+			}
+			if err := permit.FinalizeMetadataWrite(ctx); err != nil {
+				if durablePermit, durable := permit.(MetadataDurableCandidatePermit); durable &&
+					durablePermit.DurableCandidateMetadata() {
+					priorPermit, ok := permit.(MetadataDurablePriorSnapshotPermit)
+					if !ok {
+						return fmt.Errorf("finalize visible metadata write: %w", err)
+					}
+					priorBytes, priorExists, snapshotErr := priorPermit.PriorMetadataSnapshot(
+						ctx, virtualPath,
+					)
+					if snapshotErr != nil {
+						return errors.Join(
+							fmt.Errorf("finalize visible metadata write: %w", err), snapshotErr,
+						)
+					}
+					visibleStoreRef := ms.readStoreRef(ms.metadataPath(virtualPath))
+					if rollbackErr := ms.restoreMetadataVisibility(
+						ctx, virtualPath, priorBytes, priorExists,
+						visibleStoreRef, visibleStoreRef != "", true,
+					); rollbackErr != nil {
+						return errors.Join(
+							fmt.Errorf("finalize visible metadata write: %w", err),
+							fmt.Errorf("restore prior durable metadata: %w", rollbackErr),
+						)
+					}
+					return fmt.Errorf("finalize visible metadata write: %w", err)
+				}
+				visibleStoreRef := ms.readStoreRef(ms.metadataPath(virtualPath))
+				if rollbackErr := ms.restoreMetadataVisibility(
+					ctx, virtualPath, nil, false, visibleStoreRef, visibleStoreRef != "",
+					false,
+				); rollbackErr != nil {
+					return errors.Join(
+						fmt.Errorf("finalize visible metadata write: %w", err),
+						fmt.Errorf("remove unactivated visible metadata: %w", rollbackErr),
+					)
+				}
+				return fmt.Errorf("finalize visible metadata write: %w", err)
+			}
+			return nil
+		}
+	}
+	metadataPath := ms.metadataPath(virtualPath)
+	priorBytes, priorReadErr := os.ReadFile(metadataPath)
+	priorExists := priorReadErr == nil
+	if priorReadErr != nil && !os.IsNotExist(priorReadErr) {
+		return fmt.Errorf("capture metadata visibility before write: %w", priorReadErr)
+	}
+	if journalPermit, journaled := permit.(MetadataRollbackJournalPermit); journaled {
+		priorFingerprint := ""
+		priorStoreRef := ""
+		if priorExists {
+			priorMetadata, readErr := ms.ReadFileMetadata(virtualPath)
+			if readErr != nil || priorMetadata == nil {
+				return fmt.Errorf("resolve prior metadata visibility for rollback")
+			}
+			priorLayout, layoutErr := ResolveCanonicalSegmentLayout(priorMetadata)
+			if layoutErr != nil {
+				return fmt.Errorf("resolve prior metadata layout for rollback")
+			}
+			priorFingerprint = priorLayout.Fingerprint
+			priorStoreRef = ms.readStoreRef(metadataPath)
+		}
+		if err := journalPermit.JournalPriorMetadata(
+			ctx, virtualPath, priorBytes, priorExists, priorFingerprint, priorStoreRef,
+		); err != nil {
+			return fmt.Errorf("prepare metadata rollback journal: %w", err)
+		}
+	}
+
+	var writeErr error
+	wroteV3 := false
+	durablePermit, durableCandidate := permit.(MetadataDurableCandidatePermit)
+	if durableCandidate {
+		durableCandidate = durablePermit.DurableCandidateMetadata()
+	}
+	if durableCandidate {
+		candidateMetadata := metadata
+		candidateStoreRef := ""
+		if storeRef != "" {
+			converted, conversionErr := prepareFileMetadataV3(metadata, index, storeRef)
+			if conversionErr == nil {
+				candidateMetadata = converted
+				candidateStoreRef = storeRef
+				wroteV3 = true
+			}
+		}
+		if err := durablePermit.PrepareCandidateMetadata(ctx, virtualPath, candidateStoreRef); err != nil {
+			return fmt.Errorf("prepare durable metadata candidate: %w", err)
+		}
+		// Once the private candidate intent and its exact +1 exist, an I/O
+		// failure must not silently switch formats. Terminal journal cleanup
+		// owns release of the retained reservation.
+		writeErr = ms.writeFileMetadata(virtualPath, candidateMetadata, true)
+	} else if storeRef == "" {
+		writeErr = ms.WriteFileMetadata(virtualPath, metadata)
+	} else if err := ms.WriteFileMetadataV3(ctx, virtualPath, metadata, index, storeRef); err != nil {
+		// A durable import's path and storage error can contain private article
+		// or provider material. Its caller receives a sanitized failure and its
+		// private rollback journal retains the recovery evidence, so do not put
+		// either value in the process log. Preserve the legacy diagnostic for
+		// ordinary, non-journaled metadata writes.
+		if _, journaled := permit.(MetadataRollbackJournalPermit); !journaled {
+			slog.WarnContext(ctx, "v3 metadata write failed; writing v1", "path", virtualPath, "error", err)
+		}
+		writeErr = ms.WriteFileMetadata(virtualPath, metadata)
+	} else {
+		wroteV3 = true
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	if permit != nil {
+		if err := permit.FinalizeMetadataWrite(ctx); err != nil {
+			rollbackErr := ms.restoreMetadataVisibility(
+				ctx, virtualPath, priorBytes, priorExists, storeRef, wroteV3,
+				durableCandidate,
+			)
+			if rollbackErr != nil {
+				return errors.Join(
+					fmt.Errorf("finalize metadata write: %w", err),
+					fmt.Errorf("restore metadata visibility: %w", rollbackErr),
+				)
+			}
+			return fmt.Errorf("finalize metadata write: %w", err)
+		}
 	}
 	return nil
+}
+
+// RestoreMetadataVisibilitySnapshot atomically restores one private-journal
+// snapshot (or removes a path that did not exist before the queue). Store-ref
+// accounting is intentionally owned by the journal's idempotent DB operation.
+func (ms *MetadataService) RestoreMetadataVisibilitySnapshot(
+	virtualPath string,
+	priorBytes []byte,
+	priorExists bool,
+) error {
+	stripe := ms.metadataWriteStripe(virtualPath)
+	stripe.Lock()
+	defer stripe.Unlock()
+
+	metadataPath := ms.metadataPath(virtualPath)
+	if priorExists {
+		metadataDir := filepath.Dir(metadataPath)
+		if err := os.MkdirAll(metadataDir, 0o755); err != nil {
+			return err
+		}
+		tmp, err := os.CreateTemp(metadataDir, ".queue-rollback-*.tmp")
+		if err != nil {
+			return err
+		}
+		tmpPath := tmp.Name()
+		if err := tmp.Chmod(0o600); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if _, err := tmp.Write(priorBytes); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if err := os.Rename(tmpPath, metadataPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if err := syncMetadataDirectoryChain(metadataDir, ms.rootPath); err != nil {
+			return err
+		}
+	} else if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
+		return err
+	} else if err := syncMetadataDirectoryChain(filepath.Dir(metadataPath), ms.rootPath); err != nil {
+		return err
+	}
+	ms.liteCache.Remove(virtualPath)
+	return nil
+}
+
+// InspectMetadataVisibility returns only the canonical layout fingerprint and
+// v3 store reference; it never exposes segment/article identities.
+func (ms *MetadataService) InspectMetadataVisibility(virtualPath string) (MetadataVisibilityState, error) {
+	metadataPath := ms.metadataPath(virtualPath)
+	if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
+		return MetadataVisibilityState{}, nil
+	} else if err != nil {
+		return MetadataVisibilityState{}, err
+	}
+	meta, err := ms.ReadFileMetadata(virtualPath)
+	if err != nil || meta == nil {
+		return MetadataVisibilityState{}, fmt.Errorf("inspect metadata visibility")
+	}
+	layout, err := ResolveCanonicalSegmentLayout(meta)
+	if err != nil {
+		return MetadataVisibilityState{}, fmt.Errorf("inspect metadata layout")
+	}
+	return MetadataVisibilityState{
+		Exists: true, LayoutFingerprint: layout.Fingerprint,
+		StoreRef: ms.readStoreRef(metadataPath),
+	}, nil
+}
+
+// CaptureMetadataVisibilitySnapshot reads the exact visible bytes together
+// with their sanitized structural projection. Callers must keep the returned
+// bytes inside controlled private state and must never log or persist them in
+// SQL.
+func (ms *MetadataService) CaptureMetadataVisibilitySnapshot(
+	virtualPath string,
+) ([]byte, MetadataVisibilityState, error) {
+	metadataPath := ms.metadataPath(virtualPath)
+	data, err := os.ReadFile(metadataPath)
+	if os.IsNotExist(err) {
+		return nil, MetadataVisibilityState{}, nil
+	}
+	if err != nil {
+		return nil, MetadataVisibilityState{}, err
+	}
+	state, err := ms.InspectMetadataVisibility(virtualPath)
+	if err != nil || !state.Exists {
+		return nil, MetadataVisibilityState{}, fmt.Errorf("capture metadata visibility")
+	}
+	return data, state, nil
+}
+
+// PrivateStateDirectory returns a controlled sibling of the metadata root so
+// journal files can never appear in WebDAV/library directory scans.
+func (ms *MetadataService) PrivateStateDirectory(component string) string {
+	root := filepath.Clean(ms.rootPath)
+	digest := sha256.Sum256([]byte(root))
+	component = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		return '-'
+	}, strings.ToLower(component))
+	component = strings.Trim(component, "-")
+	if component == "" {
+		component = "state"
+	}
+	return filepath.Join(
+		filepath.Dir(root),
+		fmt.Sprintf(".altmount-%x-%s", digest[:8], component),
+	)
+}
+
+func (ms *MetadataService) metadataPath(virtualPath string) string {
+	filename := filepath.Base(virtualPath)
+	return filepath.Join(
+		ms.rootPath,
+		filepath.Dir(virtualPath),
+		ms.truncateFilename(filename)+".meta",
+	)
+}
+
+func (ms *MetadataService) metadataWriteStripe(virtualPath string) *sync.Mutex {
+	// Hash the actual final path, not the caller's path. Filename truncation can
+	// map distinct long virtual names to the same .meta file.
+	digest := sha256.Sum256([]byte(filepath.Clean(ms.metadataPath(virtualPath))))
+	return &ms.metadataWriteStripes[int(digest[0])%len(ms.metadataWriteStripes)]
+}
+
+func syncMetadataDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
+func syncMetadataDirectoryChain(leaf, boundary string) error {
+	leaf = filepath.Clean(leaf)
+	boundary = filepath.Clean(boundary)
+	for current := leaf; ; current = filepath.Dir(current) {
+		if err := syncMetadataDirectory(current); err != nil {
+			return err
+		}
+		if current == boundary {
+			parent := filepath.Dir(current)
+			if parent != current {
+				return syncMetadataDirectory(parent)
+			}
+			return nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current || !pathWithinBoundary(current, boundary) {
+			return fmt.Errorf("metadata directory is outside durability boundary")
+		}
+	}
+}
+
+func pathWithinBoundary(path, boundary string) bool {
+	relative, err := filepath.Rel(boundary, path)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+// ensureMetadataDirectory makes each newly-created directory entry durable
+// when requested. Syncing only the leaf would persist a metadata file inside
+// it without necessarily persisting the leaf's link in its parent.
+func ensureMetadataDirectory(path string, mode fs.FileMode, durable bool) error {
+	if !durable {
+		return os.MkdirAll(path, mode)
+	}
+	clean := filepath.Clean(path)
+	created := make([]string, 0, 4)
+	for current := clean; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("metadata directory component is not a directory")
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		created = append(created, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			return err
+		}
+	}
+	if err := os.MkdirAll(clean, mode); err != nil {
+		return err
+	}
+	for index := len(created) - 1; index >= 0; index-- {
+		if err := syncMetadataDirectory(filepath.Dir(created[index])); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ms *MetadataService) restoreMetadataVisibility(
+	ctx context.Context,
+	virtualPath string,
+	priorBytes []byte,
+	priorExists bool,
+	newStoreRef string,
+	wroteV3 bool,
+	durableCandidate bool,
+) error {
+	metadataPath := ms.metadataPath(virtualPath)
+	if priorExists {
+		metadataDir := filepath.Dir(metadataPath)
+		if err := os.MkdirAll(metadataDir, 0o755); err != nil {
+			return err
+		}
+		tmp, err := os.CreateTemp(metadataDir, ".admission-rollback-*.tmp")
+		if err != nil {
+			return err
+		}
+		tmpPath := tmp.Name()
+		if _, err := tmp.Write(priorBytes); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if durableCandidate {
+			if err := tmp.Sync(); err != nil {
+				_ = tmp.Close()
+				_ = os.Remove(tmpPath)
+				return err
+			}
+		}
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if err := os.Rename(tmpPath, metadataPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if durableCandidate {
+			if err := syncMetadataDirectoryChain(metadataDir, ms.rootPath); err != nil {
+				return err
+			}
+		}
+	} else if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
+		return err
+	} else if durableCandidate {
+		if err := syncMetadataDirectoryChain(filepath.Dir(metadataPath), ms.rootPath); err != nil {
+			return err
+		}
+	}
+	ms.liteCache.Remove(virtualPath)
+	if !priorExists {
+		utils.RemoveEmptyDirs(ms.rootPath, filepath.Dir(metadataPath))
+	}
+	if wroteV3 && !durableCandidate && ms.storeRefCounter != nil && newStoreRef != "" {
+		if _, err := ms.storeRefCounter.DecStoreRef(ctx, newStoreRef); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func canonicalLayoutsEqual(left, right *metapb.FileMetadata) bool {
+	leftLayout, leftErr := ResolveCanonicalSegmentLayout(left)
+	rightLayout, rightErr := ResolveCanonicalSegmentLayout(right)
+	return leftErr == nil && rightErr == nil && leftLayout.Fingerprint == rightLayout.Fingerprint
 }
 
 // ReadFileMetadata reads file metadata from disk. The full proto (including
@@ -306,10 +864,7 @@ func (ms *MetadataService) WriteFileMetadataAuto(ctx context.Context, virtualPat
 // caller's handle. As a side effect, the lightweight projection is cached so
 // subsequent Readdir/Stat calls are fast without a disk read.
 func (ms *MetadataService) ReadFileMetadata(virtualPath string) (*metapb.FileMetadata, error) {
-	// Create metadata file path
-	filename := filepath.Base(virtualPath)
-	metadataDir := filepath.Join(ms.rootPath, filepath.Dir(virtualPath))
-	metadataPath := filepath.Join(metadataDir, filename+".meta")
+	metadataPath := ms.metadataPath(virtualPath)
 
 	// Read file
 	data, err := os.ReadFile(metadataPath)
@@ -401,9 +956,7 @@ func (ms *MetadataService) ReadFileMetadataLite(virtualPath string) (*FileMetada
 	}
 
 	// Cache miss — read the head of the file and scan wire-format fields.
-	filename := filepath.Base(virtualPath)
-	metadataDir := filepath.Join(ms.rootPath, filepath.Dir(virtualPath))
-	metadataPath := filepath.Join(metadataDir, filename+".meta")
+	metadataPath := ms.metadataPath(virtualPath)
 
 	f, err := os.Open(metadataPath)
 	if err != nil {
@@ -505,9 +1058,7 @@ func parseLiteFields(buf []byte) (*FileMetadataLite, bool) {
 // partial-read scan in ReadFileMetadataLite fails to locate the lite
 // fields within liteScanBytes.
 func (ms *MetadataService) readFileMetadataLiteFull(virtualPath string) (*FileMetadataLite, error) {
-	filename := filepath.Base(virtualPath)
-	metadataDir := filepath.Join(ms.rootPath, filepath.Dir(virtualPath))
-	metadataPath := filepath.Join(metadataDir, filename+".meta")
+	metadataPath := ms.metadataPath(virtualPath)
 
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {

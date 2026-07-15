@@ -106,6 +106,7 @@ export interface HealthConfig {
 	library_dir?: string;
 	cleanup_orphaned_metadata?: boolean;
 	check_interval_seconds?: number;
+	gap_confirmation_delay_minutes?: number;
 	max_connections_for_health_checks?: number;
 	check_batch_size?: number; // Files fetched and swept together per health-check cycle
 	max_concurrent_jobs?: number; // Max concurrent health check jobs
@@ -216,6 +217,7 @@ export interface FuseConfig {
 
 // Import strategy type
 export type ImportStrategy = "NONE" | "SYMLINK" | "STRM";
+export type ImportDamagePolicy = "strict" | "tolerant";
 
 // Import configuration
 export interface ImportConfig {
@@ -225,6 +227,7 @@ export interface ImportConfig {
 	max_download_prefetch: number;
 	segment_sample_percentage: number; // Percentage of segments to check (1-100)
 	read_timeout_seconds: number;
+	damage_policy: ImportDamagePolicy;
 	import_strategy: ImportStrategy;
 	import_dir?: string | null;
 	watch_dir?: string | null;
@@ -386,6 +389,7 @@ export interface HealthUpdateRequest {
 	library_dir?: string;
 	cleanup_orphaned_metadata?: boolean;
 	check_interval_seconds?: number; // Interval in seconds (optional)
+	gap_confirmation_delay_minutes?: number;
 	max_connections_for_health_checks?: number;
 	check_batch_size?: number; // Files fetched and swept together per health-check cycle
 	max_concurrent_jobs?: number; // Max concurrent health check jobs
@@ -460,6 +464,7 @@ export interface ImportUpdateRequest {
 	max_processor_workers?: number;
 	queue_processing_interval_seconds?: number; // Interval in seconds for queue processing
 	allowed_file_extensions?: string[];
+	damage_policy?: ImportDamagePolicy;
 	import_strategy?: ImportStrategy;
 	import_dir?: string | null;
 	watch_dir?: string | null;

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/javi11/altmount/internal/importer/admissionctx"
 	"github.com/javi11/altmount/internal/importer/filesystem"
 	"github.com/javi11/altmount/internal/importer/parser"
 	"github.com/javi11/altmount/internal/importer/utils"
@@ -14,6 +15,14 @@ import (
 	"github.com/javi11/altmount/internal/metadata"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 )
+
+type durableProcessingError struct {
+	message string
+	cause   error
+}
+
+func (e *durableProcessingError) Error() string { return e.message }
+func (e *durableProcessingError) Unwrap() error { return e.cause }
 
 // ProcessSingleFile processes a single file (creates and writes metadata).
 // Returns (virtualDir, writtenMetaPath, error). writtenMetaPath is the virtual path of the
@@ -30,11 +39,17 @@ func ProcessSingleFile(
 	storeIndex map[string]int64,
 	storeRef string,
 ) (string, string, error) {
+	_, durableAdmission := admissionctx.FromContext(ctx)
 	// Validate file extension before processing
 	if !utils.HasAllowedFilesInRegular([]parser.ParsedFile{file}, allowedFileExtensions, filterSamples) {
-		slog.WarnContext(ctx, "File does not match allowed extensions",
-			"filename", file.Filename,
-			"allowed_extensions", allowedFileExtensions)
+		if !durableAdmission {
+			slog.WarnContext(ctx, "File does not match allowed extensions",
+				"filename", file.Filename,
+				"allowed_extensions", allowedFileExtensions)
+		}
+		if durableAdmission {
+			return "", "", fmt.Errorf("final-layout file does not match allowed extensions")
+		}
 		return "", "", fmt.Errorf("file '%s' does not match allowed extensions (allowed: %v)", file.Filename, allowedFileExtensions)
 	}
 
@@ -44,10 +59,13 @@ func ProcessSingleFile(
 	// rather than being silently skipped.
 	virtualFilePath := filepath.Join(virtualDir, file.Filename)
 	virtualFilePath = strings.ReplaceAll(virtualFilePath, string(filepath.Separator), "/")
-	virtualFilePath = filesystem.EnsureUniqueVirtualPath(virtualFilePath, metadataService)
+	desiredVirtualFilePath := virtualFilePath
 
 	// Double check if this specific file is allowed
 	if !utils.IsAllowedFile(file.Filename, file.Size, allowedFileExtensions, filterSamples) {
+		if durableAdmission {
+			return "", "", fmt.Errorf("final-layout file is not allowed")
+		}
 		return "", "", fmt.Errorf("file '%s' is not allowed", file.Filename)
 	}
 
@@ -58,6 +76,9 @@ func ProcessSingleFile(
 		file.Segments,
 		file.Encryption,
 	); err != nil {
+		if durableAdmission {
+			return "", "", fmt.Errorf("final-layout segment structure is invalid")
+		}
 		return "", "", err
 	}
 
@@ -87,15 +108,45 @@ func ProcessSingleFile(
 		file.NzbdavID,
 	)
 
+	if reusableBinding, reusable := admissionctx.ReusableLayout(ctx, desiredVirtualFilePath); reusable {
+		layout, layoutErr := metadata.ResolveCanonicalSegmentLayout(fileMeta)
+		if layoutErr == nil && layout.Fingerprint == reusableBinding.Fingerprint {
+			// This exact queue/path/layout crossed admission before a prior
+			// attempt parked on another file. Reuse the original path instead
+			// of manufacturing a duplicate suffix on restart.
+			virtualFilePath = desiredVirtualFilePath
+			if !reusableBinding.ActivationPending {
+				if existing, readErr := metadataService.ReadFileMetadata(virtualFilePath); readErr == nil &&
+					existing != nil && existing.Status == metapb.FileStatus_FILE_STATUS_HEALTHY {
+					existingLayout, existingErr := metadata.ResolveCanonicalSegmentLayout(existing)
+					if existingErr == nil && existingLayout.Fingerprint == reusableBinding.Fingerprint {
+						return virtualDir, virtualFilePath, nil
+					}
+				}
+			}
+		} else {
+			virtualFilePath = filesystem.EnsureUniqueVirtualPath(desiredVirtualFilePath, metadataService)
+		}
+	} else {
+		virtualFilePath = filesystem.EnsureUniqueVirtualPath(desiredVirtualFilePath, metadataService)
+	}
+
 	// Write file metadata to disk (v3 store-backed when available, else v1)
 	if err := metadataService.WriteFileMetadataAuto(ctx, virtualFilePath, fileMeta, storeIndex, storeRef); err != nil {
+		if durableAdmission {
+			return "", "", &durableProcessingError{
+				message: "failed to write admitted metadata", cause: err,
+			}
+		}
 		return "", "", fmt.Errorf("failed to write metadata for single file %s: %w", file.Filename, err)
 	}
 
-	slog.InfoContext(ctx, "Successfully processed single file",
-		"file", file.Filename,
-		"virtual_path", virtualFilePath,
-		"size", file.Size)
+	if !durableAdmission {
+		slog.InfoContext(ctx, "Successfully processed single file",
+			"file", file.Filename,
+			"virtual_path", virtualFilePath,
+			"size", file.Size)
+	}
 
 	return virtualDir, virtualFilePath, nil
 }

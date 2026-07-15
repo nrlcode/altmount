@@ -46,6 +46,8 @@ type Server struct {
 	config              *Config
 	queueRepo           *database.Repository
 	healthRepo          *database.HealthRepository
+	healthRunRepository HealthRunProgressRepository
+	healthObservation   HealthObservationController
 	authService         *auth.Service
 	userRepo            *database.UserRepository
 	configManager       ConfigManager
@@ -135,6 +137,30 @@ func NewServer(
 // SetHealthWorker sets the health worker reference for the server
 func (s *Server) SetHealthWorker(healthWorker *health.HealthWorker) {
 	s.healthWorker = healthWorker
+}
+
+// SetHealthRunRepository enables the durable PR5 health progress and control
+// endpoints without changing the source-compatible NewServer constructor.
+func (s *Server) SetHealthRunRepository(repository HealthRunProgressRepository) {
+	s.healthRunRepository = repository
+}
+
+// HealthObservationController is the narrow observation-only compatibility
+// surface used by existing health status and manual-check routes.
+type HealthObservationController interface {
+	Status() health.ObservationServiceStatus
+	ScheduleFile(
+		context.Context,
+		int64,
+		health.ObservationScheduleIntent,
+	) (health.ObservationScheduleResult, error)
+	CancelFile(context.Context, int64) error
+}
+
+// SetHealthObservationController keeps existing API routes on the durable,
+// non-destructive PR5 engine when the legacy repair-capable worker is absent.
+func (s *Server) SetHealthObservationController(controller HealthObservationController) {
+	s.healthObservation = controller
 }
 
 // SetLibrarySyncWorker sets the library sync worker reference for the server
@@ -276,6 +302,11 @@ func (s *Server) SetupRoutes(app *fiber.App) {
 	api.Post("/health/regenerate-symlinks", s.handleRegenerateLibraryFiles)
 	api.Post("/health/check", s.handleAddHealthCheck)
 	api.Get("/health/worker/status", s.handleGetHealthWorkerStatus)
+	// Durable run routes must precede the legacy /health/:id route so "runs"
+	// cannot be interpreted as a numeric legacy health-record identifier.
+	api.Get("/health/runs", s.handleListHealthRuns)
+	api.Get("/health/runs/:id", s.handleGetHealthRun)
+	api.Post("/health/runs/:id/:action", s.handleControlHealthRun)
 	api.Post("/health/:id/repair", s.handleRepairHealth)
 	api.Post("/health/:id/unmask", s.handleUnmaskHealth)
 	api.Post("/health/:id/check-now", s.handleDirectHealthCheck)

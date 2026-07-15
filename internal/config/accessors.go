@@ -14,6 +14,16 @@ func (c *Config) GetCheckInterval() time.Duration {
 	return time.Duration(c.Health.CheckIntervalSeconds) * time.Second
 }
 
+// GetGapConfirmationMinimumDelay returns the minimum time between independent
+// all-provider absence confirmation waves. Older configurations omit the
+// value, so non-positive values retain the safety-first ten-minute default.
+func (c *Config) GetGapConfirmationMinimumDelay() time.Duration {
+	if c.Health.GapConfirmationDelayMinutes <= 0 {
+		return 10 * time.Minute
+	}
+	return time.Duration(c.Health.GapConfirmationDelayMinutes) * time.Minute
+}
+
 // GetMaxConcurrentJobs returns max concurrent health check jobs with a default fallback.
 func (c *Config) GetMaxConcurrentJobs() int {
 	if c.Health.MaxConcurrentJobs <= 0 {
@@ -119,11 +129,11 @@ func (c *Config) GetMaxRepairRetries() int {
 
 // Import config accessor methods.
 
-// GetImportDamagePolicyTolerant reports whether small confirmed damage on a
-// standalone video file should import as degraded (true, the default) instead
-// of failing the import (false, "strict").
+// GetImportDamagePolicyTolerant reports whether eligible unresolved damage may
+// import as health-pending. Strict is the default; only an explicit validated
+// tolerant value opts in.
 func (c *Config) GetImportDamagePolicyTolerant() bool {
-	return c.Import.DamagePolicy != "strict"
+	return c.Import.DamagePolicy == string(ImportDamagePolicyTolerant)
 }
 
 // TotalProviderConnections returns the pool's total connection capacity: the

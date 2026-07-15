@@ -524,6 +524,17 @@ func (m *manager) AcquireImportConnection(ctx context.Context) (func(), error) {
 	return m.budget.Acquire(ctx)
 }
 
+// AcquireImportConnections atomically reserves a weighted share of the same
+// playback-aware budget used by import BODY fetches. This additive concrete
+// capability is discovered through a narrow type assertion so existing
+// Manager test doubles remain source compatible.
+func (m *manager) AcquireImportConnections(
+	ctx context.Context,
+	maxSlots int,
+) (func(), int, error) {
+	return m.budget.AcquireUpTo(ctx, maxSlots)
+}
+
 // SetImportConnCapacity sets the import connection budget to the pool's total
 // connection count.
 func (m *manager) SetImportConnCapacity(total int) {

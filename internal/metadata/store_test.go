@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -36,6 +37,21 @@ func TestStoreService_WriteRead(t *testing.T) {
 	assert.Equal(t, "m1@x", flat[0].Id)
 	assert.Equal(t, "m2@x", flat[1].Id)
 	assert.Equal(t, "p1@x", flat[2].Id)
+}
+
+func TestPR5DurableStoreVerificationBypassesWriteThroughCache(t *testing.T) {
+	ss := NewStoreService(t.TempDir())
+	ref := filepath.Join(t.TempDir(), ".nzbs", "release.nzbz")
+	original := sampleStore()
+	require.NoError(t, ss.WriteStoreDurable(ref, original))
+	require.NoError(t, os.WriteFile(ref, []byte("corrupt-on-disk"), 0o600))
+
+	cached, err := ss.ReadStore(ref)
+	require.NoError(t, err)
+	require.True(t, proto.Equal(original, cached),
+		"the ordinary read demonstrates why it cannot be the durability check")
+	_, err = ss.ReadStoreFromDisk(ref)
+	require.Error(t, err, "durable verification must inspect final on-disk bytes")
 }
 
 func TestResolveRefs(t *testing.T) {

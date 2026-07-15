@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -21,6 +22,35 @@ func (m *mockProcessor) HandleSuccess(_ context.Context, _ *database.ImportQueue
 	return nil
 }
 func (m *mockProcessor) HandleFailure(_ context.Context, _ *database.ImportQueueItem, _ error) {}
+
+type successFailureProcessor struct {
+	successErr error
+	failureErr error
+}
+
+func (p *successFailureProcessor) ProcessItem(context.Context, *database.ImportQueueItem) (string, error) {
+	return "library/result.mkv", nil
+}
+func (p *successFailureProcessor) HandleSuccess(
+	context.Context, *database.ImportQueueItem, string,
+) error {
+	return p.successErr
+}
+func (p *successFailureProcessor) HandleFailure(
+	_ context.Context, _ *database.ImportQueueItem, err error,
+) {
+	p.failureErr = err
+}
+
+func TestPR5HandleSuccessErrorFlowsThroughFailureHandler(t *testing.T) {
+	successErr := errors.New("success finalization failed")
+	processor := &successFailureProcessor{successErr: successErr}
+	manager := NewManager(ManagerConfig{Workers: 1, ConfigGetter: testConfigGetter}, nil, processor, nil)
+	manager.finishProcessing(
+		context.Background(), &database.ImportQueueItem{ID: 91}, "library/result.mkv", nil,
+	)
+	require.ErrorIs(t, processor.failureErr, successErr)
+}
 
 // testConfigGetter returns a config with a reasonable queue processing interval
 func testConfigGetter() *config.Config {

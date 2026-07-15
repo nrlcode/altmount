@@ -49,29 +49,33 @@ type FirstSegmentData struct {
 	RawBytes            []byte             // Up to 16KB of raw data for PAR2 detection (may be less if segment is smaller)
 	MissingFirstSegment bool               // True if first segment download failed (article not found, etc.)
 	IsArticleNotFound   bool               // True only when 430 Not Found (permanent); false for timeouts/transient
+	TerminalUnavailable bool               // True only when every enabled provider completed BODY with a terminal unresolved outcome
 	SkippedFirstSegment bool               // True when the fetch was intentionally skipped (clean-named multipart file); Headers/RawBytes are empty by design, not by failure
 	OriginalIndex       int                // Original position in the parsed NZB file list
 }
 
 // Parser handles NZB file parsing
 type Parser struct {
-	poolManager pool.Manager        // Pool manager for dynamic pool access
-	getConfig   config.ConfigGetter // Returns current config for connection limits
-	log         *slog.Logger        // Logger for debug/error messages
+	poolManager    pool.Manager        // Pool manager for dynamic pool access
+	getConfig      config.ConfigGetter // Returns current config for connection limits
+	log            *slog.Logger        // Logger for debug/error messages
+	networkTimeout time.Duration
 }
 
 // Use conc pool for parallel processing with proper error handling
 type fileResult struct {
-	parsedFile *ParsedFile
-	err        error
+	parsedFile    *ParsedFile
+	err           error
+	originalIndex int
 }
 
 // NewParser creates a new NZB parser
 func NewParser(poolManager pool.Manager, getConfig config.ConfigGetter) *Parser {
 	return &Parser{
-		poolManager: poolManager,
-		getConfig:   getConfig,
-		log:         slog.Default().With("component", "nzb-parser"),
+		poolManager:    poolManager,
+		getConfig:      getConfig,
+		log:            slog.Default().With("component", "nzb-parser"),
+		networkTimeout: 10 * time.Minute,
 	}
 }
 
@@ -112,11 +116,18 @@ func SanitizeNzbFilenames(n *nzbparser.Nzb) {
 // opts carries knowledge collected before the network phase, e.g. file indexes
 // whose segments are already known to be missing from a pre-parse Stat check.
 func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string, progressTracker progress.ProgressTracker, opts ParseOptions) (*ParsedNzb, error) {
-	ctx = slogutil.With(ctx, "nzb_path", nzbPath)
+	requestCtx := ctx
+	if !opts.RequireCompleteFinalLayout {
+		ctx = slogutil.With(ctx, "nzb_path", nzbPath)
+	}
 
 	// Safety timeout for the entire network phase.
 	// Parsing large NZBs with many missing articles can sometimes hang in NNTP body fetching.
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	networkTimeout := p.networkTimeout
+	if networkTimeout <= 0 {
+		networkTimeout = 10 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, networkTimeout)
 	defer cancel()
 
 	parsed := &ParsedNzb{
@@ -141,7 +152,18 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 	// This cache is used by both PAR2 extraction and file parsing to avoid redundant fetches
 	firstSegmentCache, notFoundIDs, err := p.fetchAllFirstSegments(ctx, n.Files, progressTracker, opts)
 	if err != nil {
+		if opts.RequireCompleteFinalLayout {
+			if requestCtx.Err() != nil {
+				return nil, requestCtx.Err()
+			}
+			return nil, newFinalLayoutIncompleteError()
+		}
 		return nil, err
+	}
+	if opts.RequireCompleteFinalLayout {
+		if err := validateCompleteFirstSegmentCache(len(n.Files), firstSegmentCache, opts.OptionalFileIndexes); err != nil {
+			return nil, err
+		}
 	}
 
 	// PAR2 descriptor matching is only worth network I/O when (a) the NZB actually
@@ -222,7 +244,9 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 		g.Go(func() error {
 			h, err := p.fetchYencHeaders(gctx, repSeg, repGroups)
 			if err != nil {
-				p.log.DebugContext(gctx, "Representative yEnc header fetch failed, falling back to per-file normalization", "error", err)
+				if !opts.RequireCompleteFinalLayout {
+					p.log.DebugContext(gctx, "Representative yEnc header fetch failed, falling back to per-file normalization", "error", err)
+				}
 				return nil
 			}
 			if h.PartSize > 0 {
@@ -235,9 +259,17 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 
 	if par2Err != nil {
 		if stderrors.Is(par2Err, context.Canceled) {
+			if opts.RequireCompleteFinalLayout {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				return nil, newFinalLayoutIncompleteError()
+			}
 			return nil, errors.NewNonRetryableError("extracting PAR2 file descriptors canceled", par2Err)
 		}
-		p.log.WarnContext(ctx, "Failed to extract PAR2 file descriptors", "error", par2Err)
+		if !opts.RequireCompleteFinalLayout {
+			p.log.WarnContext(ctx, "Failed to extract PAR2 file descriptors", "error", par2Err)
+		}
 	}
 
 	// For files whose first segment we intentionally skipped, fill in the first-segment
@@ -287,13 +319,20 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 	// GetFileInfos processes ALL files including PAR2 files; SeparateFiles handles the split
 	fileInfos := fileinfo.GetFileInfos(filesWithFirstSegment, par2Descriptors, parsed.Filename)
 	if len(fileInfos) == 0 {
-		p.log.WarnContext(ctx, "Failed to get file infos from network, falling back to NZB XML data",
-			"nzb_path", nzbPath)
+		if !opts.RequireCompleteFinalLayout {
+			p.log.WarnContext(ctx, "Failed to get file infos from network, falling back to NZB XML data",
+				"nzb_path", nzbPath)
+		}
 		fileInfos = p.fallbackGetFileInfos(n.Files)
 	}
 
 	if len(fileInfos) == 0 {
 		return nil, errors.NewNonRetryableError("NZB file contains no valid files. This can be caused because the file has missing segments in your providers.", nil)
+	}
+	if opts.RequireCompleteFinalLayout {
+		if err := validateRequiredFileInfos(len(n.Files), fileInfos, opts.OptionalFileIndexes); err != nil {
+			return nil, err
+		}
 	}
 
 	maxParse := max(min(len(fileInfos), 20), 1)
@@ -302,11 +341,12 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 	// Process files in parallel using conc pool
 	for _, info := range fileInfos {
 		concPool.Go(func(ctx context.Context) (fileResult, error) {
-			parsedFile, err := p.parseFile(ctx, n.Meta, parsed.Filename, info, firstSegmentSizeCache, warmFirstSegmentBytes, nzbStandardPartSize, notFoundIDs, parsed.SegmentIndex)
+			parsedFile, err := p.parseFile(ctx, n.Meta, parsed.Filename, info, firstSegmentSizeCache, warmFirstSegmentBytes, nzbStandardPartSize, notFoundIDs, parsed.SegmentIndex, opts.RequireCompleteFinalLayout)
 
 			return fileResult{
-				parsedFile: parsedFile,
-				err:        err,
+				parsedFile:    parsedFile,
+				err:           err,
+				originalIndex: info.OriginalIndex,
 			}, nil
 		})
 	}
@@ -314,7 +354,16 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 	// Wait for all goroutines to complete and collect results
 	results, err := concPool.Wait()
 	if err != nil {
-		if stderrors.Is(err, context.Canceled) {
+		if opts.RequireCompleteFinalLayout {
+			if requestCtx.Err() != nil {
+				return nil, requestCtx.Err()
+			}
+			if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) ||
+				usenet.IsIncomplete(err) {
+				return nil, newFinalLayoutIncompleteError()
+			}
+		}
+		if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
 			return nil, errors.NewNonRetryableError("parsing canceled", err)
 		}
 
@@ -322,13 +371,47 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 	}
 
 	// Check for errors and collect valid results
-	var parsedFiles []*ParsedFile
+	var (
+		parsedFiles          []*ParsedFile
+		confirmationRequired bool
+		incomplete           bool
+		invalid              bool
+	)
 	for _, result := range results {
 		if result.err != nil {
-			slog.InfoContext(ctx, "Failed to parse file", "error", result.err)
+			if opts.RequireCompleteFinalLayout {
+				if finalLayoutFileRequired(opts.OptionalFileIndexes, result.originalIndex) {
+					switch {
+					case IsFinalLayoutIncomplete(result.err):
+						incomplete = true
+					case IsFinalLayoutConfirmationRequired(result.err):
+						confirmationRequired = true
+					default:
+						invalid = true
+					}
+				}
+				continue
+			}
+			p.log.InfoContext(ctx, "Failed to parse file", "error", result.err)
 			continue
 		}
 		parsedFiles = append(parsedFiles, result.parsedFile)
+	}
+	if opts.RequireCompleteFinalLayout {
+		if requestCtx.Err() != nil {
+			return nil, requestCtx.Err()
+		}
+		// Incomplete work always outranks conclusive failures: omitted or
+		// canceled provider work can never complete rejection evidence.
+		if incomplete {
+			return nil, newFinalLayoutIncompleteError()
+		}
+		if confirmationRequired {
+			return nil, newFinalLayoutConfirmationError()
+		}
+		if invalid || !allRequiredFilesParsed(len(n.Files), parsedFiles, opts.OptionalFileIndexes) {
+			return nil, newFinalLayoutInvalidError()
+		}
 	}
 
 	// Check if all files are PAR2 files - indicates missing segments
@@ -373,7 +456,7 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 // firstSegmentSizeCache contains pre-fetched yEnc info (PartSize + total FileSize) for first segments to avoid redundant fetching.
 // nzbStandardPartSize, when >0, is the yEnc PartSize of a representative middle segment in the NZB;
 // it lets normalization skip the per-file second-segment fetch.
-func (p *Parser) parseFile(ctx context.Context, meta map[string]string, nzbFilename string, info *fileinfo.FileInfo, firstSegmentSizeCache map[string]firstSegmentYencInfo, warmFirstSegmentBytes map[string][]byte, nzbStandardPartSize int64, notFoundIDs map[string]struct{}, segmentIndex map[string]int64) (*ParsedFile, error) {
+func (p *Parser) parseFile(ctx context.Context, meta map[string]string, nzbFilename string, info *fileinfo.FileInfo, firstSegmentSizeCache map[string]firstSegmentYencInfo, warmFirstSegmentBytes map[string][]byte, nzbStandardPartSize int64, notFoundIDs map[string]struct{}, segmentIndex map[string]int64, requireCompleteFinalLayout bool) (*ParsedFile, error) {
 	if len(info.NzbFile.Segments) == 0 {
 		return nil, fmt.Errorf("file has no segments")
 	}
@@ -387,8 +470,29 @@ func (p *Parser) parseFile(ctx context.Context, meta map[string]string, nzbFilen
 		// Safe to access Segments[0] since files without segments are filtered earlier
 		cachedFirstSegment := firstSegmentSizeCache[info.NzbFile.Segments[0].ID]
 
+		// Freeze the enabled-provider identity set before any BODY dispatch.
+		// Runtime config may be replaced while the wire call is in flight; its
+		// terminal evidence must be judged against the dispatch-time set.
+		bodyProviders := captureBODYProviderSnapshot(p.getConfig())
 		err := p.normalizeSegmentSizesWithYenc(ctx, info.NzbFile.Segments, cachedFirstSegment, nzbStandardPartSize, notFoundIDs)
 		if err != nil {
+			if requireCompleteFinalLayout {
+				// Caller cancellation always outranks terminal-looking transport
+				// evidence delivered concurrently with cancellation.
+				if ctx.Err() != nil {
+					return nil, newFinalLayoutIncompleteError()
+				}
+				if terminalAllProviderBODYFailure(ctx, err, bodyProviders) {
+					return nil, newFinalLayoutConfirmationError()
+				}
+				if usenet.IsIncomplete(err) || stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+					return nil, newFinalLayoutIncompleteError()
+				}
+				// Hard absence and a present-but-unusable yEnc header both leave
+				// byte offsets untrusted. Neither may fall back to NZB-declared
+				// encoded sizes under durable admission.
+				return nil, newFinalLayoutConfirmationError()
+			}
 			if usenet.IsHardArticleAbsence(err) {
 				// A segment required to determine the real (decoded) sizes is missing
 				// from every provider. Importing the file with the NZB's un-normalized
@@ -581,6 +685,175 @@ func (p *Parser) parseFile(ctx context.Context, meta map[string]string, nzbFilen
 	return parsedFile, nil
 }
 
+func validateCompleteFirstSegmentCache(expected int, cache []*FirstSegmentData, optional map[int]struct{}) error {
+	if expected == 0 {
+		return newFinalLayoutInvalidError()
+	}
+	seen := make([]bool, expected)
+	confirmationRequired := false
+	invalid := false
+	for _, data := range cache {
+		if data == nil || data.File == nil || data.OriginalIndex < 0 || data.OriginalIndex >= expected {
+			return newFinalLayoutIncompleteError()
+		}
+		if !finalLayoutFileRequired(optional, data.OriginalIndex) {
+			continue
+		}
+		if seen[data.OriginalIndex] {
+			return newFinalLayoutInvalidError()
+		}
+		seen[data.OriginalIndex] = true
+		if len(data.File.Segments) == 0 {
+			invalid = true
+			continue
+		}
+		if !data.MissingFirstSegment {
+			continue
+		}
+		if data.IsArticleNotFound {
+			confirmationRequired = true
+			continue
+		}
+		if data.TerminalUnavailable {
+			confirmationRequired = true
+			continue
+		}
+		return newFinalLayoutIncompleteError()
+	}
+	for index, present := range seen {
+		if finalLayoutFileRequired(optional, index) && !present {
+			return newFinalLayoutIncompleteError()
+		}
+	}
+	if invalid {
+		return newFinalLayoutInvalidError()
+	}
+	if confirmationRequired {
+		return newFinalLayoutConfirmationError()
+	}
+	return nil
+}
+
+// completeAllProviderBODYFailure recognizes only a transport-owned, bounded
+// all-provider BODY pass. Missing provider attempts, non-BODY evidence,
+// cancellation, transport ambiguity, or a bare error remain resumable. 451 is
+// deliberately retained as temporary failure; it becomes terminal for this
+// import pass only after every enabled provider was actually attempted.
+type bodyProviderSnapshot map[string]struct{}
+
+func captureBODYProviderSnapshot(cfg *config.Config) bodyProviderSnapshot {
+	if cfg == nil {
+		return nil
+	}
+	intended := make(bodyProviderSnapshot)
+	for index := range cfg.Providers {
+		provider := &cfg.Providers[index]
+		if provider.Enabled == nil || !*provider.Enabled {
+			continue
+		}
+		providerID := strings.TrimSpace(provider.ID)
+		if providerID == "" {
+			providerID = provider.NNTPPoolName()
+		}
+		if providerID == "" {
+			return nil
+		}
+		intended[providerID] = struct{}{}
+	}
+	if len(intended) == 0 {
+		return nil
+	}
+	return intended
+}
+
+func completeAllProviderBODYFailure(err error, intended bodyProviderSnapshot) bool {
+	if err == nil || len(intended) == 0 {
+		return false
+	}
+	var transportErr *nntppool.TransportError
+	if !stderrors.As(err, &transportErr) || transportErr == nil || len(transportErr.Attempts) == 0 {
+		return false
+	}
+	lastBODY := make(map[string]nntppool.OutcomeKind, len(intended))
+	for _, attempt := range transportErr.Attempts {
+		if attempt.Operation != nntppool.OperationBody {
+			continue
+		}
+		if _, expected := intended[attempt.ProviderID]; !expected {
+			continue
+		}
+		lastBODY[attempt.ProviderID] = attempt.Outcome
+	}
+	for providerID := range intended {
+		outcome, attempted := lastBODY[providerID]
+		if !attempted {
+			return false
+		}
+		switch outcome {
+		case nntppool.OutcomeHardArticleAbsence,
+			nntppool.OutcomeTemporaryFailure,
+			nntppool.OutcomeProviderUnavailable,
+			nntppool.OutcomeCorruptBody:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func terminalAllProviderBODYFailure(
+	ctx context.Context,
+	err error,
+	intended bodyProviderSnapshot,
+) bool {
+	return ctx != nil && ctx.Err() == nil && completeAllProviderBODYFailure(err, intended)
+}
+
+func finalLayoutFileRequired(optional map[int]struct{}, index int) bool {
+	_, excluded := optional[index]
+	return !excluded
+}
+
+func validateRequiredFileInfos(expected int, infos []*fileinfo.FileInfo, optional map[int]struct{}) error {
+	seen := make([]bool, expected)
+	for _, info := range infos {
+		if info == nil || info.OriginalIndex < 0 || info.OriginalIndex >= expected {
+			return newFinalLayoutInvalidError()
+		}
+		if !finalLayoutFileRequired(optional, info.OriginalIndex) {
+			continue
+		}
+		if seen[info.OriginalIndex] {
+			return newFinalLayoutInvalidError()
+		}
+		seen[info.OriginalIndex] = true
+	}
+	for index, present := range seen {
+		if finalLayoutFileRequired(optional, index) && !present {
+			return newFinalLayoutInvalidError()
+		}
+	}
+	return nil
+}
+
+func allRequiredFilesParsed(expected int, files []*ParsedFile, optional map[int]struct{}) bool {
+	seen := make([]bool, expected)
+	for _, file := range files {
+		if file == nil || file.OriginalIndex < 0 || file.OriginalIndex >= expected {
+			return false
+		}
+		if finalLayoutFileRequired(optional, file.OriginalIndex) {
+			seen[file.OriginalIndex] = true
+		}
+	}
+	for index, present := range seen {
+		if finalLayoutFileRequired(optional, index) && !present {
+			return false
+		}
+	}
+	return true
+}
+
 // skipEligibleVideoExtensions is a deliberately narrow set of unambiguous video
 // container extensions whose type can be trusted from the name alone. It excludes
 // ambiguous extensions that IsVideoFile accepts (.bin, .dat, .img, .iso, .ifo, .nsv, …),
@@ -694,7 +967,9 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 
 	cp, err := p.poolManager.GetPool()
 	if err != nil {
-		p.log.DebugContext(context.Background(), "Failed to get connection pool for first segment fetching", "error", err)
+		if !opts.RequireCompleteFinalLayout {
+			p.log.DebugContext(context.Background(), "Failed to get connection pool for first segment fetching", "error", err)
+		}
 		return nil, notFoundIDs, &usenet.IncompleteError{Expected: len(files), Cause: err}
 	}
 	if cp == nil {
@@ -705,11 +980,12 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 
 	// Use conc pool for parallel fetching — I/O-bound, so use more than NumCPU
 	type fetchResult struct {
-		segmentID  string
-		isNotFound bool // true when 430 Not Found (permanent)
-		incomplete bool // true for every non-conclusive transport outcome
-		data       *FirstSegmentData
-		err        error
+		originalIndex int
+		segmentID     string
+		isNotFound    bool // true when 430 Not Found (permanent)
+		incomplete    bool // true for every non-conclusive transport outcome
+		data          *FirstSegmentData
+		err           error
 	}
 
 	// Goroutine bound only — the real fetch bound is the pool manager's global
@@ -740,7 +1016,8 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 			// Skip files without segments
 			if len(fileToFetch.Segments) == 0 {
 				return fetchResult{
-					segmentID: fileToFetch.Subject,
+					originalIndex: originalIndex,
+					segmentID:     fileToFetch.Subject,
 					data: &FirstSegmentData{
 						File:                fileToFetch,
 						MissingFirstSegment: true,
@@ -754,8 +1031,9 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 			// mark missing without a Body call, seeding notFoundIDs via the result.
 			if _, broken := opts.BrokenFileIndexes[originalIndex]; broken {
 				return fetchResult{
-					segmentID:  fileToFetch.Segments[0].ID,
-					isNotFound: true,
+					originalIndex: originalIndex,
+					segmentID:     fileToFetch.Segments[0].ID,
+					isNotFound:    true,
 					data: &FirstSegmentData{
 						File:                fileToFetch,
 						MissingFirstSegment: true,
@@ -772,7 +1050,8 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 			// transfer per clean-named multipart file.
 			if shouldSkipFirstSegmentFetch(fileToFetch) {
 				return fetchResult{
-					segmentID: fileToFetch.Segments[0].ID,
+					originalIndex: originalIndex,
+					segmentID:     fileToFetch.Segments[0].ID,
 					data: &FirstSegmentData{
 						File:                fileToFetch,
 						SkippedFirstSegment: true,
@@ -787,7 +1066,7 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 			// per-attempt timeout starts, so queue wait never burns the deadline.
 			releaseConn, err := p.poolManager.AcquireImportConnection(ctx)
 			if err != nil {
-				return fetchResult{incomplete: true, err: err}, nil
+				return fetchResult{originalIndex: originalIndex, incomplete: true, err: err}, nil
 			}
 			defer releaseConn()
 
@@ -795,22 +1074,33 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 			c, cancel := context.WithTimeout(ctx, time.Second*30)
 			defer cancel()
 
+			// Snapshot provider identities before dispatch so a concurrent config
+			// replacement cannot reinterpret the completed attempt evidence.
+			bodyProviders := captureBODYProviderSnapshot(p.getConfig())
+
 			// Get body for the first segment (v4 returns decoded bytes + YEnc metadata)
 			result, err := cp.Body(c, firstSegment.ID)
 			if err != nil {
-				notFound := usenet.IsHardArticleAbsence(err)
-				p.log.DebugContext(ctx, "first segment fetch failed",
-					"outcome", usenet.ClassifyNNTPOutcome(err),
-					"error", err,
-				)
+				callerCanceled := ctx.Err() != nil
+				notFound := !callerCanceled && usenet.IsHardArticleAbsence(err)
+				terminalUnavailable := opts.RequireCompleteFinalLayout &&
+					terminalAllProviderBODYFailure(ctx, err, bodyProviders)
+				if !opts.RequireCompleteFinalLayout {
+					p.log.DebugContext(ctx, "first segment fetch failed",
+						"outcome", usenet.ClassifyNNTPOutcome(err),
+						"error", err,
+					)
+				}
 				return fetchResult{
-					segmentID:  firstSegment.ID,
-					isNotFound: notFound,
-					incomplete: !notFound,
+					originalIndex: originalIndex,
+					segmentID:     firstSegment.ID,
+					isNotFound:    notFound,
+					incomplete:    callerCanceled || (!notFound && !terminalUnavailable),
 					data: &FirstSegmentData{
 						File:                fileToFetch,
 						MissingFirstSegment: true,
 						IsArticleNotFound:   notFound,
+						TerminalUnavailable: terminalUnavailable,
 						OriginalIndex:       originalIndex,
 					},
 					err: fmt.Errorf("failed to get body: %w", err),
@@ -835,7 +1125,8 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 			}
 
 			return fetchResult{
-				segmentID: firstSegment.ID,
+				originalIndex: originalIndex,
+				segmentID:     firstSegment.ID,
 				data: &FirstSegmentData{
 					File:          fileToFetch,
 					Headers:       headers,
@@ -855,7 +1146,7 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 	completed := 0
 	var incompleteCause error
 	for _, result := range results {
-		if result.incomplete {
+		if result.incomplete && finalLayoutFileRequired(opts.OptionalFileIndexes, result.originalIndex) {
 			if incompleteCause == nil {
 				incompleteCause = result.err
 			}
@@ -892,8 +1183,10 @@ func (p *Parser) fetchAllFirstSegments(ctx context.Context, files []nzbparser.Nz
 		}
 
 		if len(data.RawBytes) == 0 {
-			p.log.WarnContext(context.Background(), "First segment has no data",
-				"file", data.File.Subject)
+			if !opts.RequireCompleteFinalLayout {
+				p.log.WarnContext(context.Background(), "First segment has no data",
+					"file", data.File.Subject)
+			}
 		}
 	}
 
@@ -1136,6 +1429,11 @@ func (p *Parser) fetchYencHeaders(ctx context.Context, segment nzbparser.NzbSegm
 	if cp == nil {
 		return nntppool.YEncMeta{}, &usenet.IncompleteError{Expected: 1, Cause: fmt.Errorf("usenet connection pool is nil")}
 	}
+	releaseConnection, err := p.poolManager.AcquireImportConnection(ctx)
+	if err != nil {
+		return nntppool.YEncMeta{}, &usenet.IncompleteError{Expected: 1, Cause: err}
+	}
+	defer releaseConnection()
 
 	// onMeta fires after =ybegin/=ypart parsing (~first 2 lines), while the
 	// body continues draining to io.Discard. Keep it only as provisional data:
@@ -1152,7 +1450,15 @@ func (p *Parser) fetchYencHeaders(ctx context.Context, segment nzbparser.NzbSegm
 	// corrected transport validates framing, decoded size, and CRC only at the
 	// terminal result boundary.
 	select {
-	case result := <-resultCh:
+	case result, ok := <-resultCh:
+		if !ok {
+			return nntppool.YEncMeta{}, &usenet.IncompleteError{
+				Expected: 1, Cause: fmt.Errorf("BODY completed without a terminal result"),
+			}
+		}
+		if ctx.Err() != nil {
+			return nntppool.YEncMeta{}, &usenet.IncompleteError{Expected: 1, Cause: ctx.Err()}
+		}
 		if result.Err != nil {
 			if usenet.IsHardArticleAbsence(result.Err) {
 				return nntppool.YEncMeta{}, fmt.Errorf("failed to get body: %w", result.Err)
@@ -1183,6 +1489,10 @@ func (p *Parser) fetchYencHeaders(ctx context.Context, segment nzbparser.NzbSegm
 
 		return headers, nil
 	case <-ctx.Done():
+		// BodyAsync may need to finish transport cleanup after observing the
+		// canceled context. Keep the shared import token until that actual
+		// terminal boundary so a replacement BODY cannot oversubscribe the pool.
+		<-resultCh
 		return nntppool.YEncMeta{}, &usenet.IncompleteError{Expected: 1, Cause: ctx.Err()}
 	}
 }

@@ -2,14 +2,23 @@ package database
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func storeRefOperationKey(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
 
 func setupStoreRefTestDB(t *testing.T) *StoreRefRepository {
 	t.Helper()
@@ -22,6 +31,14 @@ func setupStoreRefTestDB(t *testing.T) *StoreRefRepository {
 			store_path TEXT NOT NULL PRIMARY KEY,
 			ref_count  INTEGER NOT NULL DEFAULT 0,
 			updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+		)
+		;
+		CREATE TABLE IF NOT EXISTS nzb_store_ref_operations (
+			operation_key TEXT NOT NULL PRIMARY KEY,
+			store_path_hash TEXT NOT NULL,
+			delta INTEGER NOT NULL CHECK(delta IN (-1, 1)),
+			resulting_ref_count BIGINT NOT NULL CHECK(resulting_ref_count >= 0),
+			applied_at DATETIME NOT NULL
 		)
 	`)
 	require.NoError(t, err)
@@ -141,4 +158,67 @@ func TestStoreRefRepository_MultipleStores(t *testing.T) {
 	countB, err = repo.GetStoreRefCount(ctx, pathB)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), countB, "store B must be unaffected")
+}
+
+func TestStoreRefRepository_ApplyStoreRefDeltaOnceIsDurableAndRawFree(t *testing.T) {
+	repo := setupStoreRefTestDB(t)
+	ctx := context.Background()
+	path := "/store/private-local-name.nzbz"
+	require.NoError(t, repo.IncStoreRef(ctx, path))
+	require.NoError(t, repo.IncStoreRef(ctx, path))
+	key := storeRefOperationKey("queue-7:rollback:candidate-a")
+
+	count, applied, err := repo.ApplyStoreRefDeltaOnce(ctx, key, path, -1)
+	require.NoError(t, err)
+	assert.True(t, applied)
+	assert.Equal(t, int64(1), count)
+	count, applied, err = repo.ApplyStoreRefDeltaOnce(ctx, key, path, -1)
+	require.NoError(t, err)
+	assert.False(t, applied)
+	assert.Equal(t, int64(1), count)
+	actual, err := repo.GetStoreRefCount(ctx, path)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), actual)
+
+	var retainedHash string
+	require.NoError(t, repo.db.QueryRowContext(ctx, `
+		SELECT store_path_hash FROM nzb_store_ref_operations WHERE operation_key = ?
+	`, key).Scan(&retainedHash))
+	assert.NotEqual(t, path, retainedHash)
+	assert.NotContains(t, retainedHash, "private-local-name")
+	_, _, err = repo.ApplyStoreRefDeltaOnce(ctx, key, path, 1)
+	require.ErrorIs(t, err, ErrStoreRefOperationConflict)
+}
+
+func TestStoreRefRepository_ApplyStoreRefDeltaOnceConvergesConcurrently(t *testing.T) {
+	repo := setupStoreRefTestDB(t)
+	ctx := context.Background()
+	key := storeRefOperationKey("concurrent-increment")
+	path := "/store/concurrent.nzbz"
+	var appliedCount atomic.Int64
+	var wg sync.WaitGroup
+	errorsOut := make(chan error, 12)
+	for range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			count, applied, err := repo.ApplyStoreRefDeltaOnce(ctx, key, path, 1)
+			if err == nil && count != 1 {
+				err = fmt.Errorf("unexpected converged count %d", count)
+			}
+			if applied {
+				appliedCount.Add(1)
+			}
+			errorsOut <- err
+		}()
+	}
+	wg.Wait()
+	close(errorsOut)
+	for err := range errorsOut {
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int64(1), appliedCount.Load())
+	count, err := repo.GetStoreRefCount(ctx, path)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), count)
 }

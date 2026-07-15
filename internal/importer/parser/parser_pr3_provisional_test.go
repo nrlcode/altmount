@@ -65,3 +65,61 @@ func TestPR3FetchYencHeadersWaitsForValidatedBody(t *testing.T) {
 	require.False(t, errors.Is(err, nntppool.ErrArticleNotFound),
 		"corrupt BODY must not be converted to hard absence")
 }
+
+type emptyTerminalBodyAsyncClient struct {
+	*fakepool.Client
+}
+
+func (c *emptyTerminalBodyAsyncClient) BodyAsync(
+	context.Context,
+	string,
+	io.Writer,
+	...func(nntppool.YEncMeta),
+) <-chan nntppool.BodyResult {
+	results := make(chan nntppool.BodyResult)
+	close(results)
+	return results
+}
+
+func TestPR5FetchYencHeadersTreatsClosedChannelWithoutResultAsIncomplete(t *testing.T) {
+	client := &emptyTerminalBodyAsyncClient{Client: fakepool.New()}
+	parser := NewParser(newFakeFullPoolManager(client), stormConfigGetter(1))
+	_, err := parser.fetchYencHeaders(
+		context.Background(), nzbparser.NzbSegment{ID: "empty-terminal"}, nil,
+	)
+	require.Error(t, err)
+	require.True(t, usenet.IsIncomplete(err))
+}
+
+type cancelRacingTerminalClient struct {
+	*fakepool.Client
+	cancel context.CancelFunc
+}
+
+func (c *cancelRacingTerminalClient) BodyAsync(
+	context.Context,
+	string,
+	io.Writer,
+	...func(nntppool.YEncMeta),
+) <-chan nntppool.BodyResult {
+	results := make(chan nntppool.BodyResult, 1)
+	c.cancel()
+	results <- nntppool.BodyResult{Err: &nntppool.TransportError{
+		Kind: nntppool.OutcomeHardArticleAbsence, Cause: nntppool.ErrArticleNotFound,
+	}}
+	close(results)
+	return results
+}
+
+func TestPR5FetchYencHeadersCallerCancellationOutranksRacingTerminalResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &cancelRacingTerminalClient{Client: fakepool.New(), cancel: cancel}
+	parser := NewParser(newFakeFullPoolManager(client), stormConfigGetter(1))
+	_, err := parser.fetchYencHeaders(
+		ctx, nzbparser.NzbSegment{ID: "racing-terminal"}, nil,
+	)
+	require.Error(t, err)
+	require.True(t, usenet.IsIncomplete(err))
+	require.False(t, usenet.IsHardArticleAbsence(err),
+		"a terminal-looking result cannot outrank caller cancellation")
+}

@@ -96,3 +96,20 @@ func (b *ImportBudget) NotifyStreamChange() {
 func (b *ImportBudget) Acquire(ctx context.Context) (release func(), err error) {
 	return b.sem.Acquire(ctx)
 }
+
+// AcquireN atomically reserves the maximum number of simultaneous NNTP wire
+// operations a batch may create. It shares the same playback-aware capacity
+// as ordinary import BODY work.
+func (b *ImportBudget) AcquireN(ctx context.Context, slots int) (release func(), err error) {
+	return b.sem.AcquireN(ctx, slots)
+}
+
+// AcquireUpTo reserves a dynamically clamped batch share and reports the
+// granted wire concurrency to the caller. A queued batch follows pool-capacity
+// shrinkage instead of waiting for a now-impossible original weight.
+func (b *ImportBudget) AcquireUpTo(
+	ctx context.Context,
+	maxSlots int,
+) (release func(), granted int, err error) {
+	return b.sem.AcquireUpTo(ctx, maxSlots)
+}

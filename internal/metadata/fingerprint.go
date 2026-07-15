@@ -11,21 +11,35 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const segmentLayoutFingerprintVersion = "altmount-segment-layout-v1"
+const (
+	segmentLayoutFingerprintVersion  = "altmount-segment-layout-v1"
+	nestedPlaybackFingerprintVersion = "altmount-nested-playback-layout-v2"
+)
 
 // CanonicalSegmentLayoutFingerprint returns a representation-independent digest
 // of the final ordered article layout and virtual file size. Mutable health,
 // access, encryption, and storage-compaction fields are intentionally excluded.
 // Article identifiers are fed only into SHA-256 and are never returned or logged.
 func CanonicalSegmentLayoutFingerprint(meta *metapb.FileMetadata) (string, error) {
+	canonical, err := canonicalPlaybackMetadata(meta)
+	if err != nil {
+		return "", err
+	}
+	return fingerprintCanonicalPlaybackMetadata(canonical)
+}
+
+// canonicalPlaybackMetadata resolves storage compaction on a clone and selects
+// the same representation as playback. Nested sources take precedence over
+// main SegmentData; some valid stored metadata intentionally retains both.
+func canonicalPlaybackMetadata(meta *metapb.FileMetadata) (*metapb.FileMetadata, error) {
 	if meta == nil {
-		return "", fmt.Errorf("metadata is required")
+		return nil, fmt.Errorf("metadata is required")
 	}
 	if meta.FileSize < 0 {
-		return "", fmt.Errorf("virtual file size must be non-negative")
+		return nil, fmt.Errorf("virtual file size must be non-negative")
 	}
 	if err := validateResolvedFingerprintLayout(meta); err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// Expansion happens on a clone so callers do not observe a storage-shape
@@ -33,12 +47,29 @@ func CanonicalSegmentLayoutFingerprint(meta *metapb.FileMetadata) (string, error
 	// making compact and already-expanded metadata structurally identical.
 	canonical := proto.Clone(meta).(*metapb.FileMetadata)
 	if err := ExpandSharedOuterSources(canonical); err != nil {
-		return "", fmt.Errorf("expand shared nested sources: %w", err)
+		return nil, fmt.Errorf("expand shared nested sources: %w", err)
 	}
+	if len(canonical.NestedSources) > 0 {
+		canonical.SegmentData = nil
+		canonical.SegmentRuns = nil
+		canonical.SegmentRefs = nil
+		if err := retainNestedPlaybackDependencies(canonical); err != nil {
+			return nil, err
+		}
+	}
+	return canonical, nil
+}
 
+func fingerprintCanonicalPlaybackMetadata(canonical *metapb.FileMetadata) (string, error) {
 	digest := sha256.New()
 	writeFingerprintString(digest, segmentLayoutFingerprintVersion)
 	writeFingerprintInt64(digest, canonical.FileSize)
+	if len(canonical.NestedSources) > 0 {
+		// PR5 narrows nested identity to the articles full-file playback can
+		// actually request. Keep ordinary v1 identities stable while fencing all
+		// earlier nested fingerprints from this corrected dependency domain.
+		writeFingerprintString(digest, nestedPlaybackFingerprintVersion)
+	}
 
 	writeFingerprintUint64(digest, uint64(len(canonical.SegmentData)))
 	for i, segment := range canonical.SegmentData {
@@ -70,8 +101,12 @@ func CanonicalSegmentLayoutFingerprint(meta *metapb.FileMetadata) (string, error
 }
 
 func validateResolvedFingerprintLayout(meta *metapb.FileMetadata) error {
-	if err := validateResolvedSegmentStorage(meta.SegmentData, meta.SegmentRuns, meta.SegmentRefs); err != nil {
-		return fmt.Errorf("main segment layout: %w", err)
+	// Playback ignores retained main SegmentData whenever nested sources exist,
+	// so only require the main representation to be resolved when it is active.
+	if len(meta.NestedSources) == 0 {
+		if err := validateResolvedSegmentStorage(meta.SegmentData, meta.SegmentRuns, meta.SegmentRefs); err != nil {
+			return fmt.Errorf("main segment layout: %w", err)
+		}
 	}
 	for i, shared := range meta.SharedOuterSources {
 		if shared == nil {
@@ -119,6 +154,17 @@ func validateResolvedSegmentStorage(segments []*metapb.SegmentData, runs []*meta
 }
 
 func writeFingerprintSegment(digest hash.Hash, segment *metapb.SegmentData) error {
+	if err := validateFingerprintSegment(segment); err != nil {
+		return err
+	}
+	writeFingerprintString(digest, segment.Id)
+	writeFingerprintInt64(digest, segment.SegmentSize)
+	writeFingerprintInt64(digest, segment.StartOffset)
+	writeFingerprintInt64(digest, segment.EndOffset)
+	return nil
+}
+
+func validateFingerprintSegment(segment *metapb.SegmentData) error {
 	if segment == nil {
 		return fmt.Errorf("segment is nil")
 	}
@@ -131,10 +177,6 @@ func writeFingerprintSegment(digest hash.Hash, segment *metapb.SegmentData) erro
 	if segment.StartOffset < 0 || segment.EndOffset < segment.StartOffset || segment.EndOffset >= segment.SegmentSize {
 		return fmt.Errorf("segment bounds are outside decoded size")
 	}
-	writeFingerprintString(digest, segment.Id)
-	writeFingerprintInt64(digest, segment.SegmentSize)
-	writeFingerprintInt64(digest, segment.StartOffset)
-	writeFingerprintInt64(digest, segment.EndOffset)
 	return nil
 }
 

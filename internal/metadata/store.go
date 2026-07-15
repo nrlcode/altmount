@@ -35,11 +35,22 @@ func NewStoreService(rootPath string) *StoreService {
 
 // WriteStore writes zstd(proto) to ref atomically and refreshes the cache.
 func (ss *StoreService) WriteStore(ref string, store *metapb.NzbStore) error {
+	return ss.writeStore(ref, store, false)
+}
+
+// WriteStoreDurable publishes a store only after its bytes, final directory
+// entry, and any newly-created parent directory entries are durable. It also
+// verifies the final on-disk bytes without consulting the write-through cache.
+func (ss *StoreService) WriteStoreDurable(ref string, store *metapb.NzbStore) error {
+	return ss.writeStore(ref, store, true)
+}
+
+func (ss *StoreService) writeStore(ref string, store *metapb.NzbStore, durable bool) error {
 	raw, err := proto.Marshal(store)
 	if err != nil {
 		return fmt.Errorf("marshal store: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(ref), 0755); err != nil {
+	if err := ensureMetadataDirectory(filepath.Dir(ref), 0o755, durable); err != nil {
 		return fmt.Errorf("mkdir store dir: %w", err)
 	}
 	compressed := ss.encoder.EncodeAll(raw, nil)
@@ -55,6 +66,13 @@ func (ss *StoreService) WriteStore(ref string, store *metapb.NzbStore) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write temp store file: %w", writeErr)
 	}
+	if durable {
+		if syncErr := tmpFile.Sync(); syncErr != nil {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("sync temp store file: %w", syncErr)
+		}
+	}
 	if closeErr := tmpFile.Close(); closeErr != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close temp store file: %w", closeErr)
@@ -63,14 +81,53 @@ func (ss *StoreService) WriteStore(ref string, store *metapb.NzbStore) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename store file: %w", err)
 	}
+	if durable {
+		if err := syncMetadataDirectoryChain(dir, durableStoreDirectoryRoot(dir)); err != nil {
+			return fmt.Errorf("sync store directory: %w", err)
+		}
+		verified, err := ss.readStore(ref, false)
+		if err != nil || !proto.Equal(verified, store) {
+			ss.cache.Remove(ref)
+			if err != nil {
+				return fmt.Errorf("verify durable store: %w", err)
+			}
+			return fmt.Errorf("verify durable store: content mismatch")
+		}
+	}
 	ss.cache.Add(ref, store)
 	return nil
 }
 
+func durableStoreDirectoryRoot(dir string) string {
+	dir = filepath.Clean(dir)
+	for current := dir; ; current = filepath.Dir(current) {
+		if filepath.Base(current) == ".nzbs" {
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return dir
+		}
+	}
+}
+
 // ReadStore reads and decompresses a store, caching the result.
 func (ss *StoreService) ReadStore(ref string) (*metapb.NzbStore, error) {
-	if c, ok := ss.cache.Get(ref); ok {
-		return c, nil
+	return ss.readStore(ref, true)
+}
+
+// ReadStoreFromDisk bypasses the decompressed cache. Import durability checks
+// use this to prove the bytes that will survive restart, not the object that
+// WriteStore most recently cached.
+func (ss *StoreService) ReadStoreFromDisk(ref string) (*metapb.NzbStore, error) {
+	return ss.readStore(ref, false)
+}
+
+func (ss *StoreService) readStore(ref string, allowCache bool) (*metapb.NzbStore, error) {
+	if allowCache {
+		if c, ok := ss.cache.Get(ref); ok {
+			return c, nil
+		}
 	}
 	compressed, err := os.ReadFile(ref)
 	if err != nil {
@@ -84,8 +141,33 @@ func (ss *StoreService) ReadStore(ref string) (*metapb.NzbStore, error) {
 	if err := proto.Unmarshal(raw, store); err != nil {
 		return nil, fmt.Errorf("unmarshal store: %w", err)
 	}
-	ss.cache.Add(ref, store)
+	if allowCache {
+		ss.cache.Add(ref, store)
+	}
 	return store, nil
+}
+
+// RemoveStore removes both the durable store and any cached decoded value.
+func (ss *StoreService) RemoveStore(ref string) error {
+	ss.cache.Remove(ref)
+	if err := os.Remove(ref); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// RemoveStoreDurable removes a store and persists the directory-entry change.
+func (ss *StoreService) RemoveStoreDurable(ref string) error {
+	if err := ss.RemoveStore(ref); err != nil {
+		return err
+	}
+	dir := filepath.Dir(ref)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return syncMetadataDirectoryChain(dir, durableStoreDirectoryRoot(dir))
 }
 
 // FlatSegments returns all segments in flat order: files in order, each file's
