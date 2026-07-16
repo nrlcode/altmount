@@ -129,8 +129,8 @@ func createFailCheckingTrigger(t *testing.T, db *sql.DB) {
 	t.Helper()
 	_, err := db.Exec(`
 		CREATE TRIGGER fail_checking_claim
-		BEFORE UPDATE OF status ON file_health
-		WHEN NEW.status = 'checking'
+		BEFORE UPDATE OF health_claim_token ON file_health
+		WHEN NEW.health_claim_token IS NOT NULL
 		BEGIN
 			SELECT RAISE(FAIL, 'synthetic checking claim failure');
 		END;
@@ -147,6 +147,42 @@ func TestHealthCycleClaimFailureStopsBeforeSweepAndDeletion(t *testing.T) {
 	assert.Error(t, err, "claim failure must fail the cycle closed")
 	assert.Equal(t, int64(0), client.StatCalls(), "failed claim must prevent the hard-absence sweep")
 	fixture.assertPreserved(t)
+}
+
+func TestHealthCycleOneFailedClaimRollsBackWholeBatch(t *testing.T) {
+	client := fakepool.New()
+	fixture := newDestructiveClaimFixture(t, client)
+
+	secondPath := "complete/fenced/show.s01e02.mkv"
+	secondLibraryPath := filepath.Join(filepath.Dir(fixture.libraryPath), "show.s01e02.mkv")
+	require.NoError(t, os.WriteFile(secondLibraryPath, []byte("second current library content"), 0o644))
+	writeHealthyFile(t, fixture.env, secondPath)
+	insertFileHealth(t, fixture.env.db, secondPath, secondLibraryPath, 0, 3)
+	secondMetadataPath := fixture.env.metadataService.GetMetadataFilePath(secondPath)
+
+	_, err := fixture.env.db.Exec(`
+		CREATE TRIGGER fail_one_checking_claim
+		BEFORE UPDATE OF health_claim_token ON file_health
+		WHEN NEW.health_claim_token IS NOT NULL
+		 AND NEW.file_path = 'complete/fenced/show.s01e02.mkv'
+		BEGIN
+			SELECT RAISE(FAIL, 'synthetic second-row claim failure');
+		END;
+	`)
+	require.NoError(t, err)
+
+	err = fixture.env.hw.runHealthCheckCycle(context.Background())
+	assert.Error(t, err, "one rejected candidate must roll the entire claim batch back")
+	assert.Equal(t, int64(0), client.StatCalls(), "partial claim must not start any batch sweep")
+	fixture.assertPreserved(t)
+	_, err = os.Stat(secondMetadataPath)
+	require.NoError(t, err, "the failed candidate metadata must remain")
+	_, err = os.Stat(secondLibraryPath)
+	require.NoError(t, err, "the failed candidate library content must remain")
+	secondRecord, err := fixture.env.healthRepo.GetFileHealth(context.Background(), secondPath)
+	require.NoError(t, err)
+	require.NotNil(t, secondRecord)
+	assert.NotEqual(t, database.HealthStatusChecking, secondRecord.Status, "rollback must not strand a sibling claim")
 }
 
 func TestHealthCycleStaleSelectedRowRollsBackThenCanProgress(t *testing.T) {
