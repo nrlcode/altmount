@@ -576,11 +576,6 @@ func TestBackgroundCheckStopCancelsTrackedClaimBeforeReturning(t *testing.T) {
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	t.Cleanup(cancelWorker)
 	require.NoError(t, fixture.env.hw.Start(workerCtx))
-	t.Cleanup(func() {
-		if fixture.env.hw.IsRunning() {
-			_ = fixture.env.hw.Stop(context.Background())
-		}
-	})
 	require.NoError(t, fixture.env.hw.PerformBackgroundCheck(context.Background(), fixture.filePath))
 	require.Eventually(t, func() bool {
 		return client.InFlight() == 1 && fixture.env.hw.IsCheckActive(fixture.filePath)
