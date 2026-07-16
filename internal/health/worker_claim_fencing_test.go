@@ -77,6 +77,51 @@ func (c *claimRevokingClient) StatMany(ctx context.Context, messageIDs []string,
 	return c.Client.StatMany(ctx, messageIDs, opts)
 }
 
+// finalizationReplacingClient waits for the underlying STAT sweep to finish,
+// installs a replacement owner, and only then releases the results to the
+// worker. This pins the ownership change between transport evidence and final
+// publication without adding a production-only test hook.
+type finalizationReplacingClient struct {
+	*fakepool.Client
+	db       *sql.DB
+	filePath string
+	err      error
+}
+
+func (c *finalizationReplacingClient) StatMany(ctx context.Context, messageIDs []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
+	in := c.Client.StatMany(ctx, messageIDs, opts)
+	out := make(chan nntppool.StatManyResult, len(messageIDs))
+	go func() {
+		defer close(out)
+		results := make([]nntppool.StatManyResult, 0, len(messageIDs))
+		for result := range in {
+			results = append(results, result)
+		}
+
+		_, c.err = c.db.Exec(`
+			UPDATE file_health
+			SET status = 'checking',
+			    metadata = '{"owner":"b"}',
+			    health_claim_token = 'owner-b',
+			    scheduled_check_at = '2042-03-04 05:06:07',
+			    last_error = 'owner-b-error',
+			    error_details = '{"owner":"b","evidence":"complete"}'
+			WHERE file_path = ?
+		`, c.filePath)
+		if c.err != nil {
+			return
+		}
+		for _, result := range results {
+			select {
+			case out <- result:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
 type destructiveClaimFixture struct {
 	env          *repairTestEnv
 	client       *fakepool.Client
@@ -96,7 +141,10 @@ func newDestructiveClaimFixture(t *testing.T, client pool.NntpClient) *destructi
 
 	baseClient, ok := client.(*fakepool.Client)
 	if !ok {
-		if wrapped, wrappedOK := client.(*claimRevokingClient); wrappedOK {
+		switch wrapped := client.(type) {
+		case *claimRevokingClient:
+			baseClient = wrapped.Client
+		case *finalizationReplacingClient:
 			baseClient = wrapped.Client
 		}
 	}
@@ -504,7 +552,49 @@ func TestRepairTriggerRequiresFreshRotationBeforeARR(t *testing.T) {
 
 	err = fixture.env.hw.runHealthCheckCycle(context.Background())
 	assert.Error(t, err)
+	assert.Empty(t, fixture.env.mockARRs.calls, "failed pre-ARR rotation must prevent every ARR request")
 	fixture.assertPreserved(t)
+}
+
+func TestPreSTATRotationFailureStopsBeforeSweepAndPreservesState(t *testing.T) {
+	client := fakepool.New()
+	fixture := newDestructiveClaimFixture(t, client)
+	createFailNextClaimRotationTrigger(t, fixture.env.db)
+
+	err := fixture.env.hw.runHealthCheckCycle(context.Background())
+	assert.Error(t, err, "failed pre-STAT rotation must fail the worker cycle closed")
+	assert.Equal(t, int64(0), client.StatCalls(), "transport evidence must not start without the fresh pre-STAT token")
+	fixture.assertPreserved(t)
+}
+
+func TestHealthCycleLostClaimBeforeHealthyPublicationPreservesReplacementOwnerState(t *testing.T) {
+	base := fakepool.New()
+	wrapped := &finalizationReplacingClient{Client: base}
+	fixture := newDestructiveClaimFixture(t, wrapped)
+	base.SetDefaultBehavior(fakepool.SegmentBehavior{})
+	wrapped.db = fixture.env.db
+	wrapped.filePath = fixture.filePath
+
+	err := fixture.env.hw.runHealthCheckCycle(context.Background())
+	assert.Error(t, err, "a zero-row token-bound final publication must be reported")
+	require.NoError(t, wrapped.err)
+	assert.Equal(t, int64(1), base.StatCalls(), "owner replacement occurs only after the accepted STAT finishes")
+
+	var status, metadata, scheduledAt string
+	var token, lastError, errorDetails sql.NullString
+	require.NoError(t, fixture.env.db.QueryRow(`
+		SELECT status, metadata, health_claim_token, scheduled_check_at, last_error, error_details
+		FROM file_health WHERE file_path = ?
+	`, fixture.filePath).Scan(&status, &metadata, &token, &scheduledAt, &lastError, &errorDetails))
+	assert.Equal(t, "checking", status)
+	assert.JSONEq(t, `{"owner":"b"}`, metadata)
+	assert.True(t, token.Valid, "replacement ownership token must remain present")
+	assert.Equal(t, "owner-b", token.String)
+	assert.Contains(t, scheduledAt, "2042-03-04 05:06:07")
+	assert.True(t, lastError.Valid)
+	assert.Equal(t, "owner-b-error", lastError.String)
+	assert.True(t, errorDetails.Valid)
+	assert.JSONEq(t, `{"owner":"b","evidence":"complete"}`, errorDetails.String)
 }
 
 func TestDestructiveRotationZeroRowsFailsClosed(t *testing.T) {
