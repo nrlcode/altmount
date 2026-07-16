@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -21,6 +22,15 @@ type healthClaimRotationAPI interface {
 	RotateHealthClaim(context.Context, int64, string, HealthStatus, string) (string, error)
 }
 
+// healthCleanupDeleteAPI freezes the administrative cleanup authority boundary.
+// The row returned by each DELETE is the current row that the database actually
+// removed; callers must not drive physical cleanup from an earlier unlocked read.
+type healthCleanupDeleteAPI interface {
+	DeleteHealthRecordByIDReturning(context.Context, int64) (*FileHealth, error)
+	DeleteHealthRecordsBulkReturning(context.Context, []string) ([]*FileHealth, error)
+	DeleteHealthRecordsByDateReturning(context.Context, time.Time, *HealthStatus) ([]*FileHealth, error)
+}
+
 func requireHealthBatchClaimAPI(t *testing.T, repo *HealthRepository) healthBatchClaimAPI {
 	t.Helper()
 	claims, ok := any(repo).(healthBatchClaimAPI)
@@ -33,6 +43,13 @@ func requireHealthClaimRotationAPI(t *testing.T, repo *HealthRepository) healthC
 	rotation, ok := any(repo).(healthClaimRotationAPI)
 	require.True(t, ok, "HealthRepository must expose checked fresh-token RotateHealthClaim")
 	return rotation
+}
+
+func requireHealthCleanupDeleteAPI(t *testing.T, repo *HealthRepository) healthCleanupDeleteAPI {
+	t.Helper()
+	cleanup, ok := any(repo).(healthCleanupDeleteAPI)
+	require.True(t, ok, "HealthRepository must expose atomic delete-and-return cleanup boundaries")
+	return cleanup
 }
 
 func TestClaimFilesCheckingBulkReturnsFreshRowsWithUniquePerRowTokens(t *testing.T) {
@@ -243,4 +260,168 @@ func TestUpdateHealthStatusBulkStaleGuardRollsBackOwnedSibling(t *testing.T) {
 	require.NotNil(t, stale)
 	assert.Equal(t, HealthStatusHealthy, stale.Status)
 	assert.Equal(t, 7, stale.RepairRetryCount)
+}
+
+func TestHealthCleanupDeleteByIDReturnsFreshRelinkedRow(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+	const oldPath = "cleanup/by-id-old.mkv"
+	const currentPath = "cleanup/by-id-current.mkv"
+	const oldLibrary = "/library/old/by-id.mkv"
+	const currentLibrary = "/library/current/by-id.mkv"
+
+	_, err := repo.db.ExecContext(ctx, `
+		INSERT INTO file_health (file_path, library_path, status, metadata)
+		VALUES (?, ?, 'corrupted', '{"revision":"old"}')
+	`, oldPath, oldLibrary)
+	require.NoError(t, err)
+	selected, err := repo.GetFileHealth(ctx, oldPath)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+
+	_, err = repo.db.ExecContext(ctx, `
+		UPDATE file_health
+		SET file_path = ?, library_path = ?, metadata = '{"revision":"current"}'
+		WHERE id = ?
+	`, currentPath, currentLibrary, selected.ID)
+	require.NoError(t, err)
+
+	deleted, err := requireHealthCleanupDeleteAPI(t, repo).DeleteHealthRecordByIDReturning(ctx, selected.ID)
+	require.NoError(t, err)
+	require.NotNil(t, deleted)
+	assert.Equal(t, selected.ID, deleted.ID)
+	assert.Equal(t, currentPath, deleted.FilePath, "physical cleanup must follow the current same-ID relink")
+	require.NotNil(t, deleted.LibraryPath)
+	assert.Equal(t, currentLibrary, *deleted.LibraryPath)
+	require.NotNil(t, deleted.Metadata)
+	assert.JSONEq(t, `{"revision":"current"}`, *deleted.Metadata)
+
+	current, err := repo.GetFileHealthByID(ctx, selected.ID)
+	require.NoError(t, err)
+	assert.Nil(t, current)
+}
+
+func TestHealthCleanupBulkReturningUsesCurrentPathRows(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+	const stalePath = "cleanup/bulk-relinked-old.mkv"
+	const relinkedPath = "cleanup/bulk-relinked-current.mkv"
+	const replacedPath = "cleanup/bulk-reimported.mkv"
+
+	_, err := repo.db.ExecContext(ctx, `
+		INSERT INTO file_health (file_path, library_path, status, metadata)
+		VALUES (?, '/library/stale-relink.mkv', 'corrupted', '{"revision":"old"}'),
+		       (?, '/library/stale-reimport.mkv', 'corrupted', '{"revision":"old"}')
+	`, stalePath, replacedPath)
+	require.NoError(t, err)
+
+	relinked, err := repo.GetFileHealth(ctx, stalePath)
+	require.NoError(t, err)
+	require.NotNil(t, relinked)
+	_, err = repo.db.ExecContext(ctx, `
+		UPDATE file_health
+		SET file_path = ?, library_path = '/library/current-relink.mkv', metadata = '{"revision":"current"}'
+		WHERE id = ?
+	`, relinkedPath, relinked.ID)
+	require.NoError(t, err)
+
+	replaced, err := repo.GetFileHealth(ctx, replacedPath)
+	require.NoError(t, err)
+	require.NotNil(t, replaced)
+	_, err = repo.db.ExecContext(ctx, `DELETE FROM file_health WHERE id = ?`, replaced.ID)
+	require.NoError(t, err)
+	_, err = repo.db.ExecContext(ctx, `
+		INSERT INTO file_health (file_path, library_path, status, metadata)
+		VALUES (?, '/library/current-reimport.mkv', 'pending', '{"revision":"current"}')
+	`, replacedPath)
+	require.NoError(t, err)
+
+	deleted, err := requireHealthCleanupDeleteAPI(t, repo).DeleteHealthRecordsBulkReturning(
+		ctx, []string{stalePath, replacedPath},
+	)
+	require.NoError(t, err)
+	require.Len(t, deleted, 1)
+	assert.Equal(t, replacedPath, deleted[0].FilePath)
+	assert.NotEqual(t, replaced.ID, deleted[0].ID, "same-path replacement must be represented by its current identity")
+	require.NotNil(t, deleted[0].LibraryPath)
+	assert.Equal(t, "/library/current-reimport.mkv", *deleted[0].LibraryPath)
+	require.NotNil(t, deleted[0].Metadata)
+	assert.JSONEq(t, `{"revision":"current"}`, *deleted[0].Metadata)
+
+	stillRelinked, err := repo.GetFileHealth(ctx, relinkedPath)
+	require.NoError(t, err)
+	require.NotNil(t, stillRelinked, "a path-based request must not delete a row relinked away from the requested path")
+	assert.Equal(t, relinked.ID, stillRelinked.ID)
+}
+
+func TestHealthCleanupDeleteByDateRechecksEligibilityAndReturnsFreshRows(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+	const eligiblePath = "cleanup/age-current.mkv"
+	const revokedPath = "cleanup/age-revoked.mkv"
+
+	_, err := repo.db.ExecContext(ctx, `
+		INSERT INTO file_health (file_path, library_path, status, metadata, created_at)
+		VALUES (?, '/library/stale-age.mkv', 'corrupted', '{"revision":"old"}', datetime('now', '-30 days')),
+		       (?, '/library/revoked-age.mkv', 'corrupted', '{"revision":"old"}', datetime('now', '-30 days'))
+	`, eligiblePath, revokedPath)
+	require.NoError(t, err)
+	_, err = repo.db.ExecContext(ctx, `
+		UPDATE file_health
+		SET library_path = '/library/current-age.mkv', metadata = '{"revision":"current"}'
+		WHERE file_path = ?
+	`, eligiblePath)
+	require.NoError(t, err)
+	_, err = repo.db.ExecContext(ctx, `
+		UPDATE file_health SET status = 'healthy', created_at = datetime('now') WHERE file_path = ?
+	`, revokedPath)
+	require.NoError(t, err)
+
+	status := HealthStatusCorrupted
+	deleted, err := requireHealthCleanupDeleteAPI(t, repo).DeleteHealthRecordsByDateReturning(
+		ctx, time.Now().Add(-7*24*time.Hour), &status,
+	)
+	require.NoError(t, err)
+	require.Len(t, deleted, 1)
+	assert.Equal(t, eligiblePath, deleted[0].FilePath)
+	require.NotNil(t, deleted[0].LibraryPath)
+	assert.Equal(t, "/library/current-age.mkv", *deleted[0].LibraryPath)
+	require.NotNil(t, deleted[0].Metadata)
+	assert.JSONEq(t, `{"revision":"current"}`, *deleted[0].Metadata)
+
+	revoked, err := repo.GetFileHealth(ctx, revokedPath)
+	require.NoError(t, err)
+	require.NotNil(t, revoked, "current age/status eligibility must be checked by the deleting statement")
+	assert.Equal(t, HealthStatusHealthy, revoked.Status)
+}
+
+func TestDeleteHealthRecordsBulkRollsBackEarlierChunks(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+	paths := make([]string, 251)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("cleanup/rollback-%03d.mkv", i)
+		_, err := repo.db.ExecContext(ctx, `
+			INSERT INTO file_health (file_path, status) VALUES (?, 'corrupted')
+		`, paths[i])
+		require.NoError(t, err)
+	}
+	_, err := repo.db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TRIGGER reject_later_cleanup_chunk
+		BEFORE DELETE ON file_health
+		WHEN OLD.file_path = '%s'
+		BEGIN
+			SELECT RAISE(FAIL, 'synthetic later-chunk cleanup failure');
+		END
+	`, paths[250]))
+	require.NoError(t, err)
+
+	deleted, err := repo.DeleteHealthRecordsBulk(ctx, paths)
+	require.Error(t, err)
+	assert.Equal(t, int64(0), deleted, "rolled-back chunks must not be reported as durably deleted")
+	for _, path := range []string{paths[0], paths[249], paths[250]} {
+		row, getErr := repo.GetFileHealth(ctx, path)
+		require.NoError(t, getErr)
+		assert.NotNil(t, row, "all chunks must roll back when a later chunk fails: %s", path)
+	}
 }
