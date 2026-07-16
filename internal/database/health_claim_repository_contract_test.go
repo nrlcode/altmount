@@ -470,8 +470,11 @@ func TestHealthCleanupDeleteByDateRechecksEligibilityAndReturnsFreshRows(t *test
 	owned, err := repo.GetFileHealth(ctx, ownedPath)
 	require.NoError(t, err)
 	require.NotNil(t, owned, "unattended age cleanup must defer an actively owned row")
-	require.NotNil(t, owned.HealthClaimToken)
-	assert.Equal(t, "active-owner", *owned.HealthClaimToken)
+	var ownedToken string
+	require.NoError(t, repo.db.QueryRowContext(ctx, `
+		SELECT health_claim_token FROM file_health WHERE id = ?
+	`, owned.ID).Scan(&ownedToken))
+	assert.Equal(t, "active-owner", ownedToken)
 }
 
 func TestAutomaticBulkCleanupSkipsActiveClaims(t *testing.T) {
@@ -494,8 +497,11 @@ func TestAutomaticBulkCleanupSkipsActiveClaims(t *testing.T) {
 	owned, err := repo.GetFileHealth(ctx, ownedPath)
 	require.NoError(t, err)
 	require.NotNil(t, owned, "automatic reconciliation must leave active ownership for a later pass")
-	require.NotNil(t, owned.HealthClaimToken)
-	assert.Equal(t, "active-owner", *owned.HealthClaimToken)
+	var ownedToken string
+	require.NoError(t, repo.db.QueryRowContext(ctx, `
+		SELECT health_claim_token FROM file_health WHERE id = ?
+	`, owned.ID).Scan(&ownedToken))
+	assert.Equal(t, "active-owner", ownedToken)
 }
 
 func TestDeleteHealthRecordsBulkRollsBackEarlierChunks(t *testing.T) {
