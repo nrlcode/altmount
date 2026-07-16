@@ -106,6 +106,11 @@ func TestManualRepairHandlersRequireClaimBeforeARR(t *testing.T) {
 			_, err = app.Test(req, -1)
 			require.NoError(t, err)
 			assert.Equal(t, int64(0), requests.Load(), "ARR must not be called when durable repair admission fails")
+			var token string
+			require.NoError(t, db.QueryRow(`
+				SELECT health_claim_token FROM file_health WHERE file_path = 'movies/fenced.mkv'
+			`).Scan(&token))
+			assert.Equal(t, "foreign-owner", token, "a losing manual repair must preserve the exact winning token")
 		})
 	}
 }

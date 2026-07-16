@@ -257,6 +257,27 @@ func createIgnoreSecondClaimRotationTrigger(t *testing.T, db *sql.DB) {
 	require.NoError(t, err)
 }
 
+func createReplaceOwnerInsideClaimTrigger(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(`
+		CREATE TRIGGER replace_owner_inside_claim
+		AFTER UPDATE OF health_claim_token ON file_health
+		WHEN OLD.health_claim_token IS NULL
+		 AND NEW.health_claim_token IS NOT NULL
+		BEGIN
+			UPDATE file_health
+			SET library_path = '/owner-b/library.mkv',
+			    metadata = '{"owner":"b"}',
+			    health_claim_token = 'owner-b',
+			    scheduled_check_at = '2042-03-04 05:06:07',
+			    last_error = 'owner-b-error',
+			    error_details = '{"owner":"b","evidence":"replacement"}'
+			WHERE id = NEW.id;
+		END;
+	`)
+	require.NoError(t, err)
+}
+
 func TestHealthCycleClaimFailureStopsBeforeSweepAndDeletion(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
@@ -340,6 +361,27 @@ func TestHealthCycleClaimsAndUsesFreshRowAfterPreClaimMutation(t *testing.T) {
 	require.NoError(t, oldErr, "the stale preselection library path must never be deleted")
 	_, currentErr := os.Stat(newLibraryPath)
 	assert.True(t, os.IsNotExist(currentErr), "the fresh row returned under the claim must drive the deletion")
+}
+
+func TestClaimTransactionRejectsReplacementBeforeTokenBoundReread(t *testing.T) {
+	client := fakepool.New()
+	fixture := newDestructiveClaimFixture(t, client)
+	createReplaceOwnerInsideClaimTrigger(t, fixture.env.db)
+
+	err := fixture.env.hw.runHealthCheckCycle(context.Background())
+	assert.Error(t, err, "a claim whose token is replaced before its row is returned must roll back")
+	assert.Equal(t, int64(0), client.StatCalls(), "an unlocked post-claim read must never authorize STAT")
+	fixture.assertPreserved(t)
+
+	var status, libraryPath string
+	var token sql.NullString
+	require.NoError(t, fixture.env.db.QueryRow(`
+		SELECT status, library_path, health_claim_token
+		FROM file_health WHERE file_path = ?
+	`, fixture.filePath).Scan(&status, &libraryPath, &token))
+	assert.Equal(t, "pending", status, "the failed claim transaction must restore the pre-claim phase")
+	assert.Equal(t, fixture.libraryPath, libraryPath, "an unowned replacement row must not escape a failed claim transaction")
+	assert.False(t, token.Valid, "the rejected claim and trigger replacement must both roll back")
 }
 
 func TestHealthCycleStaleSelectedRowRollsBackThenCanProgress(t *testing.T) {

@@ -2,6 +2,7 @@ package nzbfilesystem
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -130,6 +131,10 @@ func TestStreamingDeleteOnCorruptionRequiresCurrentHealthOwnership(t *testing.T)
 	require.NoError(t, err)
 	require.NotNil(t, fh, "an unowned streaming callback must not delete the health authority")
 	assert.Equal(t, database.HealthStatusChecking, fh.Status)
+	var token sql.NullString
+	require.NoError(t, db.QueryRow(`SELECT health_claim_token FROM file_health WHERE file_path = ?`, filePath).Scan(&token))
+	assert.True(t, token.Valid, "an unowned delete callback must preserve ownership")
+	assert.Equal(t, "foreign-owner", token.String, "an unowned delete callback must preserve the exact winning token")
 	meta, err := ms.ReadFileMetadata(filePath)
 	require.NoError(t, err)
 	require.NotNil(t, meta, "an unowned callback must not delete or hide metadata")
@@ -164,6 +169,10 @@ func TestStreamingRepairMoveRequiresCurrentHealthOwnership(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, fh)
 	assert.Equal(t, database.HealthStatusChecking, fh.Status, "unowned streaming evidence may not publish repair authority")
+	var token sql.NullString
+	require.NoError(t, db.QueryRow(`SELECT health_claim_token FROM file_health WHERE file_path = ?`, filePath).Scan(&token))
+	assert.True(t, token.Valid, "an unowned repair/move callback must preserve ownership")
+	assert.Equal(t, "foreign-owner", token.String, "an unowned repair/move callback must preserve the exact winning token")
 	meta, err := ms.ReadFileMetadata(filePath)
 	require.NoError(t, err)
 	require.NotNil(t, meta, "unowned streaming evidence must not move metadata")
