@@ -113,8 +113,8 @@ func TestStreamingDeleteOnCorruptionRequiresCurrentHealthOwnership(t *testing.T)
 	require.NoError(t, os.WriteFile(libraryPath, []byte("current"), 0o644))
 	_, err := db.Exec(`
 		INSERT INTO file_health
-			(file_path, library_path, status, scheduled_check_at, health_claim_token, health_claim_version)
-		VALUES (?, ?, 'checking', datetime('now'), 'foreign-owner', 1)
+			(file_path, library_path, status, scheduled_check_at, health_claim_token)
+		VALUES (?, ?, 'checking', datetime('now'), 'foreign-owner')
 	`, filePath, libraryPath)
 	require.NoError(t, err)
 
@@ -149,8 +149,8 @@ func TestStreamingRepairMoveRequiresCurrentHealthOwnership(t *testing.T) {
 	seg := writeStreamMeta(t, ms, filePath)
 	_, err := db.Exec(`
 		INSERT INTO file_health
-			(file_path, library_path, status, scheduled_check_at, health_claim_token, health_claim_version)
-		VALUES (?, ?, 'checking', datetime('now'), 'foreign-owner', 1)
+			(file_path, library_path, status, scheduled_check_at, health_claim_token)
+		VALUES (?, ?, 'checking', datetime('now'), 'foreign-owner')
 	`, filePath, libraryPath)
 	require.NoError(t, err)
 

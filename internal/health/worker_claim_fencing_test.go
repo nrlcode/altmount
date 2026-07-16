@@ -26,9 +26,10 @@ type discoveryMutationARRs struct {
 }
 
 type sameStatusMutationARRs struct {
-	db       *sql.DB
-	filePath string
-	err      error
+	db             *sql.DB
+	filePath       string
+	newLibraryPath string
+	err            error
 }
 
 func (m *sameStatusMutationARRs) TriggerFileRescan(context.Context, string, string, *string) error {
@@ -38,9 +39,9 @@ func (m *sameStatusMutationARRs) TriggerFileRescan(context.Context, string, stri
 func (m *sameStatusMutationARRs) DiscoverFileMetadata(context.Context, string, string, string, string) (*model.WebhookMetadata, error) {
 	_, m.err = m.db.Exec(`
 		UPDATE file_health
-		SET metadata = '{"ownership":"changed"}'
+		SET library_path = ?
 		WHERE file_path = ? AND status = 'pending'
-	`, m.filePath)
+	`, m.newLibraryPath, m.filePath)
 	return nil, m.err
 }
 
@@ -160,15 +161,49 @@ func createFailCheckingTrigger(t *testing.T, db *sql.DB) {
 	require.NoError(t, err)
 }
 
-func createFailClaimConsumptionTrigger(t *testing.T, db *sql.DB) {
+func createFailNextClaimRotationTrigger(t *testing.T, db *sql.DB) {
 	t.Helper()
 	_, err := db.Exec(`
-		CREATE TRIGGER fail_claim_consumption
+		CREATE TRIGGER fail_next_claim_rotation
 		BEFORE UPDATE OF health_claim_token ON file_health
 		WHEN OLD.health_claim_token IS NOT NULL
-		 AND NEW.health_claim_token IS NULL
+		 AND NEW.health_claim_token IS NOT NULL
+		 AND NEW.health_claim_token != OLD.health_claim_token
+		 AND (SELECT COUNT(*) FROM test_health_claim_audit) >= 1
 		BEGIN
-			SELECT RAISE(FAIL, 'synthetic claim consumption failure');
+			SELECT RAISE(FAIL, 'synthetic claim rotation failure');
+		END;
+	`)
+	require.NoError(t, err)
+}
+
+func createFailSecondClaimRotationTrigger(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(`
+		CREATE TRIGGER fail_second_claim_rotation
+		BEFORE UPDATE OF health_claim_token ON file_health
+		WHEN OLD.health_claim_token IS NOT NULL
+		 AND NEW.health_claim_token IS NOT NULL
+		 AND NEW.health_claim_token != OLD.health_claim_token
+		 AND (SELECT COUNT(*) FROM test_health_claim_audit) >= 2
+		BEGIN
+			SELECT RAISE(FAIL, 'synthetic destructive rotation failure');
+		END;
+	`)
+	require.NoError(t, err)
+}
+
+func createIgnoreSecondClaimRotationTrigger(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(`
+		CREATE TRIGGER ignore_second_claim_rotation
+		BEFORE UPDATE OF health_claim_token ON file_health
+		WHEN OLD.health_claim_token IS NOT NULL
+		 AND NEW.health_claim_token IS NOT NULL
+		 AND NEW.health_claim_token != OLD.health_claim_token
+		 AND (SELECT COUNT(*) FROM test_health_claim_audit) >= 2
+		BEGIN
+			SELECT RAISE(IGNORE);
 		END;
 	`)
 	require.NoError(t, err)
@@ -185,17 +220,17 @@ func TestHealthCycleClaimFailureStopsBeforeSweepAndDeletion(t *testing.T) {
 	fixture.assertPreserved(t)
 }
 
-func TestMissingMetadataDeletionRequiresConsumedClaim(t *testing.T) {
+func TestMissingMetadataDeletionRequiresFreshDestructiveRotation(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
 	require.NoError(t, os.Remove(fixture.metadataPath))
-	createFailClaimConsumptionTrigger(t, fixture.env.db)
+	createFailNextClaimRotationTrigger(t, fixture.env.db)
 
 	err := fixture.env.hw.runHealthCheckCycle(context.Background())
 	assert.Error(t, err)
 	record, getErr := fixture.env.healthRepo.GetFileHealth(context.Background(), fixture.filePath)
 	require.NoError(t, getErr)
-	assert.NotNil(t, record, "missing metadata is evidence only until exact claim consumption succeeds")
+	assert.NotNil(t, record, "missing metadata is evidence only until a fresh destructive rotation succeeds")
 	_, statErr := os.Stat(fixture.libraryPath)
 	require.NoError(t, statErr)
 }
@@ -237,17 +272,26 @@ func TestHealthCycleMixedBatchOmitsLostClaimAndPreservesSiblingAlignment(t *test
 	assert.NotEqual(t, database.HealthStatusChecking, secondRecord.Status, "the lost candidate must remain eligible for a later attempt")
 }
 
-func TestHealthCycleSameStatusOwnershipMutationCannotBeClaimed(t *testing.T) {
+func TestHealthCycleClaimsAndUsesFreshRowAfterPreClaimMutation(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
-	mutator := &sameStatusMutationARRs{db: fixture.env.db, filePath: fixture.filePath}
+	newLibraryPath := filepath.Join(filepath.Dir(fixture.libraryPath), "current-show.s01e01.mkv")
+	require.NoError(t, os.WriteFile(newLibraryPath, []byte("new current library content"), 0o644))
+	mutator := &sameStatusMutationARRs{
+		db:             fixture.env.db,
+		filePath:       fixture.filePath,
+		newLibraryPath: newLibraryPath,
+	}
 	fixture.env.hw.arrsService = mutator
 
 	err := fixture.env.hw.runHealthCheckCycle(context.Background())
-	assert.Error(t, err, "same-status ownership mutation must invalidate the selected snapshot")
+	require.NoError(t, err, "the worker may claim a current row after a pre-claim mutation")
 	require.NoError(t, mutator.err)
-	assert.Equal(t, int64(0), client.StatCalls(), "a pre-claim ownership mutation must prevent STAT")
-	fixture.assertPreserved(t)
+	assert.Equal(t, int64(1), client.StatCalls())
+	_, oldErr := os.Stat(fixture.libraryPath)
+	require.NoError(t, oldErr, "the stale preselection library path must never be deleted")
+	_, currentErr := os.Stat(newLibraryPath)
+	assert.True(t, os.IsNotExist(currentErr), "the fresh row returned under the claim must drive the deletion")
 }
 
 func TestHealthCycleStaleSelectedRowRollsBackThenCanProgress(t *testing.T) {
@@ -326,7 +370,7 @@ func TestRepairNotificationClaimFailureCannotDelete(t *testing.T) {
 	assert.Empty(t, fixture.env.mockARRs.calls, "a lost repair claim must not reach ARR")
 }
 
-func TestRepairNotificationRequiresConsumedClaimBeforeARRAndMove(t *testing.T) {
+func TestRepairNotificationRequiresFreshRotationBeforeARRAndMove(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
 	fixture.env.hw.configGetter().Health.CorruptionAction = "repair"
@@ -336,11 +380,11 @@ func TestRepairNotificationRequiresConsumedClaimBeforeARRAndMove(t *testing.T) {
 		WHERE file_path = ?
 	`, fixture.filePath)
 	require.NoError(t, err)
-	createFailClaimConsumptionTrigger(t, fixture.env.db)
+	createFailNextClaimRotationTrigger(t, fixture.env.db)
 
 	err = fixture.env.hw.runHealthCheckCycle(context.Background())
 	assert.Error(t, err)
-	assert.Empty(t, fixture.env.mockARRs.calls, "repair notification must consume its exact claim before ARR")
+	assert.Empty(t, fixture.env.mockARRs.calls, "repair notification must freshly rotate its exact claim before ARR")
 	fixture.assertPreserved(t)
 }
 
@@ -368,12 +412,12 @@ func TestDirectCheckOnlyOneConcurrentClaimantCanReachSTAT(t *testing.T) {
 	assert.True(t, (firstErr == nil) != (secondErr == nil), "exactly one claimant should own the check: first=%v second=%v", firstErr, secondErr)
 }
 
-func TestBackgroundClaimFailureDoesNotClobberForeignOwner(t *testing.T) {
+func TestBackgroundClaimFailureCannotReleaseOrClobberForeignOwner(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
 	_, err := fixture.env.db.Exec(`
 		UPDATE file_health
-		SET status = 'checking', health_claim_token = 'foreign-owner', health_claim_version = health_claim_version + 1
+		SET status = 'checking', health_claim_token = 'foreign-owner'
 		WHERE file_path = ?
 	`, fixture.filePath)
 	require.NoError(t, err)
@@ -381,12 +425,13 @@ func TestBackgroundClaimFailureDoesNotClobberForeignOwner(t *testing.T) {
 	fixture.env.hw.running = true
 	fixture.env.hw.mu.Unlock()
 
-	require.NoError(t, fixture.env.hw.PerformBackgroundCheck(context.Background(), fixture.filePath))
-	require.Eventually(t, func() bool {
-		var status, token string
-		queryErr := fixture.env.db.QueryRow(`SELECT status, health_claim_token FROM file_health WHERE file_path = ?`, fixture.filePath).Scan(&status, &token)
-		return queryErr == nil && status == "checking" && token == "foreign-owner" && !fixture.env.hw.IsCheckActive(fixture.filePath)
-	}, time.Second, 5*time.Millisecond, "a failed background admission must not reset another owner's row")
+	err = fixture.env.hw.PerformBackgroundCheck(context.Background(), fixture.filePath)
+	assert.Error(t, err, "foreign ownership must reject background admission synchronously")
+	var status, token string
+	require.NoError(t, fixture.env.db.QueryRow(`SELECT status, health_claim_token FROM file_health WHERE file_path = ?`, fixture.filePath).Scan(&status, &token))
+	assert.Equal(t, "checking", status)
+	assert.Equal(t, "foreign-owner", token, "a losing worker must not clear or rotate the winner's token")
+	assert.False(t, fixture.env.hw.IsCheckActive(fixture.filePath))
 	assert.Equal(t, int64(0), client.StatCalls())
 }
 
@@ -434,7 +479,7 @@ func TestHealthCycleFinalPublicationFailureReleasesOwnedClaimInProcess(t *testin
 	assert.Equal(t, int64(2), client.StatCalls(), "the released row must make progress in the same process")
 }
 
-func TestRepairExhaustedMoveRequiresConsumedClaim(t *testing.T) {
+func TestRepairExhaustedMoveRequiresFreshDestructiveRotation(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
 	fixture.env.hw.configGetter().Health.CorruptionAction = "repair"
@@ -442,41 +487,84 @@ func TestRepairExhaustedMoveRequiresConsumedClaim(t *testing.T) {
 		UPDATE file_health SET retry_count = 2, repair_retry_count = 3 WHERE file_path = ?
 	`, fixture.filePath)
 	require.NoError(t, err)
-	createFailClaimConsumptionTrigger(t, fixture.env.db)
+	createFailSecondClaimRotationTrigger(t, fixture.env.db)
 
 	err = fixture.env.hw.runHealthCheckCycle(context.Background())
 	assert.Error(t, err)
 	fixture.assertPreserved(t)
 }
 
-func TestRepairTriggerMoveRequiresConsumedClaim(t *testing.T) {
+func TestRepairTriggerRequiresFreshRotationBeforeARR(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
 	fixture.env.hw.configGetter().Health.CorruptionAction = "repair"
 	_, err := fixture.env.db.Exec(`UPDATE file_health SET retry_count = 2 WHERE file_path = ?`, fixture.filePath)
 	require.NoError(t, err)
-	createFailClaimConsumptionTrigger(t, fixture.env.db)
+	createFailSecondClaimRotationTrigger(t, fixture.env.db)
 
 	err = fixture.env.hw.runHealthCheckCycle(context.Background())
 	assert.Error(t, err)
 	fixture.assertPreserved(t)
 }
 
-func TestRepairReplacementCleanupRequiresConsumedClaim(t *testing.T) {
+func TestDestructiveRotationZeroRowsFailsClosed(t *testing.T) {
+	client := fakepool.New()
+	fixture := newDestructiveClaimFixture(t, client)
+	createIgnoreSecondClaimRotationTrigger(t, fixture.env.db)
+
+	err := fixture.env.hw.runHealthCheckCycle(context.Background())
+	assert.Error(t, err, "a zero-row destructive rotation must be treated as lost ownership")
+	assert.Equal(t, int64(1), client.StatCalls(), "the already-authorized sweep may finish")
+	fixture.assertPreserved(t)
+}
+
+func TestSuccessfulARRThenLostClaimCannotMoveMetadata(t *testing.T) {
+	client := fakepool.New()
+	fixture := newDestructiveClaimFixture(t, client)
+	fixture.env.hw.configGetter().Health.CorruptionAction = "repair"
+	fixture.env.mockARRs.onTrigger = func() {
+		_, err := fixture.env.db.Exec(`
+			UPDATE file_health SET health_claim_token = 'post-arr-owner'
+			WHERE file_path = ?
+		`, fixture.filePath)
+		require.NoError(t, err)
+	}
+	_, err := fixture.env.db.Exec(`UPDATE file_health SET retry_count = 2 WHERE file_path = ?`, fixture.filePath)
+	require.NoError(t, err)
+
+	err = fixture.env.hw.runHealthCheckCycle(context.Background())
+	assert.Error(t, err)
+	require.Len(t, fixture.env.mockARRs.calls, 1, "ARR may complete before ownership is stolen")
+	fixture.assertPreserved(t)
+	var token string
+	require.NoError(t, fixture.env.db.QueryRow(`SELECT health_claim_token FROM file_health WHERE file_path = ?`, fixture.filePath).Scan(&token))
+	assert.Equal(t, "post-arr-owner", token)
+}
+
+func TestRepairReplacementCleanupRequiresCurrentRotationAfterARR(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
 	fixture.env.hw.configGetter().Health.CorruptionAction = "repair"
 	fixture.env.mockARRs.returnErr = arrs.ErrEpisodeAlreadySatisfied
+	fixture.env.mockARRs.onTrigger = func() {
+		_, err := fixture.env.db.Exec(`
+			UPDATE file_health SET health_claim_token = 'replacement-owner'
+			WHERE file_path = ?
+		`, fixture.filePath)
+		require.NoError(t, err)
+	}
 	_, err := fixture.env.db.Exec(`UPDATE file_health SET retry_count = 2 WHERE file_path = ?`, fixture.filePath)
 	require.NoError(t, err)
-	createFailClaimConsumptionTrigger(t, fixture.env.db)
 
 	err = fixture.env.hw.runHealthCheckCycle(context.Background())
 	assert.Error(t, err)
 	fixture.assertPreserved(t)
+	var token string
+	require.NoError(t, fixture.env.db.QueryRow(`SELECT health_claim_token FROM file_health WHERE file_path = ?`, fixture.filePath).Scan(&token))
+	assert.Equal(t, "replacement-owner", token)
 }
 
-func TestMetadataRegenerationRequiresConsumedClaim(t *testing.T) {
+func TestMetadataRegenerationRequiresFreshRotation(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
 	fixture.env.hw.configGetter().Health.CorruptionAction = "repair"
@@ -489,11 +577,40 @@ func TestMetadataRegenerationRequiresConsumedClaim(t *testing.T) {
 		WHERE file_path = ?
 	`, fixture.filePath)
 	require.NoError(t, err)
-	createFailClaimConsumptionTrigger(t, fixture.env.db)
+	createFailNextClaimRotationTrigger(t, fixture.env.db)
 
 	err = fixture.env.hw.runHealthCheckCycle(context.Background())
 	assert.Error(t, err)
-	assert.Equal(t, int64(0), importer.calls.Load(), "metadata regeneration must follow checked claim consumption")
+	assert.Equal(t, int64(0), importer.calls.Load(), "metadata regeneration must follow a fresh checked rotation")
+}
+
+func TestHealthClaimAndSweepRotationUseDistinctFreshTokens(t *testing.T) {
+	client := fakepool.New()
+	fixture := newDestructiveClaimFixture(t, client)
+	client.SetDefaultBehavior(fakepool.SegmentBehavior{})
+
+	require.NoError(t, fixture.env.hw.runHealthCheckCycle(context.Background()))
+	rows, err := fixture.env.db.Query(`
+		SELECT token FROM test_health_claim_audit
+		WHERE file_path = ? ORDER BY rowid
+	`, fixture.filePath)
+	require.NoError(t, err)
+	defer rows.Close()
+	var tokens []string
+	for rows.Next() {
+		var token string
+		require.NoError(t, rows.Scan(&token))
+		tokens = append(tokens, token)
+	}
+	require.NoError(t, rows.Err())
+	require.GreaterOrEqual(t, len(tokens), 2, "admission and pre-STAT rotation must both be audited")
+	seen := make(map[string]struct{}, len(tokens))
+	for _, token := range tokens {
+		assert.NotEmpty(t, token)
+		_, reused := seen[token]
+		assert.False(t, reused, "every ownership boundary must use a globally fresh token")
+		seen[token] = struct{}{}
+	}
 }
 
 func TestHealthClaimReleaseDoesNotRaceAcrossConcurrentCleanup(t *testing.T) {
@@ -519,14 +636,14 @@ func TestRestartClearsClaimsButPreservesDurableRepairPhase(t *testing.T) {
 	const repairPath = "complete/fenced/repair-phase.mkv"
 	_, err := fixture.env.db.Exec(`
 		UPDATE file_health
-		SET status = 'checking', health_claim_token = 'checking-owner', health_claim_version = 7
+		SET status = 'checking', health_claim_token = 'checking-owner'
 		WHERE file_path = ?
 	`, fixture.filePath)
 	require.NoError(t, err)
 	_, err = fixture.env.db.Exec(`
 		INSERT INTO file_health
-			(file_path, status, scheduled_check_at, health_claim_token, health_claim_version)
-		VALUES (?, 'repair_triggered', datetime('now', '-1 second'), 'repair-owner', 11)
+			(file_path, status, scheduled_check_at, health_claim_token)
+		VALUES (?, 'repair_triggered', datetime('now', '-1 second'), 'repair-owner')
 	`, repairPath)
 	require.NoError(t, err)
 

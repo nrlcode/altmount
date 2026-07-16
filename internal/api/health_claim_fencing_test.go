@@ -53,27 +53,13 @@ func newAPIHealthClaimFixture(t *testing.T) (*sql.DB, *database.HealthRepository
 			is_masked BOOLEAN DEFAULT FALSE,
 			indexer TEXT,
 			download_id TEXT,
-			health_claim_token TEXT,
-			health_claim_version INTEGER NOT NULL DEFAULT 0
+			health_claim_token TEXT
 		)
 	`)
 	require.NoError(t, err)
 	cfg := config.DefaultConfig()
 	cfg.Metadata.RootPath = t.TempDir()
 	return db, database.NewHealthRepository(db, database.DialectSQLite), metadata.NewMetadataService(cfg.Metadata.RootPath), cfg
-}
-
-func installRejectAPIHealthClaim(t *testing.T, db *sql.DB) {
-	t.Helper()
-	_, err := db.Exec(`
-		CREATE TRIGGER reject_api_health_claim
-		BEFORE UPDATE OF health_claim_token ON file_health
-		WHEN NEW.health_claim_token IS NOT NULL
-		BEGIN
-			SELECT RAISE(FAIL, 'synthetic API claim failure');
-		END
-	`)
-	require.NoError(t, err)
 }
 
 func TestManualRepairHandlersRequireClaimBeforeARR(t *testing.T) {
@@ -98,11 +84,10 @@ func TestManualRepairHandlersRequireClaimBeforeARR(t *testing.T) {
 			cfg.Arrs.RadarrInstances = []config.ArrsInstanceConfig{{Name: "radarr-test", URL: upstream.URL, APIKey: "test", Enabled: &enabled}}
 			meta := `{"instanceName":"radarr-test","movie":{"id":1}}`
 			_, err := db.Exec(`
-				INSERT INTO file_health (file_path, status, metadata, scheduled_check_at)
-				VALUES ('movies/fenced.mkv', 'corrupted', ?, datetime('now'))
+				INSERT INTO file_health (file_path, status, metadata, scheduled_check_at, health_claim_token)
+				VALUES ('movies/fenced.mkv', 'corrupted', ?, datetime('now'), 'foreign-owner')
 			`, meta)
 			require.NoError(t, err)
-			installRejectAPIHealthClaim(t, db)
 
 			manager := &mockConfigManager{cfg: cfg}
 			server := &Server{
