@@ -60,7 +60,8 @@ func newCleanupTestHealthRepo(t *testing.T) *database.HealthRepository {
 			streaming_failure_count INTEGER DEFAULT 0,
 			is_masked BOOLEAN DEFAULT FALSE,
 			indexer TEXT DEFAULT NULL,
-			download_id TEXT DEFAULT NULL
+			download_id TEXT DEFAULT NULL,
+			health_claim_token TEXT DEFAULT NULL
 		);
 	`)
 	require.NoError(t, err)

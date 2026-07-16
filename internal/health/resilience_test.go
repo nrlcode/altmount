@@ -48,7 +48,8 @@ func newResilienceDB(t *testing.T) *sql.DB {
 			streaming_failure_count INTEGER DEFAULT 0,
 			is_masked BOOLEAN DEFAULT FALSE,
 			indexer TEXT DEFAULT NULL,
-			download_id TEXT DEFAULT NULL
+			download_id TEXT DEFAULT NULL,
+			health_claim_token TEXT DEFAULT NULL
 		);
 
 		CREATE TABLE IF NOT EXISTS system_state (

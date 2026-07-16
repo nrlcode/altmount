@@ -100,6 +100,28 @@ func TestPR3UnconfirmedCorruptBodyDoesNotDeleteOrRepair(t *testing.T) {
 	assert.NotNil(t, meta, "unconfirmed corruption must not delete or move metadata")
 }
 
+func TestStreamingDeleteOnCorruptionMissingHealthRowFailsClosed(t *testing.T) {
+	repo, _, ms := setupStreamHealthEnv(t)
+	ctx := context.Background()
+	const filePath = "movies/missing-health-owner.mkv"
+	seg := writeStreamMeta(t, ms, filePath)
+
+	enabled := true
+	cfg := config.DefaultConfig()
+	cfg.Health.Enabled = &enabled
+	cfg.Health.CorruptionAction = "delete"
+	mvf := newStreamFailureMVF(ctx, filePath, repo, ms, seg, cfg)
+	mvf.updateFileHealthOnError(&usenet.DataCorruptionError{
+		UnderlyingErr: errors.New("article not found"),
+		NoRetry:       true,
+	}, true)
+
+	meta, err := ms.ReadFileMetadata(filePath)
+	require.NoError(t, err)
+	require.NotNil(t, meta, "missing database ownership must preserve metadata")
+	assert.Equal(t, metapb.FileStatus_FILE_STATUS_HEALTHY, meta.Status)
+}
+
 func TestStreamingDeleteOnCorruptionRequiresCurrentHealthOwnership(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlinks not supported on Windows")

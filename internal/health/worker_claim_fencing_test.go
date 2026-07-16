@@ -568,6 +568,44 @@ func TestBackgroundCheckClaimsSynchronouslyBeforeReturning(t *testing.T) {
 	assert.Equal(t, int64(0), client.StatCalls())
 }
 
+func TestBackgroundCheckStopCancelsTrackedClaimBeforeReturning(t *testing.T) {
+	client := fakepool.New()
+	fixture := newDestructiveClaimFixture(t, client)
+	client.SetDefaultBehavior(fakepool.SegmentBehavior{Latency: time.Hour})
+
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	t.Cleanup(cancelWorker)
+	require.NoError(t, fixture.env.hw.Start(workerCtx))
+	t.Cleanup(func() {
+		if fixture.env.hw.IsRunning() {
+			_ = fixture.env.hw.Stop(context.Background())
+		}
+	})
+	require.NoError(t, fixture.env.hw.PerformBackgroundCheck(context.Background(), fixture.filePath))
+	require.Eventually(t, func() bool {
+		return client.InFlight() == 1 && fixture.env.hw.IsCheckActive(fixture.filePath)
+	}, time.Second, time.Millisecond)
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- fixture.env.hw.Stop(context.Background()) }()
+	select {
+	case err := <-stopDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return after canceling the admitted background check")
+	}
+
+	assert.Zero(t, client.InFlight(), "worker shutdown must cancel admitted background transport")
+	assert.False(t, fixture.env.hw.IsCheckActive(fixture.filePath))
+	var status string
+	var token sql.NullString
+	require.NoError(t, fixture.env.db.QueryRow(`
+		SELECT status, health_claim_token FROM file_health WHERE file_path = ?
+	`, fixture.filePath).Scan(&status, &token))
+	assert.Equal(t, "pending", status, "shutdown cancellation must re-arm an owned checking row")
+	assert.False(t, token.Valid, "Stop must not return while its background claim remains installed")
+}
+
 func TestHealthCycleFinalPublicationFailureReleasesOwnedClaimInProcess(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
