@@ -257,48 +257,31 @@ func createIgnoreSecondClaimRotationTrigger(t *testing.T, db *sql.DB) {
 	require.NoError(t, err)
 }
 
-func installAuditAndIgnoreFreshClaimRotation(db *sql.DB) error {
-	_, err := db.Exec(`
-		CREATE TABLE test_post_arr_rotation_attempts (
-			old_token TEXT NOT NULL,
-			new_token TEXT NOT NULL
-		);
+const postARRFreshRotationSentinel = "facore_post_arr_fresh_rotation_attempt"
 
-		CREATE TRIGGER audit_and_ignore_fresh_claim_rotation
+func installRejectFreshClaimRotationWithSentinel(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TRIGGER reject_fresh_claim_rotation_with_sentinel
 		BEFORE UPDATE OF health_claim_token ON file_health
 		WHEN OLD.health_claim_token IS NOT NULL
 		 AND NEW.health_claim_token IS NOT NULL
 		 AND NEW.health_claim_token != OLD.health_claim_token
 		BEGIN
-			INSERT INTO test_post_arr_rotation_attempts(old_token, new_token)
-			VALUES (OLD.health_claim_token, NEW.health_claim_token);
-			SELECT RAISE(IGNORE);
+			SELECT RAISE(FAIL, 'facore_post_arr_fresh_rotation_attempt');
 		END;
 	`)
 	return err
 }
 
-func assertOnePostARRFreshRotationAttempt(t *testing.T, db *sql.DB) {
+func assertPostARRFreshRotationSentinel(t *testing.T, err error) {
 	t.Helper()
-	rows, err := db.Query(`SELECT old_token, new_token FROM test_post_arr_rotation_attempts ORDER BY rowid`)
-	require.NoError(t, err)
-	defer rows.Close()
-
-	type attempt struct{ oldToken, newToken string }
-	var attempts []attempt
-	for rows.Next() {
-		var got attempt
-		require.NoError(t, rows.Scan(&got.oldToken, &got.newToken))
-		attempts = append(attempts, got)
+	assert.Error(t, err, "post-ARR authority must attempt a checked distinct-token rotation")
+	errText := ""
+	if err != nil {
+		errText = err.Error()
 	}
-	require.NoError(t, rows.Err())
-	assert.Len(t, attempts, 1, "the worker must attempt exactly one checked post-ARR rotation")
-	if len(attempts) != 1 {
-		return
-	}
-	assert.NotEmpty(t, attempts[0].oldToken)
-	assert.NotEmpty(t, attempts[0].newToken)
-	assert.NotEqual(t, attempts[0].oldToken, attempts[0].newToken, "post-ARR authority must use a globally fresh token")
+	assert.Contains(t, errText, postARRFreshRotationSentinel,
+		"only the distinct-token trigger sentinel proves the post-ARR rotation was attempted")
 }
 
 func createReplaceOwnerInsideClaimTrigger(t *testing.T, db *sql.DB) {
@@ -723,16 +706,15 @@ func TestSuccessfulARRRequiresFreshPostARRRotationBeforeMove(t *testing.T) {
 	fixture.env.hw.configGetter().Health.CorruptionAction = "repair"
 	var triggerErr error
 	fixture.env.mockARRs.onTrigger = func() {
-		triggerErr = installAuditAndIgnoreFreshClaimRotation(fixture.env.db)
+		triggerErr = installRejectFreshClaimRotationWithSentinel(fixture.env.db)
 	}
 	_, err := fixture.env.db.Exec(`UPDATE file_health SET retry_count = 2 WHERE file_path = ?`, fixture.filePath)
 	require.NoError(t, err)
 
 	err = fixture.env.hw.runHealthCheckCycle(context.Background())
-	assert.Error(t, err, "successful ARR must be followed by a distinct checked token before metadata move")
+	assertPostARRFreshRotationSentinel(t, err)
 	require.NoError(t, triggerErr)
 	require.Len(t, fixture.env.mockARRs.calls, 1, "ARR succeeds before the rejected post-ARR rotation")
-	assertOnePostARRFreshRotationAttempt(t, fixture.env.db)
 	fixture.assertPreserved(t)
 }
 
@@ -766,16 +748,15 @@ func TestAlreadySatisfiedCleanupRequiresFreshPostARRRotation(t *testing.T) {
 	fixture.env.mockARRs.returnErr = arrs.ErrEpisodeAlreadySatisfied
 	var triggerErr error
 	fixture.env.mockARRs.onTrigger = func() {
-		triggerErr = installAuditAndIgnoreFreshClaimRotation(fixture.env.db)
+		triggerErr = installRejectFreshClaimRotationWithSentinel(fixture.env.db)
 	}
 	_, err := fixture.env.db.Exec(`UPDATE file_health SET retry_count = 2 WHERE file_path = ?`, fixture.filePath)
 	require.NoError(t, err)
 
 	err = fixture.env.hw.runHealthCheckCycle(context.Background())
-	assert.Error(t, err, "AlreadySatisfied cleanup must be preceded by a distinct checked post-ARR token")
+	assertPostARRFreshRotationSentinel(t, err)
 	require.NoError(t, triggerErr)
 	require.Len(t, fixture.env.mockARRs.calls, 1, "ARR response arrives before the rejected cleanup rotation")
-	assertOnePostARRFreshRotationAttempt(t, fixture.env.db)
 	fixture.assertPreserved(t)
 }
 
@@ -791,14 +772,13 @@ func TestRepairNotificationSuccessfulARRRequiresFreshPostARRRotationBeforeMove(t
 	require.NoError(t, err)
 	var triggerErr error
 	fixture.env.mockARRs.onTrigger = func() {
-		triggerErr = installAuditAndIgnoreFreshClaimRotation(fixture.env.db)
+		triggerErr = installRejectFreshClaimRotationWithSentinel(fixture.env.db)
 	}
 
 	err = fixture.env.hw.runHealthCheckCycle(context.Background())
-	assert.Error(t, err, "successful repair notification ARR must rotate freshly before metadata move")
+	assertPostARRFreshRotationSentinel(t, err)
 	require.NoError(t, triggerErr)
 	require.Len(t, fixture.env.mockARRs.calls, 1, "repair notification reaches ARR before the rejected post-ARR rotation")
-	assertOnePostARRFreshRotationAttempt(t, fixture.env.db)
 	fixture.assertPreserved(t)
 }
 
