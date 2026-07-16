@@ -139,8 +139,23 @@ func newRepairTestEnv(t *testing.T, tempDir string, arrsErr error, configure ...
 			streaming_failure_count INTEGER DEFAULT 0,
 			is_masked BOOLEAN DEFAULT FALSE,
 			indexer TEXT DEFAULT NULL,
-			download_id TEXT DEFAULT NULL
+			download_id TEXT DEFAULT NULL,
+			health_claim_token TEXT DEFAULT NULL
 		);
+
+		CREATE TRIGGER IF NOT EXISTS test_update_file_health_timestamp
+		AFTER UPDATE ON file_health
+		BEGIN
+			UPDATE file_health SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+		END;
+
+		CREATE TRIGGER IF NOT EXISTS test_revoke_health_claim
+		AFTER UPDATE OF status, file_path, library_path, metadata, source_nzb_path ON file_health
+		WHEN OLD.health_claim_token IS NOT NULL
+		 AND NEW.health_claim_token = OLD.health_claim_token
+		BEGIN
+			UPDATE file_health SET health_claim_token = NULL WHERE id = NEW.id;
+		END;
 
 		CREATE TABLE IF NOT EXISTS system_state (
 			key TEXT PRIMARY KEY,
