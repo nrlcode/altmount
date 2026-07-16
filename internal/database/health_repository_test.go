@@ -40,7 +40,8 @@ func setupTestDB(t *testing.T) *HealthRepository {
 			streaming_failure_count INTEGER DEFAULT 0,
 			is_masked BOOLEAN DEFAULT FALSE,
 			indexer TEXT DEFAULT NULL,
-			download_id TEXT DEFAULT NULL
+			download_id TEXT DEFAULT NULL,
+			health_claim_token TEXT DEFAULT NULL
 		);
 	`)
 	require.NoError(t, err)
@@ -602,7 +603,7 @@ func TestResetStalePendingFiles_ResetsStuckPending(t *testing.T) {
 	require.NotNil(t, hBefore)
 	assert.Equal(t, HealthStatusPending, hBefore.Status)
 	assert.Equal(t, 0, hBefore.RetryCount)
-	
+
 	// Now run ResetStalePendingFiles
 	err = repo.ResetStalePendingFiles(ctx)
 	require.NoError(t, err)
@@ -611,7 +612,7 @@ func TestResetStalePendingFiles_ResetsStuckPending(t *testing.T) {
 	hAfter, err := repo.GetFileHealth(ctx, filePath)
 	require.NoError(t, err)
 	require.NotNil(t, hAfter)
-	
+
 	got := queryScheduledCheckAt(t, repo, filePath)
 	require.NotNil(t, got)
 	assert.True(t, got.Before(time.Now().UTC().Add(1*time.Minute)), "stuck file scheduled time should be reset to now (got %v)", got)
@@ -716,4 +717,3 @@ func TestRelinkFileByFilename_ConflictMerge(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, oldH)
 }
-

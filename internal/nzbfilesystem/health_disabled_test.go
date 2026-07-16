@@ -50,8 +50,20 @@ func setupStreamHealthEnv(t *testing.T) (*database.HealthRepository, *sql.DB, *m
 			streaming_failure_count INTEGER DEFAULT 0,
 			is_masked BOOLEAN DEFAULT FALSE,
 			indexer TEXT DEFAULT NULL,
-			download_id TEXT DEFAULT NULL
+			download_id TEXT DEFAULT NULL,
+			health_claim_token TEXT DEFAULT NULL,
+			health_claim_version INTEGER NOT NULL DEFAULT 0
 		);
+
+		CREATE TRIGGER revoke_stream_test_health_claim
+		AFTER UPDATE OF status, file_path, library_path, metadata, source_nzb_path ON file_health
+		WHEN NEW.health_claim_version = OLD.health_claim_version
+		BEGIN
+			UPDATE file_health
+			SET health_claim_token = NULL,
+			    health_claim_version = health_claim_version + 1
+			WHERE id = NEW.id;
+		END;
 	`)
 	require.NoError(t, err)
 
@@ -224,4 +236,3 @@ func TestUpdateFileHealthOnError_FailureMasking_MasksRepair(t *testing.T) {
 	original, _ = ms.ReadFileMetadata(filePath)
 	assert.Nil(t, original, "metadata should be moved to corrupted folder now")
 }
-
