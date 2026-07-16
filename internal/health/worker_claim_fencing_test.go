@@ -257,6 +257,20 @@ func createIgnoreSecondClaimRotationTrigger(t *testing.T, db *sql.DB) {
 	require.NoError(t, err)
 }
 
+func installRejectNextFreshClaimRotation(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TRIGGER reject_next_fresh_claim_rotation
+		BEFORE UPDATE OF health_claim_token ON file_health
+		WHEN OLD.health_claim_token IS NOT NULL
+		 AND NEW.health_claim_token IS NOT NULL
+		 AND NEW.health_claim_token != OLD.health_claim_token
+		BEGIN
+			SELECT RAISE(FAIL, 'synthetic post-ARR fresh rotation failure');
+		END;
+	`)
+	return err
+}
+
 func createReplaceOwnerInsideClaimTrigger(t *testing.T, db *sql.DB) {
 	t.Helper()
 	_, err := db.Exec(`
@@ -673,6 +687,24 @@ func TestSuccessfulARRThenLostClaimCannotMoveMetadata(t *testing.T) {
 	assert.Equal(t, "post-arr-owner", token)
 }
 
+func TestSuccessfulARRRequiresFreshPostARRRotationBeforeMove(t *testing.T) {
+	client := fakepool.New()
+	fixture := newDestructiveClaimFixture(t, client)
+	fixture.env.hw.configGetter().Health.CorruptionAction = "repair"
+	var triggerErr error
+	fixture.env.mockARRs.onTrigger = func() {
+		triggerErr = installRejectNextFreshClaimRotation(fixture.env.db)
+	}
+	_, err := fixture.env.db.Exec(`UPDATE file_health SET retry_count = 2 WHERE file_path = ?`, fixture.filePath)
+	require.NoError(t, err)
+
+	err = fixture.env.hw.runHealthCheckCycle(context.Background())
+	assert.Error(t, err, "successful ARR must be followed by a distinct checked token before metadata move")
+	require.NoError(t, triggerErr)
+	require.Len(t, fixture.env.mockARRs.calls, 1, "ARR succeeds before the rejected post-ARR rotation")
+	fixture.assertPreserved(t)
+}
+
 func TestRepairReplacementCleanupRequiresCurrentRotationAfterARR(t *testing.T) {
 	client := fakepool.New()
 	fixture := newDestructiveClaimFixture(t, client)
@@ -694,6 +726,25 @@ func TestRepairReplacementCleanupRequiresCurrentRotationAfterARR(t *testing.T) {
 	var token string
 	require.NoError(t, fixture.env.db.QueryRow(`SELECT health_claim_token FROM file_health WHERE file_path = ?`, fixture.filePath).Scan(&token))
 	assert.Equal(t, "replacement-owner", token)
+}
+
+func TestAlreadySatisfiedCleanupRequiresFreshPostARRRotation(t *testing.T) {
+	client := fakepool.New()
+	fixture := newDestructiveClaimFixture(t, client)
+	fixture.env.hw.configGetter().Health.CorruptionAction = "repair"
+	fixture.env.mockARRs.returnErr = arrs.ErrEpisodeAlreadySatisfied
+	var triggerErr error
+	fixture.env.mockARRs.onTrigger = func() {
+		triggerErr = installRejectNextFreshClaimRotation(fixture.env.db)
+	}
+	_, err := fixture.env.db.Exec(`UPDATE file_health SET retry_count = 2 WHERE file_path = ?`, fixture.filePath)
+	require.NoError(t, err)
+
+	err = fixture.env.hw.runHealthCheckCycle(context.Background())
+	assert.Error(t, err, "AlreadySatisfied cleanup must be preceded by a distinct checked post-ARR token")
+	require.NoError(t, triggerErr)
+	require.Len(t, fixture.env.mockARRs.calls, 1, "ARR response arrives before the rejected cleanup rotation")
+	fixture.assertPreserved(t)
 }
 
 func TestMetadataRegenerationRequiresFreshRotation(t *testing.T) {

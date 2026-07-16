@@ -108,7 +108,7 @@ func TestUpdateHealthStatusBulk_ExpectedStatusGuard(t *testing.T) {
 		{Type: UpdateTypeRepairRetry, FilePath: "rescued.mkv", ScheduledCheckAt: now, ExpectedStatus: &repairStatus},
 		{Type: UpdateTypeRepairRetry, FilePath: "still_repair.mkv", ScheduledCheckAt: now, ExpectedStatus: &repairStatus},
 	})
-	require.NoError(t, err)
+	assert.Error(t, err, "a stale-first guarded batch must fail atomically")
 
 	rescued, err := repo.GetFileHealth(ctx, "rescued.mkv")
 	require.NoError(t, err)
@@ -118,7 +118,7 @@ func TestUpdateHealthStatusBulk_ExpectedStatusGuard(t *testing.T) {
 	still, err := repo.GetFileHealth(ctx, "still_repair.mkv")
 	require.NoError(t, err)
 	assert.Equal(t, HealthStatusRepairTriggered, still.Status)
-	assert.Equal(t, 2, still.RepairRetryCount, "guard must allow the write when status still matches")
+	assert.Equal(t, 1, still.RepairRetryCount, "the later owned sibling must not publish after an earlier stale guard")
 }
 
 // TestUpdateHealthStatusBulk_NoGuardAppliesRegardless verifies that without ExpectedStatus
