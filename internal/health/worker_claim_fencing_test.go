@@ -652,7 +652,7 @@ func TestHealthCycleLostClaimBeforeHealthyPublicationPreservesReplacementOwnerSt
 	var status, metadata, scheduledAt string
 	var token, lastError, errorDetails sql.NullString
 	require.NoError(t, fixture.env.db.QueryRow(`
-		SELECT status, metadata, health_claim_token, scheduled_check_at, last_error, error_details
+		SELECT status, metadata, health_claim_token, CAST(scheduled_check_at AS TEXT), last_error, error_details
 		FROM file_health WHERE file_path = ?
 	`, fixture.filePath).Scan(&status, &metadata, &token, &scheduledAt, &lastError, &errorDetails))
 	assert.Equal(t, "checking", status)
