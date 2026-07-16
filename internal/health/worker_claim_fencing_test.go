@@ -146,6 +146,8 @@ func newDestructiveClaimFixture(t *testing.T, client pool.NntpClient) *destructi
 			baseClient = wrapped.Client
 		case *finalizationReplacingClient:
 			baseClient = wrapped.Client
+		case *heldStatClient:
+			baseClient = wrapped.Client
 		}
 	}
 	require.NotNil(t, baseClient)
