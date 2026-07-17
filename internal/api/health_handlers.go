@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,8 +14,16 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/health"
 	"github.com/javi11/altmount/internal/utils"
 )
+
+func healthEffectsTemporarilyDisabled(c *fiber.Ctx) error {
+	return RespondError(c, fiber.StatusConflict, "health_effects_temporarily_disabled",
+		"Health effects are temporarily disabled", "")
+}
+
+func healthEffectsEnabled() bool { return false }
 
 // handleListHealth handles GET /api/health
 //
@@ -175,6 +184,9 @@ func (s *Server) handleGetHealth(c *fiber.Ctx) error {
 //	@Security		BearerAuth
 //	@Router			/health/{id} [delete]
 func (s *Server) handleDeleteHealth(c *fiber.Ctx) error {
+	if !healthEffectsEnabled() {
+		return healthEffectsTemporarilyDisabled(c)
+	}
 	// Extract ID from path parameter
 	idStr := c.Params("id")
 	if idStr == "" {
@@ -268,6 +280,9 @@ func (s *Server) handleDeleteHealth(c *fiber.Ctx) error {
 //	@Security		BearerAuth
 //	@Router			/health/bulk/delete [post]
 func (s *Server) handleDeleteHealthBulk(c *fiber.Ctx) error {
+	if !healthEffectsEnabled() {
+		return healthEffectsTemporarilyDisabled(c)
+	}
 	// Parse request body
 	var req struct {
 		FilePaths     []string `json:"file_paths"`
@@ -283,7 +298,6 @@ func (s *Server) handleDeleteHealthBulk(c *fiber.Ctx) error {
 	if len(req.FilePaths) == 0 {
 		return RespondValidationError(c, "At least one file path is required", "")
 	}
-
 
 	metaDeletedCount := 0
 	symlinkDeletedCount := 0
@@ -359,6 +373,9 @@ func (s *Server) handleDeleteHealthBulk(c *fiber.Ctx) error {
 //	@Security		BearerAuth
 //	@Router			/health/{id}/repair [post]
 func (s *Server) handleRepairHealth(c *fiber.Ctx) error {
+	if !healthEffectsEnabled() {
+		return healthEffectsTemporarilyDisabled(c)
+	}
 	// Extract ID from path parameter
 	idStr := c.Params("id")
 	if idStr == "" {
@@ -474,6 +491,9 @@ func (s *Server) handleRepairHealth(c *fiber.Ctx) error {
 //	@Security		BearerAuth
 //	@Router			/health/bulk/repair [post]
 func (s *Server) handleRepairHealthBulk(c *fiber.Ctx) error {
+	if !healthEffectsEnabled() {
+		return healthEffectsTemporarilyDisabled(c)
+	}
 	// Parse request body
 	var req struct {
 		FilePaths []string `json:"file_paths"`
@@ -487,7 +507,6 @@ func (s *Server) handleRepairHealthBulk(c *fiber.Ctx) error {
 	if len(req.FilePaths) == 0 {
 		return RespondValidationError(c, "At least one file path is required", "")
 	}
-
 
 	ctx := c.Context()
 	cfg := s.configManager.GetConfig()
@@ -652,6 +671,9 @@ func (s *Server) handleGetHealthStats(c *fiber.Ctx) error {
 //	@Security		BearerAuth
 //	@Router			/health/cleanup [delete]
 func (s *Server) handleCleanupHealth(c *fiber.Ctx) error {
+	if !healthEffectsEnabled() {
+		return healthEffectsTemporarilyDisabled(c)
+	}
 	// Parse request body
 	var req HealthCleanupRequest
 	if len(c.Body()) > 0 {
@@ -954,15 +976,13 @@ func (s *Server) handleDirectHealthCheck(c *fiber.Ctx) error {
 		return RespondConflict(c, "Health check already in progress", "This file is currently being checked")
 	}
 
-	// Immediately set status to 'checking' using ID
-	err = s.healthRepo.SetFileCheckingByID(c.Context(), id)
-	if err != nil {
-		return RespondInternalError(c, "Failed to set checking status", err.Error())
-	}
-
 	// Start health check in background using worker (still needs file path)
 	err = s.healthWorker.PerformBackgroundCheck(context.Background(), item.FilePath)
 	if err != nil {
+		if errors.Is(err, health.ErrHealthCheckAdmissionConflict) {
+			return RespondConflict(c, "Health check admission conflict",
+				"The health record changed or another check is already in progress")
+		}
 		return RespondInternalError(c, "Failed to start background health check", err.Error())
 	}
 
@@ -1018,7 +1038,6 @@ func (s *Server) handleRestartHealthChecksBulk(c *fiber.Ctx) error {
 	if len(req.FilePaths) == 0 {
 		return RespondValidationError(c, "At least one file path is required", "")
 	}
-
 
 	// Cancel any active checks for these files
 	if s.healthWorker != nil {
@@ -1278,6 +1297,9 @@ func (s *Server) handleResetAllHealthChecks(c *fiber.Ctx) error {
 // handleRegenerateLibraryFiles handles the POST /health/regenerate-symlinks request.
 // It supports global, bulk (via file_paths), or single item regeneration.
 func (s *Server) handleRegenerateLibraryFiles(c *fiber.Ctx) error {
+	if !healthEffectsEnabled() {
+		return healthEffectsTemporarilyDisabled(c)
+	}
 	ctx := c.Context()
 	cfg := s.configManager.GetConfig()
 

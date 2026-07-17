@@ -26,6 +26,7 @@ type ArrsInstanceRequest struct {
 	Enabled           bool   `json:"enabled"`
 	SyncIntervalHours int    `json:"sync_interval_hours"`
 }
+
 // ArrsWebhookRequest represents a webhook payload from Radarr/Sonarr
 type ArrsWebhookRequest struct {
 	Artist struct {
@@ -131,7 +132,6 @@ func (req ArrsWebhookRequest) ToMetadata() model.WebhookMetadata {
 			}
 		}
 	}
-
 
 	if req.Artist.Id > 0 {
 		meta.Artist = &model.ArtistMetadata{
@@ -423,6 +423,12 @@ func (s *Server) handleArrsWebhook(c *fiber.Ctx) error {
 	}
 
 	// Process File Deletions
+	deletionBlocked := len(filesToDelete) > 0 && !healthEffectsEnabled()
+	if deletionBlocked {
+		slog.WarnContext(c.Context(), "ARR webhook deletion effects are temporarily disabled",
+			"event_type", req.EventType, "files", len(filesToDelete))
+		filesToDelete = nil
+	}
 	deleteSourceNzb := cfg.Metadata.ShouldDeleteSourceNzb()
 
 	for _, path := range filesToDelete {
@@ -521,6 +527,9 @@ func (s *Server) handleArrsWebhook(c *fiber.Ctx) error {
 	}
 
 	if len(pathsToScan) == 0 {
+		if deletionBlocked {
+			return healthEffectsTemporarilyDisabled(c)
+		}
 		if isScanEvent {
 			slog.WarnContext(c.Context(), "No file path found in webhook payload to scan")
 		}
@@ -654,6 +663,9 @@ func (s *Server) handleArrsWebhook(c *fiber.Ctx) error {
 				slog.InfoContext(c.Context(), "Added file to health check queue from webhook with high priority", "path", normalizedPath)
 			}
 		}
+	}
+	if deletionBlocked {
+		return healthEffectsTemporarilyDisabled(c)
 	}
 
 	return c.Status(200).JSON(fiber.Map{
@@ -1133,4 +1145,3 @@ func (s *Server) handleTestArrsDownloadClients(c *fiber.Ctx) error {
 		"data":    results,
 	})
 }
-

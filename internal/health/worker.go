@@ -2,28 +2,20 @@ package health
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/javi11/altmount/internal/arrs"
 	"github.com/javi11/altmount/internal/arrs/model"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
 	"github.com/javi11/altmount/internal/holes"
 	"github.com/javi11/altmount/internal/importer"
 	"github.com/javi11/altmount/internal/metadata"
-	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/progress"
-	"github.com/javi11/altmount/internal/utils"
 	"github.com/sourcegraph/conc/pool"
-	"golang.org/x/sync/singleflight"
 )
 
 // ARRsRepairService abstracts the ARR repair operations needed by HealthWorker.
@@ -31,6 +23,10 @@ type ARRsRepairService interface {
 	TriggerFileRescan(ctx context.Context, pathForRescan string, relativePath string, metadataStr *string) error
 	DiscoverFileMetadata(ctx context.Context, filePath, relativePath, nzbName, libraryPath string) (*model.WebhookMetadata, error)
 }
+
+// ErrHealthCheckAdmissionConflict means a direct check lost its exact claim
+// because the health row changed after it was observed.
+var ErrHealthCheckAdmissionConflict = errors.New("health record changed before direct check")
 
 // PlaybackActivitySource is the narrow admission signal used by the temporary
 // PR3 health-sweep pause. Repair notifications and manual checks are not
@@ -69,8 +65,6 @@ type HealthWorker struct {
 	healthChecker       *HealthChecker
 	healthRepo          *database.HealthRepository
 	metadataService     *metadata.MetadataService
-	arrsService         ARRsRepairService
-	importerService     importer.ImportService
 	configGetter        config.ConfigGetter
 	progressBroadcaster *progress.ProgressBroadcaster // optional, may be nil
 	playbackSource      PlaybackActivitySource
@@ -90,9 +84,6 @@ type HealthWorker struct {
 	// Statistics
 	stats   WorkerStats
 	statsMu sync.RWMutex
-
-	// Singleflight for metadata discovery
-	discoverySF singleflight.Group
 }
 
 // SetPlaybackActivitySource supplies the live stream counter used for ordinary
@@ -127,8 +118,6 @@ func NewHealthWorker(
 		healthChecker:       healthChecker,
 		healthRepo:          healthRepo,
 		metadataService:     metadataService,
-		arrsService:         arrsService,
-		importerService:     importerService,
 		configGetter:        configGetter,
 		progressBroadcaster: broadcaster,
 		status:              WorkerStatusStopped,
@@ -378,106 +367,75 @@ func (hw *HealthWorker) PerformBackgroundCheck(ctx context.Context, filePath str
 		return fmt.Errorf("health worker is not running")
 	}
 
+	fh, err := hw.healthRepo.GetFileHealth(ctx, filePath)
+	if err != nil {
+		return fmt.Errorf("failed to get file health state: %w", err)
+	}
+	if fh == nil {
+		return fmt.Errorf("file health record not found: %s", filePath)
+	}
+	claimed, err := hw.healthRepo.ClaimFilesCheckingBulk(ctx, []*database.FileHealth{fh})
+	if err != nil {
+		return fmt.Errorf("failed to claim direct health check: %w", err)
+	}
+	if len(claimed) != 1 {
+		return fmt.Errorf("%w: %s", ErrHealthCheckAdmissionConflict, filePath)
+	}
+
 	// Start health check in background
-	go func() {
+	go func(fh *database.FileHealth) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 
-		checkErr := hw.performDirectCheck(ctx, filePath)
+		checkErr := hw.performClaimedDirectCheck(ctx, fh)
 		if checkErr != nil {
 			if errors.Is(checkErr, context.DeadlineExceeded) {
 				slog.ErrorContext(ctx, "Background health check timed out after 10 minutes", "file_path", filePath)
 			} else {
 				slog.ErrorContext(ctx, "Background health check failed", "file_path", filePath, "error", checkErr)
 			}
-
-			// Get current health record to preserve source NZB path
-			fileHealth, getErr := hw.healthRepo.GetFileHealth(ctx, filePath)
-			var sourceNzb *string
-			if getErr == nil && fileHealth != nil {
-				sourceNzb = fileHealth.SourceNzbPath
-			}
-
-			// Set status back to pending if the check failed
-			errorMsg := checkErr.Error()
-			updateErr := hw.healthRepo.UpdateFileHealth(ctx, filePath, database.HealthStatusPending, &errorMsg, sourceNzb, nil, false)
-			if updateErr != nil {
-				slog.ErrorContext(ctx, "Failed to update status after failed check", "file_path", filePath, "error", updateErr)
-			}
 		}
-	}()
+	}(claimed[0])
 
 	return nil
 }
 
-// prepareUpdateForResult decides what DB update and side effects are needed based on the check result.
+// prepareUpdateForResult maps checked evidence to SQL only. Automatic repair,
+// deletion, metadata movement/status changes, and indexer effects are disabled.
 func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database.FileHealth, event HealthEvent) (*database.HealthStatusUpdate, func() error) {
+	_ = ctx
+	noEffect := func() error { return nil }
 	update := &database.HealthStatusUpdate{
-		FilePath: fh.FilePath,
+		FilePath:     fh.FilePath,
+		ErrorMessage: fh.LastError,
+		ErrorDetails: fh.ErrorDetails,
+	}
+	if event.Error != nil {
+		text := event.Error.Error()
+		update.ErrorMessage = &text
+	}
+	if event.Details != nil {
+		update.ErrorDetails = event.Details
 	}
 
-	var sideEffect func() error
-
-	if event.Type == EventTypeFileRemoved {
-		update.Skip = true
-		sideEffect = func() error {
-			slog.InfoContext(ctx, "File removed — health record already deleted, skipping bulk update", "file_path", fh.FilePath)
-			return nil
-		}
-		return update, sideEffect
-	}
-
-	if event.Type == EventTypeFileHealthy {
-		// File is now healthy
+	switch event.Type {
+	case EventTypeFileHealthy:
 		releaseDate := fh.ReleaseDate
 		if releaseDate == nil {
 			releaseDate = &fh.CreatedAt
 		}
-
-		nextCheck := CalculateNextCheck(releaseDate.UTC(), time.Now().UTC())
 		update.Type = database.UpdateTypeHealthy
 		update.Status = database.HealthStatusHealthy
-		update.ScheduledCheckAt = nextCheck
-
-		sideEffect = func() error {
-			slog.InfoContext(ctx, "File is healthy", "file_path", fh.FilePath)
-
-			return hw.metadataService.UpdateFileStatus(fh.FilePath, metapb.FileStatus_FILE_STATUS_HEALTHY)
-		}
-
-		return update, sideEffect
-	}
-
-	// Handle Corrupted or CheckFailed
-	var errorMsg *string
-	if event.Error != nil {
-		text := event.Error.Error()
-		errorMsg = &text
-	}
-	update.ErrorMessage = errorMsg
-	update.ErrorDetails = event.Details
-
-	// Incomplete, cancelled, unavailable, and otherwise inconclusive checks do
-	// not consume corruption/repair authority, regardless of prior retry count
-	// or delete-on-corruption configuration.
-	if event.Type == EventTypeCheckFailed {
+		update.ScheduledCheckAt = CalculateNextCheck(releaseDate.UTC(), time.Now().UTC())
+		return update, noEffect
+	case EventTypeCheckFailed, EventTypeFileRemoved:
 		exponent := min(max(fh.RetryCount, 0), 6)
-		nextCheck := time.Now().UTC().Add(time.Duration(15*(1<<exponent)) * time.Minute)
 		update.Type = database.UpdateTypeRetry
 		update.Status = database.HealthStatusPending
-		update.ScheduledCheckAt = nextCheck
-		return update, func() error {
-			slog.InfoContext(ctx, "Incomplete health check deferred without repair authority",
-				"file_path", fh.FilePath,
-				"next_check", nextCheck)
-			return nil
-		}
+		update.ScheduledCheckAt = time.Now().UTC().Add(time.Duration(15*(1<<exponent)) * time.Minute)
+		return update, noEffect
 	}
 
-	// Degraded verdict: the confirmed holes are within the padding caps, so
-	// the file still plays (streaming zero-fills the gaps). Record it as
-	// degraded — no repair trigger, no safety-folder move, periodic re-check —
-	// unless a repair is already in flight, in which case the repair flow wins.
 	if event.Classification != nil &&
 		event.Classification.Verdict == holes.VerdictDegraded &&
 		fh.Status != database.HealthStatusRepairTriggered {
@@ -485,260 +443,32 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 		if releaseDate == nil {
 			releaseDate = &fh.CreatedAt
 		}
-		nextCheck := CalculateNextCheck(releaseDate.UTC(), time.Now().UTC())
-
 		update.Type = database.UpdateTypeDegraded
 		update.Status = database.HealthStatusDegraded
-		update.ScheduledCheckAt = nextCheck
-
-		sideEffect = func() error {
-			slog.InfoContext(ctx, "File degraded: missing segments are within padding caps, skipping repair",
-				"file_path", fh.FilePath,
-				"total_missing", event.Classification.TotalMissing,
-				"longest_run", event.Classification.LongestRun,
-				"next_check", nextCheck)
-			return hw.metadataService.UpdateFileStatus(fh.FilePath, metapb.FileStatus_FILE_STATUS_DEGRADED)
-		}
-		return update, sideEffect
+		update.ScheduledCheckAt = CalculateNextCheck(releaseDate.UTC(), time.Now().UTC())
+		return update, noEffect
 	}
 
-	// When automatic repair is disabled, never trigger or re-trigger an Arr rescan: a file
-	// that has exhausted its health-check retries (or is already in repair_triggered from a
-	// time when repair was enabled) is finalized as corrupted for visibility, with no
-	// metadata safety-folder move. Regular health-check retries below are left intact.
-	// When delete-on-corruption is enabled, confirmed corruption is handled by removing
-	// the file entirely instead of ever entering the repair flow below (this covers both
-	// freshly-exhausted checks and files already sitting in repair_triggered).
-	if hw.configGetter().GetHealthDeleteOnCorruption() {
-		return hw.deleteCorruptedFile(ctx, fh)
+	maxRetries := fh.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = hw.configGetter().GetMaxRetries()
 	}
-
-	repairEnabled := hw.configGetter().GetRepairEnabled()
-	markCorruptedNoRepair := func() (*database.HealthStatusUpdate, func() error) {
+	if maxRetries <= 0 || fh.RetryCount >= maxRetries-1 {
 		update.Type = database.UpdateTypeCorrupted
 		update.Status = database.HealthStatusCorrupted
-		return update, func() error {
-			slog.InfoContext(ctx, "File corrupted but repair is disabled; marking corrupted without triggering repair",
-				"file_path", fh.FilePath, "status", fh.Status)
-			return nil
-		}
+		return update, noEffect
 	}
-
-	switch fh.Status {
-	case database.HealthStatusRepairTriggered:
-		if !repairEnabled {
-			return markCorruptedNoRepair()
-		}
-		if fh.RepairRetryCount >= hw.configGetter().GetMaxRepairRetries() {
-			sideEffect = hw.markCorruptedRepairExhausted(ctx, fh, update, errorMsg)
-		} else {
-			// Calculate repair back-off
-			interval := hw.configGetter().GetRepairInterval()
-			if hw.configGetter().GetRepairExponentialBackoff() {
-				// Exponential backoff: interval * 2^retry_count
-				// e.g. 1h, 2h, 4h...
-				multiplier := 1 << fh.RepairRetryCount
-				interval = interval * time.Duration(multiplier)
-
-				// Cap at max cooldown
-				maxCoolDown := hw.configGetter().GetRepairMaxCoolDown()
-				if interval > maxCoolDown {
-					interval = maxCoolDown
-				}
-			}
-			nextCheck := time.Now().UTC().Add(interval)
-
-			update.Type = database.UpdateTypeRepairRetry
-			update.Status = database.HealthStatusRepairTriggered
-			update.ScheduledCheckAt = nextCheck
-
-			sideEffect = func() error {
-				slog.InfoContext(ctx, "Repair retry scheduled",
-					"file_path", fh.FilePath,
-					"repair_retry_count", fh.RepairRetryCount+1,
-					"next_check", nextCheck)
-				return nil
-			}
-		}
-
-	default:
-		// Regular health check phase
-		if fh.RetryCount >= hw.configGetter().GetMaxRetries()-1 {
-			// Repair budget exhausted: this title was already re-downloaded
-			// max_repair_retries times (the counter survives webhook relinks and
-			// re-import upserts by design). Triggering yet another rescan would
-			// re-download the same broken release forever, so finalize as corrupted.
-			if fh.RepairRetryCount >= hw.configGetter().GetMaxRepairRetries() {
-				sideEffect = hw.markCorruptedRepairExhausted(ctx, fh, update, errorMsg)
-				return update, sideEffect
-			}
-
-			// Repair disabled: finalize as corrupted instead of triggering an Arr rescan.
-			if !repairEnabled {
-				return markCorruptedNoRepair()
-			}
-
-			update.Type = database.UpdateTypeRepairTrigger
-			update.Status = database.HealthStatusRepairTriggered
-
-			update.ScheduledCheckAt = time.Now().UTC().Add(hw.configGetter().GetRepairInterval())
-
-			sideEffect = func() error {
-				slog.InfoContext(ctx, "Health check retries exhausted, triggering repair", "file_path", fh.FilePath)
-
-				// Log failure against the indexer if known
-				if fh.Indexer != nil && *fh.Indexer != "" && *fh.Indexer != database.IndexerUnknown {
-					errMsg := "Retries exhausted"
-					if errorMsg != nil {
-						errMsg = *errorMsg
-					}
-					_ = hw.healthRepo.LogIndexerImport(ctx, *fh.Indexer, "failed", fmt.Sprintf("Health check failed (repair triggered): %s", errMsg), "")
-				}
-
-				outcome, err := hw.triggerFileRepair(ctx, fh, errorMsg, event.Details)
-				applyRepairOutcome(update, outcome, err)
-				return nil
-			}
-		} else {
-			// Increment health check retry count
-			backoffMinutes := 15 * (1 << fh.RetryCount)
-			nextCheck := time.Now().UTC().Add(time.Duration(backoffMinutes) * time.Minute)
-
-			update.Type = database.UpdateTypeRetry
-			update.Status = database.HealthStatusPending
-			update.ScheduledCheckAt = nextCheck
-
-			sideEffect = func() error {
-				slog.InfoContext(ctx, "Health check retry scheduled",
-					"file_path", fh.FilePath,
-					"retry_count", fh.RetryCount+1,
-					"next_check", nextCheck)
-				return nil
-			}
-		}
-	}
-
-	return update, sideEffect
+	update.Type = database.UpdateTypeRetry
+	update.Status = database.HealthStatusPending
+	update.ScheduledCheckAt = time.Now().UTC().Add(time.Duration(15*(1<<min(max(fh.RetryCount, 0), 6))) * time.Minute)
+	return update, noEffect
 }
 
-// markCorruptedRepairExhausted fills update with the terminal corrupted state for a file
-// whose repair budget is spent after a failed health check, and returns the side effect
-// (hide metadata in the safety folder, log the failure against the indexer).
-func (hw *HealthWorker) markCorruptedRepairExhausted(ctx context.Context, fh *database.FileHealth, update *database.HealthStatusUpdate, errorMsg *string) func() error {
-	update.Type = database.UpdateTypeCorrupted
-	update.Status = database.HealthStatusCorrupted
+// performClaimedDirectCheck checks and publishes one already-claimed snapshot.
+func (hw *HealthWorker) performClaimedDirectCheck(ctx context.Context, fh *database.FileHealth) error {
+	filePath := fh.FilePath
+	claimed := []*database.FileHealth{fh}
 
-	return func() error {
-		slog.ErrorContext(ctx, "File permanently marked as corrupted after repair retries exhausted", "file_path", fh.FilePath)
-
-		// Ensure metadata is hidden in the safety folder
-		hw.moveMetadataToSafetyFolder(ctx, fh)
-
-		// Log failure against the indexer if known
-		if fh.Indexer != nil && *fh.Indexer != "" && *fh.Indexer != database.IndexerUnknown {
-			errMsg := "Permanently corrupted"
-			if errorMsg != nil {
-				errMsg = *errorMsg
-			}
-			_ = hw.healthRepo.LogIndexerImport(ctx, *fh.Indexer, "failed", fmt.Sprintf("Health check permanently corrupted: %s", errMsg), "")
-		}
-
-		return nil
-	}
-}
-
-// deleteCorruptedFile removes a confirmed-corrupted file's metadata (and optional source
-// NZB), cleans up now-empty parent directories in both the metadata store and the physical
-// library tree, and deletes the health record — used instead of triggering an Arr repair
-// when health.corruption_action is set to "delete".
-func (hw *HealthWorker) deleteCorruptedFile(ctx context.Context, fh *database.FileHealth) (*database.HealthStatusUpdate, func() error) {
-	update := &database.HealthStatusUpdate{FilePath: fh.FilePath, Skip: true}
-	return update, func() error {
-		cfg := hw.configGetter()
-		var physicalPath, rootPath string
-		if fh.LibraryPath != nil {
-			physicalPath = *fh.LibraryPath
-			rootPath = cfg.MountPath
-			if cfg.Health.LibraryDir != nil && *cfg.Health.LibraryDir != "" {
-				rootPath = *cfg.Health.LibraryDir
-			}
-		}
-		if err := hw.metadataService.DeleteCorruptedFile(ctx, fh.FilePath, cfg.Metadata.ShouldDeleteSourceNzb(), physicalPath, rootPath); err != nil {
-			slog.ErrorContext(ctx, "Failed to delete corrupted file", "file_path", fh.FilePath, "error", err)
-			return err
-		}
-		if err := hw.healthRepo.DeleteHealthRecord(ctx, fh.FilePath); err != nil {
-			slog.ErrorContext(ctx, "Failed to delete health record for deleted corrupted file", "file_path", fh.FilePath, "error", err)
-		}
-		slog.WarnContext(ctx, "Deleted corrupted file instead of triggering repair", "file_path", fh.FilePath)
-		return nil
-	}
-}
-
-// prepareRepairNotificationUpdate builds the update and side effect for a file already in
-// repair_triggered state. It re-triggers ARR directly without calling CheckFile, since the
-// metadata has already been moved to the corrupted folder.
-func (hw *HealthWorker) prepareRepairNotificationUpdate(ctx context.Context, fh *database.FileHealth) (*database.HealthStatusUpdate, func() error) {
-	if hw.configGetter().GetHealthDeleteOnCorruption() {
-		return hw.deleteCorruptedFile(ctx, fh)
-	}
-
-	// Default to the existing diagnosis so a successful re-trigger (which never
-	// sets these itself) doesn't null out the reason the file was flagged in
-	// the first place; applyRepairOutcome combines onto this if repair fails.
-	update := &database.HealthStatusUpdate{
-		FilePath:     fh.FilePath,
-		ErrorMessage: fh.LastError,
-		ErrorDetails: fh.ErrorDetails,
-	}
-
-	if fh.RepairRetryCount >= hw.configGetter().GetMaxRepairRetries() {
-		// Retries exhausted — give up and mark corrupted. Deliberately no metadata
-		// move here: unlike the failed-check path, this sweep has not re-validated
-		// the file's content, and a re-import may have just landed a good copy. The
-		// user can recheck from the Health page; a failed check will then hide it.
-		update.Type = database.UpdateTypeCorrupted
-		update.Status = database.HealthStatusCorrupted
-		sideEffect := func() error {
-			slog.ErrorContext(ctx, "File permanently marked as corrupted after repair retries exhausted",
-				"file_path", fh.FilePath,
-				"repair_retry_count", fh.RepairRetryCount)
-			return nil
-		}
-		return update, sideEffect
-	}
-
-	// Calculate repair back-off
-	interval := hw.configGetter().GetRepairInterval()
-	if hw.configGetter().GetRepairExponentialBackoff() {
-		// Exponential backoff
-		multiplier := 1 << fh.RepairRetryCount
-		interval = interval * time.Duration(multiplier)
-
-		// Cap at max cooldown
-		maxCoolDown := hw.configGetter().GetRepairMaxCoolDown()
-		if interval > maxCoolDown {
-			interval = maxCoolDown
-		}
-	}
-	nextCheck := time.Now().UTC().Add(interval)
-
-	// Re-trigger ARR and increment repair_retry_count.
-	update.Type = database.UpdateTypeRepairRetry
-	update.Status = database.HealthStatusRepairTriggered
-	update.ScheduledCheckAt = nextCheck
-
-	sideEffect := func() error {
-		outcome, err := hw.retriggerFileRepair(ctx, fh)
-		applyRepairOutcome(update, outcome, err)
-		return nil
-	}
-
-	return update, sideEffect
-}
-
-// performDirectCheck performs a health check on a single file using the HealthChecker
-func (hw *HealthWorker) performDirectCheck(ctx context.Context, filePath string) error {
 	// Create cancellable context for this check
 	checkCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -762,18 +492,8 @@ func (hw *HealthWorker) performDirectCheck(ctx context.Context, filePath string)
 	default:
 	}
 
-	// Get current file state first to determine check options
-	fh, err := hw.healthRepo.GetFileHealth(ctx, filePath)
-	if err != nil {
-		return fmt.Errorf("failed to get file health state: %w", err)
-	}
-	if fh == nil {
-		return fmt.Errorf("file health record not found: %s", filePath)
-	}
-
-	opts := CheckOptions{}
 	// Delegate to HealthChecker
-	event := hw.healthChecker.CheckFile(checkCtx, filePath, opts)
+	event := hw.healthChecker.CheckFile(checkCtx, filePath, CheckOptions{})
 
 	// Check if cancelled during check
 	select {
@@ -782,21 +502,12 @@ func (hw *HealthWorker) performDirectCheck(ctx context.Context, filePath string)
 	default:
 	}
 
-	updatePtr, sideEffect := hw.prepareUpdateForResult(ctx, fh, event)
-	if sideEffect != nil {
-		if err := sideEffect(); err != nil {
-			slog.ErrorContext(ctx, "Side effect failed in direct check", "file_path", filePath, "error", err)
-		}
+	update, _ := hw.prepareUpdateForResult(ctx, fh, event)
+	if err := hw.healthRepo.PublishClaimedHealthStatusBulk(ctx, claimed, []database.HealthStatusUpdate{*update}); err != nil {
+		return fmt.Errorf("failed to publish direct health evidence: %w", err)
 	}
 
-	if !updatePtr.Skip {
-		if err := hw.healthRepo.UpdateHealthStatusBulk(ctx, []database.HealthStatusUpdate{*updatePtr}); err != nil {
-			return fmt.Errorf("failed to update health status: %w", err)
-		}
-		hw.broadcastHealthChanged()
-	}
-
-	// Notify rclone VFS about the status change
+	hw.broadcastHealthChanged()
 	hw.healthChecker.notifyRcloneVFS(filePath, event)
 
 	// Update stats
@@ -860,19 +571,22 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 		}
 	}
 
-	// Get files that need repair notifications. Only when automatic repair is enabled —
-	// when it is disabled, corrupt files are left in the corrupted state and we never
-	// re-trigger an Arr rescan.
-	var repairFiles []*database.FileHealth
-	if cfg.GetRepairEnabled() {
-		repairFiles, err = hw.healthRepo.GetFilesForRepairNotification(ctx, maxJobs)
-		if err != nil {
-			return fmt.Errorf("failed to get files for repair notification: %w", err)
-		}
+	// Playback may have started after selection. Apply the final admission gate
+	// before claiming so no row is stranded in checking.
+	if len(unhealthyFiles) > 0 && hw.shouldPauseForPlayback() {
+		slog.InfoContext(ctx, "Deferring ordinary health batch because playback became active",
+			"files", len(unhealthyFiles))
+		unhealthyFiles = nil
 	}
 
-	totalFiles := len(unhealthyFiles) + len(repairFiles)
-	if totalFiles == 0 {
+	// This is the sole automatic admission boundary. From here onward only the
+	// returned current snapshots may be discovered, checked, or published.
+	unhealthyFiles, err = hw.healthRepo.ClaimFilesCheckingBulk(ctx, unhealthyFiles)
+	if err != nil {
+		return fmt.Errorf("failed to claim health check batch: %w", err)
+	}
+
+	if len(unhealthyFiles) == 0 {
 		hw.updateStats(func(s *WorkerStats) {
 			s.CurrentRunStartTime = nil
 			s.CurrentRunFilesChecked = 0
@@ -886,168 +600,59 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 
 	slog.InfoContext(ctx, "Found files to process",
 		"health_check_files", len(unhealthyFiles),
-		"repair_notification_files", len(repairFiles),
-		"total", totalFiles,
+		"total", len(unhealthyFiles),
 		"max_concurrent_jobs", maxJobs)
 
 	// Process files in parallel with bounded concurrency
 	p := pool.New().WithMaxGoroutines(maxJobs)
-	var results []database.HealthStatusUpdate
-	var resultsMu sync.Mutex
-
-	// The regular-check writes are based on the record being 'checking' (set at
-	// the final admission boundary below);
-	// guard them on that status so a concurrent webhook relink / re-import / manual
-	// recheck that lands mid-check is not silently clobbered by a stale check result.
-	checkingStatus := database.HealthStatusChecking
-
-	// Phase A: proactive metadata discovery (may hit ARR APIs — bounded by
-	// maxJobs), then verify segment availability for the whole batch in one
-	// cross-file StatMany sweep. events is index-aligned with unhealthyFiles.
-	discover := pool.New().WithMaxGoroutines(maxJobs)
-	for _, fileHealth := range unhealthyFiles {
-		fh := fileHealth // Capture for closure
-		discover.Go(func() {
-			slog.InfoContext(ctx, "Checking unhealthy file", "file_path", fh.FilePath)
-			fh.Metadata = hw.ensureMetadata(ctx, fh)
-		})
-	}
-	discover.Wait()
-
-	// Re-check at the actual sweep boundary. Playback may have started while
-	// metadata discovery was running; dropping the ordinary batch here leaves
-	// every record pending and consumes no retry. Repair notifications continue.
-	if len(unhealthyFiles) > 0 && hw.shouldPauseForPlayback() {
-		slog.InfoContext(ctx, "Deferring prepared ordinary health batch because playback became active",
-			"files", len(unhealthyFiles))
-		unhealthyFiles = nil
-	}
-	totalFiles = len(unhealthyFiles) + len(repairFiles)
-
-	// Transition the admitted batch to 'checking' in one write instead of one
-	// UPDATE per file. This happens only after the final playback admission check.
-	checkingPaths := make([]string, len(unhealthyFiles))
-	for i, fh := range unhealthyFiles {
-		checkingPaths[i] = fh.FilePath
-	}
-	if err := hw.healthRepo.SetFilesCheckingBulk(ctx, checkingPaths); err != nil {
-		slog.ErrorContext(ctx, "Failed to bulk-set files to checking", "count", len(checkingPaths), "error", err)
-	}
+	results := make([]database.HealthStatusUpdate, len(unhealthyFiles))
 
 	paths := make([]string, len(unhealthyFiles))
 	for i, fh := range unhealthyFiles {
+		slog.InfoContext(ctx, "Checking unhealthy file", "file_path", fh.FilePath)
 		paths[i] = fh.FilePath
 	}
 	events := hw.healthChecker.CheckFilesBatch(ctx, paths)
+	if len(events) != len(unhealthyFiles) {
+		return fmt.Errorf("health checker returned %d events for %d claims", len(events), len(unhealthyFiles))
+	}
 
-	// Phase B: per-file result handling (repair side effects, ARR API calls,
-	// VFS notifications), bounded by maxJobs.
+	// Build pure SQL evidence in parallel. Index alignment preserves the exact
+	// one-to-one relationship between claims, events, and publication updates.
 	for i, fileHealth := range unhealthyFiles {
-		fh := fileHealth // Capture for closure
+		index := i
+		fh := fileHealth
 		event := events[i]
 		p.Go(func() {
-			updatePtr, sideEffect := hw.prepareUpdateForResult(ctx, fh, event)
-			updatePtr.ExpectedStatus = &checkingStatus
-			if sideEffect != nil {
-				if err := sideEffect(); err != nil {
-					slog.ErrorContext(ctx, "Failed to execute side effect for health result", "file_path", fh.FilePath, "error", err)
-				}
-			}
-
-			resultsMu.Lock()
-			results = append(results, *updatePtr)
-			resultsMu.Unlock()
-
-			// Notify VFS
-			hw.healthChecker.notifyRcloneVFS(fh.FilePath, event)
-
-			// Update cycle progress stats
-			hw.updateStats(func(s *WorkerStats) {
-				s.CurrentRunFilesChecked++
-				s.TotalFilesChecked++
-				switch event.Type {
-				case EventTypeFileHealthy:
-					s.TotalFilesHealthy++
-				case EventTypeFileCorrupted:
-					s.TotalFilesCorrupted++
-				}
-			})
+			update, _ := hw.prepareUpdateForResult(ctx, fh, event)
+			results[index] = *update
 		})
 	}
-
-	repairStatus := database.HealthStatusRepairTriggered
-	for _, fileHealth := range repairFiles {
-		fh := fileHealth // Capture for closure
-		p.Go(func() {
-			// Re-fetch the record to ensure we have the absolute latest library_path
-			// (in case a webhook updated it while we were waiting in the cycle)
-			latest, err := hw.healthRepo.GetFileHealth(ctx, fh.FilePath)
-			if err == nil && latest != nil {
-				fh = latest
-			}
-
-			// If a concurrent actor moved the record out of repair_triggered between the
-			// cycle's read and now (e.g. a Download webhook relinked the fresh copy to
-			// pending, or a manual recheck/delete fired), leave it alone. Re-triggering
-			// would clobber that rescue and re-enter the repair loop — and fire the ARR
-			// re-trigger / metadata-move side effects against a record that no longer needs them.
-			if fh.Status != database.HealthStatusRepairTriggered {
-				slog.InfoContext(ctx, "Skipping repair notification — record left repair_triggered concurrently",
-					"file_path", fh.FilePath, "status", fh.Status)
-				return
-			}
-
-			slog.InfoContext(ctx, "Re-triggering repair for file", "file_path", fh.FilePath)
-
-			updatePtr, sideEffect := hw.prepareRepairNotificationUpdate(ctx, fh)
-			updatePtr.ExpectedStatus = &repairStatus
-
-			if sideEffect != nil {
-				if err := sideEffect(); err != nil {
-					slog.ErrorContext(ctx, "Failed to execute side effect for repair notification", "file_path", fh.FilePath, "error", err)
-				}
-			}
-
-			resultsMu.Lock()
-			results = append(results, *updatePtr)
-			resultsMu.Unlock()
-
-			// Update cycle progress stats
-			hw.updateStats(func(s *WorkerStats) {
-				s.CurrentRunFilesChecked++
-				s.TotalFilesChecked++
-			})
-		})
-	}
-
-	// Wait for all files to complete processing
 	p.Wait()
 
-	// Build list of protected directories (categories and complete dir)
-	cfg = hw.configGetter()
-	protected := []string{"complete", "corrupted_metadata"} // Protect 'complete' and safety folder
-	if cfg.SABnzbd.CompleteDir != "" {
-		protected = append(protected, filepath.Base(cfg.SABnzbd.CompleteDir))
-	}
-	for _, cat := range cfg.SABnzbd.Categories {
-		protected = append(protected, cat.Name)
-		if cat.Dir != "" {
-			protected = append(protected, cat.Dir)
-		}
+	if err := hw.healthRepo.PublishClaimedHealthStatusBulk(ctx, unhealthyFiles, results); err != nil {
+		return fmt.Errorf("failed to publish claimed health evidence: %w", err)
 	}
 
-	// Clean up empty directories in metadata (e.g. from moved/imported files)
-	if err := hw.metadataService.CleanupEmptyDirectories("", protected); err != nil {
-		slog.WarnContext(ctx, "Failed to cleanup empty directories in metadata", "error", err)
-	}
-
-	// Perform bulk database update
-	if len(results) > 0 {
-		if err := hw.healthRepo.UpdateHealthStatusBulk(ctx, results); err != nil {
-			slog.ErrorContext(ctx, "Failed to perform bulk health status update", "error", err)
+	// Observers are notified only after the whole checked batch commits.
+	healthyCount := int64(0)
+	corruptedCount := int64(0)
+	for i, event := range events {
+		hw.healthChecker.notifyRcloneVFS(unhealthyFiles[i].FilePath, event)
+		switch event.Type {
+		case EventTypeFileHealthy:
+			healthyCount++
+		case EventTypeFileCorrupted:
+			corruptedCount++
 		}
-		hw.broadcastHealthChanged()
 	}
+	hw.updateStats(func(s *WorkerStats) {
+		s.CurrentRunFilesChecked = len(unhealthyFiles)
+		s.TotalFilesChecked += int64(len(unhealthyFiles))
+		s.TotalFilesHealthy += healthyCount
+		s.TotalFilesCorrupted += corruptedCount
+	})
+	hw.broadcastHealthChanged()
 
 	// Update final stats
 	hw.updateStats(func(s *WorkerStats) {
@@ -1061,8 +666,7 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 
 	slog.InfoContext(ctx, "Health check cycle completed",
 		"health_check_files", len(unhealthyFiles),
-		"repair_notification_files", len(repairFiles),
-		"total_files", totalFiles,
+		"total_files", len(unhealthyFiles),
 		"duration", time.Since(now))
 
 	return nil
@@ -1082,338 +686,4 @@ func (hw *HealthWorker) getCheckInterval() time.Duration {
 
 func (hw *HealthWorker) getMaxConcurrentJobs() int {
 	return hw.configGetter().GetMaxConcurrentJobs()
-}
-
-// repairOutcome describes the result of a repair trigger attempt.
-type repairOutcome int
-
-const (
-	repairOutcomeTriggered   repairOutcome = iota // ARR accepted the repair; metadata moved to corrupted folder
-	repairOutcomeCorrupted                        // ARR failed with a generic error; mark file corrupted
-	repairOutcomeDeleted                          // Health record and/or metadata were deleted (zombie)
-	repairOutcomeRegenerated                      // Metadata was successfully regenerated from NZB
-	repairOutcomeDeferred                         // ARR temporarily unreachable; keep repair-pending, do not condemn
-)
-
-// applyRepairOutcome maps a repairOutcome to the corresponding fields on the HealthStatusUpdate.
-func applyRepairOutcome(update *database.HealthStatusUpdate, outcome repairOutcome, err error) {
-	switch outcome {
-	case repairOutcomeTriggered:
-		update.Type = database.UpdateTypeRepairRetry
-	case repairOutcomeDeleted:
-		update.Skip = true
-	case repairOutcomeRegenerated:
-		update.Type = database.UpdateTypeHealthy
-		update.Status = database.HealthStatusHealthy
-		update.ScheduledCheckAt = time.Now().UTC().Add(24 * time.Hour) // Re-check tomorrow
-	case repairOutcomeCorrupted:
-		update.Type = database.UpdateTypeCorrupted
-		update.Status = database.HealthStatusCorrupted
-		if err != nil {
-			// Preserve the original health-check diagnosis (e.g. "missing N
-			// segments") instead of replacing it with the repair-trigger
-			// failure — losing the root cause makes the UI show only an
-			// unrelated ARR error with no indication of why the file was
-			// flagged corrupted in the first place.
-			repairErr := err.Error()
-			if update.ErrorMessage != nil && *update.ErrorMessage != "" {
-				combined := fmt.Sprintf("%s (repair failed: %s)", *update.ErrorMessage, repairErr)
-				update.ErrorMessage = &combined
-			} else {
-				update.ErrorMessage = &repairErr
-			}
-		}
-	case repairOutcomeDeferred:
-		// The ARR was only temporarily unreachable. Keep the file in repair_triggered
-		// WITHOUT incrementing repair_retry_count (UpdateTypeRepairTrigger does not bump
-		// the budget) and without condemning it, so the next repair cycle retries and the
-		// file self-heals once the ARR returns. The caller's pre-set ScheduledCheckAt
-		// (repair back-off) is preserved.
-		update.Type = database.UpdateTypeRepairTrigger
-		update.Status = database.HealthStatusRepairTriggered
-	}
-}
-
-// resolvePathForRescan determines the absolute path that ARR should rescan for a given file.
-// It checks LibraryPath first, then LibraryDir, then ImportDir, and falls back to MountPath.
-func (hw *HealthWorker) resolvePathForRescan(item *database.FileHealth) string {
-	if p, ok := item.EffectiveLibraryPath(); ok {
-		return p
-	}
-	cfg := hw.configGetter()
-	if cfg.Health.LibraryDir != nil && *cfg.Health.LibraryDir != "" {
-		return utils.JoinAbsPath(*cfg.Health.LibraryDir, item.FilePath)
-	}
-	if cfg.Import.ImportDir != nil && *cfg.Import.ImportDir != "" {
-		return utils.JoinAbsPath(*cfg.Import.ImportDir, item.FilePath)
-	}
-	return utils.JoinAbsPath(cfg.MountPath, item.FilePath)
-}
-
-// cleanupZombieRecord deletes the health record and associated metadata for a file that is
-// no longer tracked by ARR (zombie or orphan). Errors are logged but not returned because
-// cleanup is best-effort.
-func (hw *HealthWorker) cleanupZombieRecord(ctx context.Context, item *database.FileHealth) {
-	// Delete library symlink/STRM if it exists (only for ARR-relinked records; an
-	// import-time placeholder points at the virtual mount, not a real library file).
-	if p, ok := item.EffectiveLibraryPath(); ok {
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			slog.ErrorContext(ctx, "Failed to delete library file during zombie cleanup",
-				"path", p, "error", err)
-		}
-	}
-
-	if delErr := hw.healthRepo.DeleteHealthRecord(ctx, item.FilePath); delErr != nil {
-		slog.ErrorContext(ctx, "Failed to delete health record during cleanup", "file_path", item.FilePath, "error", delErr)
-	}
-
-	cfg := hw.configGetter()
-	relativePath := strings.TrimPrefix(item.FilePath, cfg.MountPath)
-	relativePath = strings.TrimPrefix(relativePath, "/")
-
-	deleteSourceNzb := cfg.Metadata.ShouldDeleteSourceNzb()
-	if delMetaErr := hw.metadataService.DeleteFileMetadataWithSourceNzb(ctx, relativePath, deleteSourceNzb); delMetaErr != nil {
-		slog.ErrorContext(ctx, "Failed to delete metadata during cleanup", "file_path", item.FilePath, "error", delMetaErr)
-	}
-}
-
-// triggerFileRepair handles the business logic for triggering repair of a corrupted file.
-// It contacts ARR APIs and moves metadata, but does NOT write health status to the DB directly.
-// Callers must apply the returned outcome to the HealthStatusUpdate before the bulk DB write.
-func (hw *HealthWorker) triggerFileRepair(ctx context.Context, item *database.FileHealth, errorMsg *string, errorDetails *string) (repairOutcome, error) {
-	filePath := item.FilePath
-
-	// Check if file metadata still exists. If not, the file is gone (likely upgraded/deleted by Sonarr already)
-	// and this health record is a zombie.
-	var metadataErr error
-	{
-		meta, err := hw.metadataService.ReadFileMetadata(filePath)
-		if err != nil {
-			slog.WarnContext(ctx, "Metadata file unreadable during repair trigger (likely physical corruption) — proceeding with repair anyway",
-				"file_path", filePath, "error", err)
-			metadataErr = err
-			// Proceed with repair attempt: physical corruption is why we're here
-		} else if meta == nil {
-			slog.WarnContext(ctx, "File metadata missing during repair trigger - file likely deleted/upgraded externally. Cleaning up zombie record.",
-				"file_path", filePath)
-
-			if delErr := hw.healthRepo.DeleteHealthRecord(ctx, filePath); delErr != nil {
-				slog.ErrorContext(ctx, "Failed to delete zombie health record", "error", delErr)
-				return repairOutcomeDeleted, delErr
-			}
-			return repairOutcomeDeleted, nil
-		}
-	}
-
-	// SPECIAL CASE: If metadata is corrupted AND we don't have a library path,
-	// we try to regenerate the metadata first before triggering a full ARR repair.
-	if metadataErr != nil && !item.IsImported() {
-		slog.InfoContext(ctx, "Metadata corrupted and no library path found - attempting regeneration from NZB", "file_path", filePath)
-		if regenErr := hw.importerService.RegenerateMetadata(ctx, filePath); regenErr == nil {
-			slog.InfoContext(ctx, "Successfully regenerated metadata for corrupted item", "file_path", filePath)
-			return repairOutcomeRegenerated, nil
-		} else {
-			slog.WarnContext(ctx, "Regeneration attempt failed, proceeding with normal repair", "file_path", filePath, "error", regenErr)
-		}
-	}
-
-	slog.InfoContext(ctx, "Triggering file repair using direct ARR API approach", "file_path", filePath)
-
-	pathForRescan := hw.resolvePathForRescan(item)
-	metadataStr := hw.ensureMetadata(ctx, item)
-
-	err := hw.arrsService.TriggerFileRescan(ctx, pathForRescan, filePath, metadataStr)
-	if err != nil {
-		// ErrEpisodeAlreadySatisfied is an ID-based confirmation from the ARR (Smart Repair
-		// Guard) that this title was upgraded/replaced by a *different* file, so the AltMount
-		// copy is genuinely redundant and safe to remove.
-		if errors.Is(err, arrs.ErrEpisodeAlreadySatisfied) {
-			slog.WarnContext(ctx, "File replaced by a different file in ARR, removing redundant copy from AltMount",
-				"file_path", filePath, "arr_error", err)
-			hw.cleanupZombieRecord(ctx, item)
-			return repairOutcomeDeleted, nil
-		}
-
-		// ErrPathMatchFailed only means AltMount could not match its rescan path against the
-		// ARR library/queue. The ARR routinely renames and reorganizes imported files (symlink
-		// libraries, custom naming), so a path miss is NOT a reliable orphan signal: treating
-		// it as one deletes the user's library symlink and the underlying virtual file. Leave
-		// the file in place — genuine orphans are removed safely by the library-sync orphan
-		// pass (two consecutive misses + ratio guard + import-history check). Mark corrupted so
-		// it follows the normal repair retry/back-off instead of being destroyed.
-		if errors.Is(err, arrs.ErrPathMatchFailed) {
-			slog.WarnContext(ctx, "ARR rescan path did not match library; leaving file in place (library-sync handles real orphans)",
-				"file_path", filePath, "path_for_rescan", pathForRescan, "arr_error", err)
-			return repairOutcomeCorrupted, err
-		}
-
-		// A temporarily unreachable ARR (network/transport error or 5xx) must NOT condemn
-		// the file. Defer: keep it repair-pending (no retry-count bump, no metadata move)
-		// so it self-heals on the next cycle once the ARR returns.
-		if arrs.IsTemporarilyUnreachable(err) {
-			slog.WarnContext(ctx, "ARR temporarily unreachable during repair trigger; deferring (file kept repair-pending, not condemned)",
-				"file_path", filePath, "path_for_rescan", pathForRescan, "arr_error", err)
-			return repairOutcomeDeferred, err
-		}
-
-		slog.ErrorContext(ctx, "Failed to trigger ARR rescan",
-			"file_path", filePath,
-			"path_for_rescan", pathForRescan,
-			"error", err)
-		return repairOutcomeCorrupted, err
-	}
-
-	// ARR rescan was triggered successfully.
-	slog.InfoContext(ctx, "Successfully triggered ARR rescan for file repair",
-		"file_path", filePath,
-		"path_for_rescan", pathForRescan)
-
-	// Move the metadata file to the corrupted folder so FUSE/WebDAV stops showing it.
-	// CRITICAL: We only do this if the file has already been imported (has a LibraryPath).
-	// If it hasn't been imported yet, we keep it visible so ARR can see the "Missing File"
-	// or "Empty Folder" and report its own warning, which helps the repair cycle.
-	if item.IsImported() {
-		hw.moveMetadataToSafetyFolder(ctx, item)
-	} else {
-		slog.InfoContext(ctx, "Skipping metadata move for corrupted item - file not yet imported by ARR", "file_path", filePath)
-	}
-
-	return repairOutcomeTriggered, nil
-}
-
-// retriggerFileRepair re-triggers the ARR rescan for a file already in repair_triggered state.
-// Unlike triggerFileRepair it does NOT write to the DB.
-// Callers must apply the returned outcome to the HealthStatusUpdate before the bulk DB write.
-func (hw *HealthWorker) retriggerFileRepair(ctx context.Context, item *database.FileHealth) (repairOutcome, error) {
-	filePath := item.FilePath
-
-	pathForRescan := hw.resolvePathForRescan(item)
-	metadataStr := hw.ensureMetadata(ctx, item)
-
-	slog.InfoContext(ctx, "Re-triggering ARR rescan for file in repair", "file_path", filePath, "path_for_rescan", pathForRescan)
-
-	err := hw.arrsService.TriggerFileRescan(ctx, pathForRescan, filePath, metadataStr)
-	if err != nil {
-		// See triggerFileRepair: only an ID-confirmed replacement (ErrEpisodeAlreadySatisfied)
-		// justifies deleting the AltMount copy. ErrPathMatchFailed is an ambiguous path miss
-		// (e.g. an ARR-renamed library) and must not delete the user's library file.
-		if errors.Is(err, arrs.ErrEpisodeAlreadySatisfied) {
-			slog.WarnContext(ctx, "File replaced by a different file in ARR, removing redundant copy from AltMount",
-				"file_path", filePath, "arr_error", err)
-			hw.cleanupZombieRecord(ctx, item)
-			return repairOutcomeDeleted, nil
-		}
-
-		if errors.Is(err, arrs.ErrPathMatchFailed) {
-			slog.WarnContext(ctx, "ARR rescan path did not match library on re-trigger; leaving file in place (library-sync handles real orphans)",
-				"file_path", filePath, "path_for_rescan", pathForRescan, "arr_error", err)
-			return repairOutcomeCorrupted, err
-		}
-
-		// Temporarily unreachable ARR: defer instead of condemning. Note the metadata move
-		// happens only on the success path below, so a deferred outcome leaves the file
-		// visible and untouched until the ARR comes back.
-		if arrs.IsTemporarilyUnreachable(err) {
-			slog.WarnContext(ctx, "ARR temporarily unreachable during repair re-trigger; deferring (file kept repair-pending, not condemned)",
-				"file_path", filePath, "path_for_rescan", pathForRescan, "arr_error", err)
-			return repairOutcomeDeferred, err
-		}
-
-		slog.ErrorContext(ctx, "Failed to re-trigger ARR rescan", "file_path", filePath, "error", err)
-		return repairOutcomeCorrupted, err
-	}
-
-	// ARR rescan re-triggered successfully — only now move the metadata to the safety
-	// folder (if the file has been imported) so a deferred/failed outcome above never
-	// hides a file that was not actually condemned.
-	hw.moveMetadataToSafetyFolder(ctx, item)
-
-	slog.InfoContext(ctx, "Successfully re-triggered ARR rescan", "file_path", filePath)
-	return repairOutcomeTriggered, nil
-}
-
-func (hw *HealthWorker) ensureMetadata(ctx context.Context, item *database.FileHealth) *string {
-	needsDiscovery := false
-	if item.Metadata == nil || *item.Metadata == "" {
-		needsDiscovery = true
-	} else {
-		var dbMeta model.WebhookMetadata
-		if err := json.Unmarshal([]byte(*item.Metadata), &dbMeta); err == nil {
-			if dbMeta.Series != nil && len(dbMeta.Episodes) == 0 {
-				needsDiscovery = true
-			}
-		}
-	}
-
-	if !needsDiscovery {
-		return item.Metadata
-	}
-
-	// Build a singleflight key.
-	// If NZB name is known, use that. Otherwise use parent directory of the file path.
-	nzbName := ""
-	if item.SourceNzbPath != nil {
-		nzbName = filepath.Base(*item.SourceNzbPath)
-	}
-	sfKey := nzbName
-	if sfKey == "" {
-		sfKey = filepath.Dir(item.FilePath)
-	}
-	if sfKey == "" || sfKey == "." {
-		sfKey = item.FilePath
-	}
-
-	res, err, _ := hw.discoverySF.Do(sfKey, func() (interface{}, error) {
-		// Re-read from DB to verify if another concurrent worker finished discovery first
-		latest, err := hw.healthRepo.GetFileHealth(ctx, item.FilePath)
-		if err == nil && latest != nil && latest.Metadata != nil && *latest.Metadata != "" {
-			var dbMeta model.WebhookMetadata
-			if err := json.Unmarshal([]byte(*latest.Metadata), &dbMeta); err == nil {
-				if dbMeta.Series == nil || len(dbMeta.Episodes) > 0 {
-					return latest.Metadata, nil
-				}
-			}
-		}
-
-		slog.DebugContext(ctx, "Missing metadata or episode IDs, attempting discovery during health check", "file_path", item.FilePath, "sf_key", sfKey)
-		relativePath := strings.TrimPrefix(item.FilePath, "complete/")
-		libPath, _ := item.EffectiveLibraryPath()
-
-		metadata, err := hw.arrsService.DiscoverFileMetadata(ctx, item.FilePath, relativePath, nzbName, libPath)
-		if err == nil && metadata != nil {
-			metaBytes, err := json.Marshal(metadata)
-			if err == nil {
-				str := string(metaBytes)
-				slog.InfoContext(ctx, "Successfully discovered metadata during health check",
-					"file_path", item.FilePath,
-					"instance", metadata.InstanceName)
-				if err := hw.healthRepo.UpdateFileMetadata(ctx, item.ID, metaBytes); err != nil {
-					slog.ErrorContext(ctx, "Failed to save discovered metadata", "error", err)
-				}
-				return &str, nil
-			}
-		}
-		return (*string)(nil), err
-	})
-
-	if err == nil && res != nil {
-		if strPtr, ok := res.(*string); ok {
-			return strPtr
-		}
-	}
-
-	return nil
-}
-
-func (hw *HealthWorker) moveMetadataToSafetyFolder(ctx context.Context, item *database.FileHealth) {
-	if !item.IsImported() {
-		return
-	}
-	cfg := hw.configGetter()
-	relativePath := strings.TrimPrefix(item.FilePath, cfg.MountPath)
-	relativePath = strings.TrimPrefix(relativePath, "/")
-	slog.InfoContext(ctx, "Moving metadata file for corrupted item to safety folder to trigger replacement", "file_path", item.FilePath)
-	if moveErr := hw.metadataService.MoveToCorrupted(ctx, relativePath); moveErr != nil {
-		slog.WarnContext(ctx, "Failed to move corrupted metadata file", "error", moveErr)
-	}
 }

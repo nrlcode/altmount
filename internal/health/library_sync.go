@@ -288,6 +288,10 @@ type cleanupCounts struct {
 	libraryDirsDeleted  int
 }
 
+// FACORE-AD-004 keeps library synchronization observational for every cleanup
+// target. Scans and additions remain active; destructive orphan cleanup does not.
+const librarySyncDestructiveCleanupEnabled = false
+
 // findFilesToDelete identifies database records that no longer have corresponding metadata files
 // or library files. filesInUse can be nil for metadata-only sync.
 func (lsw *LibrarySyncWorker) findFilesToDelete(
@@ -403,7 +407,9 @@ func (lsw *LibrarySyncWorker) syncDatabaseRecords(
 
 	// Batch delete orphaned files
 	if len(filesToDelete) > 0 {
-		if !dryRun {
+		if dryRun {
+			counts.deleted = len(filesToDelete)
+		} else if librarySyncDestructiveCleanupEnabled {
 			if _, err := lsw.healthRepo.DeleteHealthRecordsBulk(ctx, filesToDelete); err != nil {
 				slog.ErrorContext(ctx, "Failed to delete orphaned health records",
 					"count", len(filesToDelete),
@@ -413,8 +419,6 @@ func (lsw *LibrarySyncWorker) syncDatabaseRecords(
 				slog.InfoContext(ctx, "Deleted orphaned health records",
 					"count", counts.deleted)
 			}
-		} else {
-			counts.deleted = len(filesToDelete)
 		}
 	}
 
@@ -474,7 +478,7 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 
 	// Determine mount paths for symlink updates
 	var oldMountPath, newMountPath string
-	if lsw.configManager != nil && lsw.configManager.NeedsLibrarySync() && !dryRun {
+	if lsw.configManager != nil && lsw.configManager.NeedsLibrarySync() && !dryRun && librarySyncDestructiveCleanupEnabled {
 		oldMountPath = lsw.configManager.GetPreviousMountPath()
 		newMountPath = cfg.MountPath
 		slog.InfoContext(ctx, "Will update symlinks during filesystem walk",
@@ -819,7 +823,9 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 
 				if previousPending[relativeMountPath] {
 					// Confirmed orphan: missing in two consecutive runs → safe to delete
-					if !dryRun {
+					if dryRun {
+						metadataDeletedCount++
+					} else if librarySyncDestructiveCleanupEnabled {
 						if err := lsw.metadataService.DeleteFileMetadataWithSourceNzb(ctx, relativeMountPath, deleteSourceNzb); err != nil {
 							if !os.IsNotExist(err) {
 								slog.ErrorContext(ctx, "Failed to delete confirmed orphaned metadata",
@@ -830,8 +836,6 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 								"path", relativeMountPath)
 							metadataDeletedCount++
 						}
-					} else {
-						metadataDeletedCount++
 					}
 				}
 			}
@@ -885,7 +889,11 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 
 			if previousLibPending[metaPath] {
 				// Confirmed orphan: missing in two consecutive runs → safe to delete
-				if !dryRun {
+				if dryRun {
+					libraryFilesDeletedCount++
+					continue
+				}
+				if librarySyncDestructiveCleanupEnabled {
 					// SAFETY: Never delete physical files in NONE strategy.
 					if cfg.Import.ImportStrategy == config.ImportStrategyNone {
 						slog.DebugContext(ctx, "Skipped library file deletion (NONE strategy safety)", "path", file)
@@ -951,8 +959,8 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 						continue
 					}
 					slog.InfoContext(ctx, "Deleted confirmed orphaned library file", "path", file, "target", metaPath)
+					libraryFilesDeletedCount++
 				}
-				libraryFilesDeletedCount++
 			}
 		}
 
@@ -968,7 +976,7 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 		}
 
 		// Remove empty directories after file cleanup (only if not dry run and cleanup is safe)
-		if !dryRun {
+		if !dryRun && librarySyncDestructiveCleanupEnabled {
 			var err error
 			libraryDirsDeletedCount, err = lsw.removeEmptyDirectories(ctx)
 			if err != nil {
@@ -998,7 +1006,7 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 	dbCounts.added = totalAdded
 
 	// Cleanup orphaned .ids/ symlinks after all other cleanup phases
-	if shouldCleanup && !dryRun {
+	if shouldCleanup && !dryRun && librarySyncDestructiveCleanupEnabled {
 		removed, idsErr := lsw.metadataService.CleanupOrphanedIDSymlinks(ctx)
 		if idsErr != nil && !errors.Is(idsErr, context.Canceled) {
 			slog.ErrorContext(ctx, "Failed to cleanup orphaned ID symlinks", "error", idsErr)
