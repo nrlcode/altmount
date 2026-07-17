@@ -23,7 +23,6 @@ func TestTriggerFileRescanPropagatesCallerCancellation(t *testing.T) {
 	var startedOnce sync.Once
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseRequest) }) }
-	defer release()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startedOnce.Do(func() { close(requestStarted) })
 		select {
@@ -34,6 +33,7 @@ func TestTriggerFileRescanPropagatesCallerCancellation(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	defer release()
 
 	enabled := true
 	cfg := config.DefaultConfig()
