@@ -21,6 +21,11 @@ func TestRemoveEmptyDirsSafeRejectsDanglingRootSymlink(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestRemoveEmptyDirsSafeAllowsMissingRoot(t *testing.T) {
+	rootPath := filepath.Join(t.TempDir(), "missing")
+	require.NoError(t, RemoveEmptyDirsSafe(rootPath, filepath.Join(rootPath, "one", "two")))
+}
+
 func TestRemoveEmptyDirsSafeRetainsValidatedRootIdentity(t *testing.T) {
 	base := t.TempDir()
 	rootPath := filepath.Join(base, "root")

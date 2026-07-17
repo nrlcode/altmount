@@ -23,6 +23,16 @@ func TestCleanupAuthorityRejectsDanglingRootSymlink(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestCleanupAuthorityAllowsMissingRoot(t *testing.T) {
+	planner := newCleanupPlanner()
+	t.Cleanup(planner.close)
+
+	authority, err := planner.authority(filepath.Join(t.TempDir(), "missing"))
+	require.NoError(t, err)
+	require.True(t, authority.missing)
+	require.Nil(t, authority.root)
+}
+
 func TestCleanupAuthorityRetainsValidatedRootIdentity(t *testing.T) {
 	base := t.TempDir()
 	rootPath := filepath.Join(base, "root")
