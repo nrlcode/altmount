@@ -12,9 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestPrepareUpdateForResultDegraded verifies the worker's decision table for
-// classified events: degraded verdicts skip repair entirely, while fatal and
-// unclassified events follow the pre-existing retry/repair path.
+// TestPrepareUpdateForResultDegraded verifies the worker's SQL decision table.
+// Evidence classification must not mutate the metadata authority.
 func TestPrepareUpdateForResultDegraded(t *testing.T) {
 	tempDir := t.TempDir()
 	env := newRepairTestEnv(t, tempDir, nil)
@@ -57,7 +56,8 @@ func TestPrepareUpdateForResultDegraded(t *testing.T) {
 
 		got, err := env.metadataService.ReadFileMetadata(filePath)
 		require.NoError(t, err)
-		assert.Equal(t, metapb.FileStatus_FILE_STATUS_DEGRADED, got.Status)
+		assert.Equal(t, metapb.FileStatus_FILE_STATUS_HEALTHY, got.Status,
+			"SQL evidence publication must not mutate metadata")
 	})
 
 	t.Run("in-flight repair wins over degraded", func(t *testing.T) {
