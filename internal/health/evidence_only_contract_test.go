@@ -48,6 +48,33 @@ func TestWorkerAdmissionFailurePerformsNoCheckEffectOrPublication(t *testing.T) 
 	assert.Equal(t, metapb.FileStatus_FILE_STATUS_HEALTHY, meta.Status)
 }
 
+func TestWorkerProcessesOnlyRowsActuallyClaimed(t *testing.T) {
+	client := fakepool.New()
+	env := newBatchTestEnv(t, t.TempDir(), client)
+	paths := []string{"movies/claimed.mkv", "movies/omitted.mkv"}
+	segmentIDs := make([]string, len(paths))
+	for i, path := range paths {
+		segmentIDs[i] = writeHealthyFile(t, env, path)
+		insertFileHealth(t, env.db, path, "/library/"+filepath.Base(path), 0, 3)
+	}
+	_, err := env.db.Exec(`
+		CREATE TRIGGER omit_stale_health_member BEFORE UPDATE OF status ON file_health
+		WHEN OLD.file_path = 'movies/omitted.mkv' AND NEW.status = 'checking'
+		BEGIN SELECT RAISE(IGNORE); END;
+	`)
+	require.NoError(t, err)
+
+	require.NoError(t, env.hw.runHealthCheckCycle(context.Background()))
+
+	assert.Equal(t, int64(1), client.PerMessageCalls(segmentIDs[0]))
+	assert.Zero(t, client.PerMessageCalls(segmentIDs[1]),
+		"a member omitted by current-row admission must not be checked")
+	omitted, err := env.healthRepo.GetFileHealth(context.Background(), paths[1])
+	require.NoError(t, err)
+	require.NotNil(t, omitted)
+	assert.Equal(t, database.HealthStatusPending, omitted.Status)
+}
+
 func TestWorkerPublishesCorruptionEvidenceWithoutAutomaticEffects(t *testing.T) {
 	for _, action := range []string{"repair", "delete"} {
 		t.Run(action, func(t *testing.T) {
