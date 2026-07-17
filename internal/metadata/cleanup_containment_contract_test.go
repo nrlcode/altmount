@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
+	"time"
 
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/stretchr/testify/assert"
@@ -777,4 +779,181 @@ func TestCleanupContainment_DeleteDirectoryReturnsRefCounterErrors(t *testing.T)
 	assert.FileExists(t, metaPath, "the first failed refcount mutation must preserve the directory")
 	assert.FileExists(t, storePath)
 	assert.Equal(t, []string{storePath}, counter.calls)
+}
+
+type blockingCleanupRefCounter struct {
+	mu             sync.Mutex
+	count          int64
+	calls          []string
+	firstEntered   chan struct{}
+	bothPlanned    chan struct{}
+	firstOnce      sync.Once
+	bothOnce       sync.Once
+	barrierTimeout time.Duration
+	fallbacks      int
+}
+
+func newBlockingCleanupRefCounter(count int64, barrierTimeout time.Duration) *blockingCleanupRefCounter {
+	return &blockingCleanupRefCounter{
+		count:          count,
+		firstEntered:   make(chan struct{}),
+		bothPlanned:    make(chan struct{}),
+		barrierTimeout: barrierTimeout,
+	}
+}
+
+func (c *blockingCleanupRefCounter) IncStoreRef(context.Context, string) error {
+	return nil
+}
+
+func (c *blockingCleanupRefCounter) DecStoreRef(_ context.Context, path string) (int64, error) {
+	c.mu.Lock()
+	c.calls = append(c.calls, path)
+	callCount := len(c.calls)
+	c.mu.Unlock()
+
+	c.firstOnce.Do(func() { close(c.firstEntered) })
+	if callCount >= 2 {
+		c.bothOnce.Do(func() { close(c.bothPlanned) })
+	}
+
+	timer := time.NewTimer(c.barrierTimeout)
+	defer timer.Stop()
+	select {
+	case <-c.bothPlanned:
+	case <-timer.C:
+		c.mu.Lock()
+		c.fallbacks++
+		c.mu.Unlock()
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.count--
+	return c.count, nil
+}
+
+func (c *blockingCleanupRefCounter) snapshot() (calls []string, count int64, fallbacks int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.calls...), c.count, c.fallbacks
+}
+
+func TestCleanupContainment_ConcurrentDeleteConsumesMetadataReferenceOnce(t *testing.T) {
+	base := t.TempDir()
+	metadataRoot := filepath.Join(base, "metadata")
+	storeRoot := filepath.Join(base, "stores")
+	require.NoError(t, os.MkdirAll(storeRoot, 0o755))
+
+	ms := NewMetadataService(metadataRoot)
+	if _, supported := any(ms).(cleanupRootConfigurer); supported {
+		require.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot))
+	}
+
+	storePath := filepath.Join(storeRoot, "shared.nzbz")
+	require.NoError(t, ms.Store().WriteStore(storePath, &metapb.NzbStore{}))
+	targetMetaPath := writeCleanupMetadata(t, ms, "target.mkv", "", storePath)
+	survivorMetaPath := writeCleanupMetadata(t, ms, "survivor.mkv", "", storePath)
+
+	counter := newBlockingCleanupRefCounter(2, 5*time.Second)
+	ms.SetStoreRefCounter(counter)
+	results := make(chan error, 2)
+	deleteTarget := func() {
+		results <- ms.DeleteFileMetadataWithSourceNzb(context.Background(), "target.mkv", false)
+	}
+
+	go deleteTarget()
+	<-counter.firstEntered
+	go deleteTarget()
+
+	errs := []error{<-results, <-results}
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+
+	calls, count, fallbacks := counter.snapshot()
+	t.Logf("concurrent cleanup barrier: calls=%d remaining=%d fallbacks=%d", len(calls), count, fallbacks)
+	assert.Equal(t, []string{storePath}, calls,
+		"one metadata row owns one decrement even when concurrent callers planned it")
+	assert.Equal(t, int64(1), count,
+		"the surviving metadata row must retain its store reference")
+	assert.FileExists(t, storePath,
+		"a store still referenced by surviving metadata must not be deleted")
+	assert.NoFileExists(t, targetMetaPath)
+	assert.FileExists(t, survivorMetaPath)
+}
+
+type retryCleanupRefCounter struct {
+	mu       sync.Mutex
+	count    int64
+	failCall int
+	err      error
+	calls    []string
+}
+
+func (c *retryCleanupRefCounter) IncStoreRef(context.Context, string) error {
+	return nil
+}
+
+func (c *retryCleanupRefCounter) DecStoreRef(_ context.Context, path string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, path)
+	if len(c.calls) == c.failCall {
+		return c.count, c.err
+	}
+	c.count--
+	return c.count, nil
+}
+
+func (c *retryCleanupRefCounter) snapshot() (calls []string, count int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.calls...), c.count
+}
+
+func TestCleanupContainment_DeleteDirectoryRetryDoesNotRepeatConsumedDecrement(t *testing.T) {
+	base := t.TempDir()
+	metadataRoot := filepath.Join(base, "metadata")
+	storeRoot := filepath.Join(base, "stores")
+	require.NoError(t, os.MkdirAll(storeRoot, 0o755))
+
+	ms := NewMetadataService(metadataRoot)
+	if _, supported := any(ms).(cleanupRootConfigurer); supported {
+		require.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot))
+	}
+
+	storePath := filepath.Join(storeRoot, "shared.nzbz")
+	require.NoError(t, ms.Store().WriteStore(storePath, &metapb.NzbStore{}))
+	firstMetaPath := writeCleanupMetadata(t, ms, filepath.Join("movies", "first.mkv"), "", storePath)
+	secondMetaPath := writeCleanupMetadata(t, ms, filepath.Join("movies", "second.mkv"), "", storePath)
+	survivorMetaPath := writeCleanupMetadata(t, ms, "survivor.mkv", "", storePath)
+
+	counterErr := errors.New("injected later decrement failure")
+	counter := &retryCleanupRefCounter{count: 3, failCall: 2, err: counterErr}
+	ms.SetStoreRefCounter(counter)
+
+	firstErr := ms.DeleteDirectory("movies")
+	assert.ErrorIs(t, firstErr, counterErr)
+
+	remaining := 0
+	for _, metaPath := range []string{firstMetaPath, secondMetaPath} {
+		if _, err := os.Lstat(metaPath); err == nil {
+			remaining++
+		} else {
+			require.ErrorIs(t, err, os.ErrNotExist)
+		}
+	}
+	assert.Equal(t, 1, remaining,
+		"a successful decrement must consume its metadata row before a later decrement can fail")
+
+	require.NoError(t, ms.DeleteDirectory("movies"))
+	calls, count := counter.snapshot()
+	assert.Equal(t, []string{storePath, storePath, storePath}, calls,
+		"retry must visit only the metadata reference whose decrement did not succeed")
+	assert.Equal(t, int64(1), count,
+		"two removed metadata rows must leave the surviving row's reference")
+	assert.NoDirExists(t, filepath.Join(metadataRoot, "movies"))
+	assert.FileExists(t, storePath)
+	assert.FileExists(t, survivorMetaPath)
 }
