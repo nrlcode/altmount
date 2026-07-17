@@ -21,6 +21,9 @@ func TestTriggerFileRescanPropagatesCallerCancellation(t *testing.T) {
 	requestStarted := make(chan struct{})
 	releaseRequest := make(chan struct{})
 	var startedOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRequest) }) }
+	defer release()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startedOnce.Do(func() { close(requestStarted) })
 		select {
@@ -59,7 +62,7 @@ func TestTriggerFileRescanPropagatesCallerCancellation(t *testing.T) {
 	select {
 	case <-requestStarted:
 	case <-time.After(time.Second):
-		close(releaseRequest)
+		release()
 		t.Fatal("ARR request did not start")
 	}
 	cancel()
@@ -72,7 +75,7 @@ func TestTriggerFileRescanPropagatesCallerCancellation(t *testing.T) {
 	case <-time.After(250 * time.Millisecond):
 	}
 	if !returnedAfterCancel {
-		close(releaseRequest)
+		release()
 		select {
 		case callErr = <-callDone:
 		case <-time.After(2 * time.Second):

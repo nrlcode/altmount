@@ -3,7 +3,6 @@ package health
 import (
 	"context"
 	"database/sql"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -92,12 +91,16 @@ func TestHealthWorkerStartFailsClosedWhenOwnershipResetFails(t *testing.T) {
 	require.Error(t, err, "the worker must not admit work after durable ownership reset fails")
 	assert.False(t, env.hw.IsRunning())
 	assert.Equal(t, WorkerStatusStopped, env.hw.GetStats().Status)
+
+	_, err = env.db.Exec(`DROP TRIGGER fail_health_start_reset`)
+	require.NoError(t, err)
+	require.NoError(t, env.hw.Start(context.Background()),
+		"a failed startup must leave the same worker instance retryable once persistence recovers")
+	assert.True(t, env.hw.IsRunning())
+	require.NoError(t, env.hw.Stop(context.Background()))
 }
 
 func TestBackgroundCheckRegistersCancellationBeforeReturning(t *testing.T) {
-	previousProcs := runtime.GOMAXPROCS(1)
-	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
-
 	client := newHeldStatClient(1)
 	fixture := newDestructiveClaimFixture(t, pool.NntpClient(client))
 	require.NoError(t, fixture.env.hw.Start(context.Background()))
@@ -112,7 +115,43 @@ func TestBackgroundCheckRegistersCancellationBeforeReturning(t *testing.T) {
 		}
 	})
 
-	require.NoError(t, fixture.env.hw.PerformBackgroundCheck(context.Background(), fixture.filePath))
+	// This lock is a deterministic registration barrier. A correct admission
+	// cannot return until it has published the cancellation entry, so it must
+	// remain blocked here. An implementation that registers only in the spawned
+	// goroutine returns early while that goroutine waits on this exact lock.
+	fixture.env.hw.activeChecksMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			fixture.env.hw.activeChecksMu.Unlock()
+		}
+	}()
+	callStarted := make(chan struct{})
+	callDone := make(chan error, 1)
+	go func() {
+		close(callStarted)
+		callDone <- fixture.env.hw.PerformBackgroundCheck(context.Background(), fixture.filePath)
+	}()
+	<-callStarted
+	var callErr error
+	returnedBeforeRegistration := false
+	select {
+	case callErr = <-callDone:
+		returnedBeforeRegistration = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	assert.False(t, returnedBeforeRegistration,
+		"background admission must not return while cancellation registration is blocked")
+	fixture.env.hw.activeChecksMu.Unlock()
+	locked = false
+	if !returnedBeforeRegistration {
+		select {
+		case callErr = <-callDone:
+		case <-time.After(time.Second):
+			t.Fatal("background admission did not return after registration barrier opened")
+		}
+	}
+	require.NoError(t, callErr)
 	assert.True(t, fixture.env.hw.IsCheckActive(fixture.filePath),
 		"a successful admission must publish its cancellation handle before returning")
 }
@@ -142,8 +181,11 @@ func TestCancelHealthCheckJoinsExactOwnerAndPreservesReplacement(t *testing.T) {
 
 	cancelCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_ = fixture.env.hw.CancelHealthCheck(cancelCtx, fixture.filePath)
-	require.Eventually(t, func() bool { return !fixture.env.hw.IsCheckActive(fixture.filePath) }, time.Second, time.Millisecond)
+	require.NoError(t, fixture.env.hw.CancelHealthCheck(cancelCtx, fixture.filePath),
+		"cancelling the exact admitted owner should succeed even when that owner discovers a replacement")
+	assert.False(t, fixture.env.hw.IsCheckActive(fixture.filePath),
+		"CancelHealthCheck must synchronously join and unregister the exact execution")
+	assert.Zero(t, client.InFlight(), "joined cancellation must have completed transport unwinding before return")
 
 	var status, metadata string
 	var token sql.NullString

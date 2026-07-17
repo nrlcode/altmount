@@ -5,81 +5,47 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
-	"reflect"
-	"sync/atomic"
 	"testing"
 
-	"github.com/javi11/altmount/internal/database"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/testsupport/fakepool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func setEffectTestClaim(file *database.FileHealth, token *string) {
-	field := reflect.ValueOf(file).Elem().FieldByName("HealthClaimToken")
-	if field.IsValid() && field.CanSet() {
-		field.Set(reflect.ValueOf(token))
-	}
-}
-
-type healthSideEffectApplier interface {
-	applyHealthSideEffect(context.Context, *database.FileHealth, func() error) error
-}
-
-func requireHealthSideEffectApplier(t *testing.T, worker *HealthWorker) healthSideEffectApplier {
+func setEffectTestMetadataStatus(t *testing.T, env *repairTestEnv, path string, status metapb.FileStatus) {
 	t.Helper()
-	applier, ok := any(worker).(healthSideEffectApplier)
-	require.True(t, ok, "HealthWorker must centralize ownership checks around every external health effect")
-	return applier
+	fileMetadata, err := env.metadataService.ReadFileMetadata(path)
+	require.NoError(t, err)
+	require.NotNil(t, fileMetadata)
+	fileMetadata.Status = status
+	require.NoError(t, env.metadataService.WriteFileMetadata(path, fileMetadata))
 }
 
-func TestHealthSideEffectFailsClosedWithoutNonEmptyOwnership(t *testing.T) {
-	env := newRepairTestEnv(t, t.TempDir(), nil)
+func TestHealthCycleStaleRandomTokenCannotAuthorizeMetadataEffect(t *testing.T) {
+	base := fakepool.New()
+	wrapper := &finalizationReplacingClient{Client: base}
+	fixture := newDestructiveClaimFixture(t, wrapper)
+	base.SetDefaultBehavior(fakepool.SegmentBehavior{})
+	wrapper.db = fixture.env.db
+	wrapper.filePath = fixture.filePath
+	setEffectTestMetadataStatus(t, fixture.env, fixture.filePath, metapb.FileStatus_FILE_STATUS_CORRUPTED)
 
-	tests := []struct {
-		name  string
-		token *string
-	}{
-		{name: "missing token", token: nil},
-		{name: "empty token", token: new(string)},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			file := &database.FileHealth{FilePath: "complete/unowned-effect.mkv"}
-			setEffectTestClaim(file, test.token)
-			var called atomic.Bool
+	err := fixture.env.hw.runHealthCheckCycle(context.Background())
+	require.Error(t, err, "a stale in-memory token must not authorize an external metadata write")
+	require.NoError(t, wrapper.err)
 
-			err := requireHealthSideEffectApplier(t, env.hw).applyHealthSideEffect(context.Background(), file, func() error {
-				called.Store(true)
-				return nil
-			})
-
-			require.Error(t, err, "an external effect requires a non-empty durable owner")
-			assert.False(t, called.Load(), "ownership must be checked before invoking the effect")
-		})
-	}
-}
-
-func TestHealthSideEffectAllowsCurrentNonEmptyOwnership(t *testing.T) {
-	env := newRepairTestEnv(t, t.TempDir(), nil)
-	file := &database.FileHealth{FilePath: "complete/owned-effect.mkv"}
-	token := "effect-owner"
-	setEffectTestClaim(file, &token)
-	if !reflect.ValueOf(file).Elem().FieldByName("HealthClaimToken").IsValid() {
-		t.Skip("accepted parent does not yet expose health ownership in the model")
-	}
-	applier, ok := any(env.hw).(healthSideEffectApplier)
-	if !ok {
-		t.Skip("accepted parent does not yet centralize health side effects")
-	}
-	var called atomic.Bool
-
-	require.NoError(t, applier.applyHealthSideEffect(context.Background(), file, func() error {
-		called.Store(true)
-		return nil
-	}))
-	assert.True(t, called.Load())
+	currentMetadata, err := fixture.env.metadataService.ReadFileMetadata(fixture.filePath)
+	require.NoError(t, err)
+	require.NotNil(t, currentMetadata)
+	assert.Equal(t, metapb.FileStatus_FILE_STATUS_CORRUPTED, currentMetadata.Status,
+		"only the token that is current in the database may authorize the metadata transition")
+	var status, token string
+	require.NoError(t, fixture.env.db.QueryRow(`
+		SELECT status, health_claim_token FROM file_health WHERE file_path = ?
+	`, fixture.filePath).Scan(&status, &token))
+	assert.Equal(t, "checking", status)
+	assert.Equal(t, "owner-b", token)
 }
 
 func TestEffectfulCycleRowsPublishIndependentlyFromFailingSibling(t *testing.T) {
@@ -92,6 +58,8 @@ func TestEffectfulCycleRowsPublishIndependentlyFromFailingSibling(t *testing.T) 
 	require.NoError(t, os.WriteFile(secondLibraryPath, []byte("second library content"), 0o644))
 	writeHealthyFile(t, fixture.env, secondPath)
 	insertFileHealth(t, fixture.env.db, secondPath, secondLibraryPath, 0, 3)
+	setEffectTestMetadataStatus(t, fixture.env, fixture.filePath, metapb.FileStatus_FILE_STATUS_CORRUPTED)
+	setEffectTestMetadataStatus(t, fixture.env, secondPath, metapb.FileStatus_FILE_STATUS_CORRUPTED)
 
 	_, err := fixture.env.db.Exec(`
 		CREATE TRIGGER fail_second_effect_publication

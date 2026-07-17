@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/javi11/altmount/internal/config"
@@ -12,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestFilesystemRemoveNotFoundPreservesHealthRecord(t *testing.T) {
+func TestFilesystemRemoveNotFoundPreservesSamePathReplacement(t *testing.T) {
 	repo, db, _ := setupStreamHealthEnv(t)
 	cfg := config.DefaultConfig()
 	remote := NewMetadataRemoteFile(
@@ -22,23 +23,41 @@ func TestFilesystemRemoveNotFoundPreservesHealthRecord(t *testing.T) {
 	t.Cleanup(remote.repairCoalescer.Close)
 	nfs := NewNzbFilesystem(remote)
 	const path = "movies/not-found-but-current.mkv"
+	const currentLibraryPath = "/library/current/not-found.mkv"
 	_, err := db.Exec(`
-		INSERT INTO file_health (file_path, status, metadata)
-		VALUES (?, 'healthy', '{"revision":"current"}')
+		INSERT INTO file_health (file_path, library_path, status, metadata)
+		VALUES (?, '/library/stale/not-found.mkv', 'corrupted', '{"revision":"observed"}')
 	`, path)
 	require.NoError(t, err)
+	observed, err := repo.GetFileHealth(context.Background(), path)
+	require.NoError(t, err)
+	require.NotNil(t, observed)
+	_, err = db.Exec(`DELETE FROM file_health WHERE id = ?`, observed.ID)
+	require.NoError(t, err)
+	_, err = db.Exec(`
+		INSERT INTO file_health (file_path, library_path, status, metadata)
+		VALUES (?, ?, 'healthy', '{"revision":"replacement"}')
+	`, path, currentLibraryPath)
+	require.NoError(t, err)
+	replacement, err := repo.GetFileHealth(context.Background(), path)
+	require.NoError(t, err)
+	require.NotNil(t, replacement)
+	require.NotEqual(t, observed.ID, replacement.ID)
 
 	err = nfs.Remove(context.Background(), path)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, os.ErrNotExist))
 	current, err := repo.GetFileHealth(context.Background(), path)
 	require.NoError(t, err)
-	require.NotNil(t, current, "a missing metadata object is not authority to consume a current health row")
+	require.NotNil(t, current, "not-found removal must not consume a same-path replacement")
+	assert.Equal(t, replacement.ID, current.ID)
+	require.NotNil(t, current.LibraryPath)
+	assert.Equal(t, currentLibraryPath, *current.LibraryPath)
 	require.NotNil(t, current.Metadata)
-	assert.JSONEq(t, `{"revision":"current"}`, *current.Metadata)
+	assert.JSONEq(t, `{"revision":"replacement"}`, *current.Metadata)
 }
 
-func TestFilesystemRemoveClaimFailurePreservesMetadataAndHealth(t *testing.T) {
+func TestFilesystemRemoveMetadataFailurePreservesHealthRecord(t *testing.T) {
 	repo, db, metadataService := setupStreamHealthEnv(t)
 	cfg := config.DefaultConfig()
 	remote := NewMetadataRemoteFile(
@@ -49,25 +68,20 @@ func TestFilesystemRemoveClaimFailurePreservesMetadataAndHealth(t *testing.T) {
 	nfs := NewNzbFilesystem(remote)
 	const path = "movies/rejected-removal-owner.mkv"
 	writeStreamMeta(t, metadataService, path)
+	metadataPath := metadataService.GetMetadataFilePath(path)
+	require.NoError(t, os.Remove(metadataPath))
+	require.NoError(t, os.Mkdir(metadataPath, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(metadataPath, "deletion-blocker"), []byte("block"), 0o644))
 	_, err := db.Exec(`
 		INSERT INTO file_health (file_path, status, metadata)
 		VALUES (?, 'healthy', '{"revision":"current"}')
 	`, path)
 	require.NoError(t, err)
-	_, err = db.Exec(`
-		CREATE TRIGGER reject_filesystem_removal_claim
-		BEFORE UPDATE OF health_claim_token ON file_health
-		WHEN NEW.health_claim_token IS NOT NULL
-		BEGIN
-			SELECT RAISE(FAIL, 'synthetic administrative claim failure');
-		END;
-	`)
-	require.NoError(t, err)
 
 	err = nfs.Remove(context.Background(), path)
-	require.Error(t, err, "metadata removal must not start without durable administrative authority")
-	assert.True(t, metadataService.FileExists(path), "failed admission must preserve metadata")
+	require.Error(t, err, "failed metadata removal must be reported")
+	assert.True(t, metadataService.FileExists(path), "failed metadata removal must preserve the object")
 	current, err := repo.GetFileHealth(context.Background(), path)
 	require.NoError(t, err)
-	require.NotNil(t, current, "failed admission must preserve the health mapping")
+	require.NotNil(t, current, "failed metadata removal must preserve the current health mapping")
 }
