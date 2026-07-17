@@ -139,9 +139,19 @@ func (p *cleanupPlanner) authority(name string) (*cleanupAuthority, error) {
 	root, err := os.OpenRoot(name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			authority := &cleanupAuthority{missing: true}
-			p.authorities[name] = authority
-			return authority, nil
+			info, inspectErr := os.Lstat(name)
+			if errors.Is(inspectErr, fs.ErrNotExist) {
+				authority := &cleanupAuthority{missing: true}
+				p.authorities[name] = authority
+				return authority, nil
+			}
+			if inspectErr != nil {
+				return nil, fmt.Errorf("inspect cleanup root %q: %w", name, inspectErr)
+			}
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return nil, fmt.Errorf("cleanup root %q is not an unambiguous directory", name)
+			}
+			return nil, fmt.Errorf("cleanup root %q changed while acquiring authority", name)
 		}
 		return nil, fmt.Errorf("open cleanup root %q: %w", name, err)
 	}
