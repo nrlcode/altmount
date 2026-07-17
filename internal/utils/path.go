@@ -90,21 +90,28 @@ func RemoveEmptyDirsSafe(root, path string) error {
 	if relative == "." {
 		return nil
 	}
-	info, err := os.Lstat(root)
+	rooted, err := os.OpenRoot(root)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("root %q is not an unambiguous directory", root)
-	}
-	rooted, err := os.OpenRoot(root)
+	defer rooted.Close()
+	info, err := os.Lstat(root)
 	if err != nil {
 		return err
 	}
-	defer rooted.Close()
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("root %q is not an unambiguous directory", root)
+	}
+	rootInfo, err := rooted.Stat(".")
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, rootInfo) {
+		return fmt.Errorf("root %q changed while acquiring authority", root)
+	}
 
 	var parents []string
 	missing := false

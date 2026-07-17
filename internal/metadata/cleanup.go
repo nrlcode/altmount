@@ -136,24 +136,38 @@ func (p *cleanupPlanner) authority(name string) (*cleanupAuthority, error) {
 	if authority := p.authorities[name]; authority != nil {
 		return authority, nil
 	}
-	info, err := os.Lstat(name)
+	root, err := os.OpenRoot(name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			authority := &cleanupAuthority{missing: true}
 			p.authorities[name] = authority
 			return authority, nil
 		}
+		return nil, fmt.Errorf("open cleanup root %q: %w", name, err)
+	}
+	keepRoot := false
+	defer func() {
+		if !keepRoot {
+			_ = root.Close()
+		}
+	}()
+	info, err := os.Lstat(name)
+	if err != nil {
 		return nil, fmt.Errorf("inspect cleanup root %q: %w", name, err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return nil, fmt.Errorf("cleanup root %q is not an unambiguous directory", name)
 	}
-	root, err := os.OpenRoot(name)
+	rootInfo, err := root.Stat(".")
 	if err != nil {
-		return nil, fmt.Errorf("open cleanup root %q: %w", name, err)
+		return nil, fmt.Errorf("inspect opened cleanup root %q: %w", name, err)
+	}
+	if !os.SameFile(info, rootInfo) {
+		return nil, fmt.Errorf("cleanup root %q changed while acquiring authority", name)
 	}
 	authority := &cleanupAuthority{root: root}
 	p.authorities[name] = authority
+	keepRoot = true
 	return authority, nil
 }
 
