@@ -36,11 +36,13 @@ func TestClaimFilesCheckingBulkReturnsCurrentRows(t *testing.T) {
 	require.NoError(t, err)
 	selected, err := repo.GetFileHealth(ctx, "movies/current.mkv")
 	require.NoError(t, err)
+	currentSchedule := time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)
 	require.NoError(t, func() error {
 		_, updateErr := repo.db.ExecContext(ctx, `
-			UPDATE file_health SET library_path = '/library/current.mkv'
+			UPDATE file_health
+			SET library_path = '/library/current.mkv', scheduled_check_at = ?
 			WHERE id = ?
-		`, selected.ID)
+		`, currentSchedule, selected.ID)
 		return updateErr
 	}())
 
@@ -52,6 +54,30 @@ func TestClaimFilesCheckingBulkReturnsCurrentRows(t *testing.T) {
 	require.NotNil(t, claimed[0].LibraryPath)
 	assert.Equal(t, "/library/current.mkv", *claimed[0].LibraryPath,
 		"the worker must receive the current database snapshot, not its earlier selection")
+	require.NotNil(t, claimed[0].ScheduledCheckAt)
+	assert.WithinDuration(t, currentSchedule, claimed[0].ScheduledCheckAt.UTC(), time.Second,
+		"the claimed snapshot must include scheduling changes made after selection")
+}
+
+func TestClaimFilesCheckingBulkOmitsAlreadyCheckingRowWithoutMutation(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+	_, err := repo.db.ExecContext(ctx, `
+		INSERT INTO file_health (file_path, status, updated_at)
+		VALUES ('movies/in-flight.mkv', 'checking', '2020-01-02 03:04:05')
+	`)
+	require.NoError(t, err)
+	selected, err := repo.GetFileHealth(ctx, "movies/in-flight.mkv")
+	require.NoError(t, err)
+	require.Equal(t, HealthStatusChecking, selected.Status)
+
+	claimed, err := requireSchemaFreeHealthEvidence(t, repo).ClaimFilesCheckingBulk(ctx, []*FileHealth{selected})
+	require.NoError(t, err)
+	assert.Empty(t, claimed, "an in-flight row cannot be admitted a second time")
+
+	current, err := repo.GetFileHealth(ctx, "movies/in-flight.mkv")
+	require.NoError(t, err)
+	assert.Equal(t, selected, current, "rejecting an already-checking row must not mutate it")
 }
 
 func TestClaimFilesCheckingBulkOmitsStaleMembers(t *testing.T) {

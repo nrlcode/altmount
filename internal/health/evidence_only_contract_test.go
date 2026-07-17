@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
@@ -15,6 +17,66 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func waitForHealthContract(t *testing.T, condition func() bool, message string) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for !condition() {
+		select {
+		case <-deadline.C:
+			t.Fatal(message)
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
+func TestPerformBackgroundCheckClaimsSynchronouslyAndRejectsDuplicate(t *testing.T) {
+	client := fakepool.New()
+	release := make(chan struct{})
+	client.BlockUntil(release)
+	env := newBatchTestEnv(t, t.TempDir(), client)
+	const filePath = "movies/background-claim.mkv"
+	writeHealthyFile(t, env, filePath)
+	insertFileHealth(t, env.db, filePath, "/library/background-claim.mkv", 0, 3)
+
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		cancelWorker()
+		if env.hw.IsRunning() {
+			require.NoError(t, env.hw.Stop(context.Background()))
+		}
+	})
+	require.NoError(t, env.hw.Start(workerCtx))
+
+	require.NoError(t, env.hw.PerformBackgroundCheck(context.Background(), filePath))
+	claimed, err := env.healthRepo.GetFileHealth(context.Background(), filePath)
+	require.NoError(t, err)
+	assert.Equal(t, database.HealthStatusChecking, claimed.Status,
+		"the background check must own its durable claim before PerformBackgroundCheck returns")
+	waitForHealthContract(t, func() bool { return client.InFlight() == 1 },
+		"timed out waiting for the first STAT")
+
+	err = env.hw.PerformBackgroundCheck(context.Background(), filePath)
+	if err == nil {
+		waitForHealthContract(t, func() bool { return client.InFlight() == 2 },
+			"timed out waiting for the duplicate STAT")
+	}
+	assert.Error(t, err, "a second start must be rejected while the first claim is active")
+	assert.Equal(t, int64(1), client.StatCalls(), "the rejected start cannot dispatch a second STAT")
+
+	close(release)
+	released = true
+	waitForHealthContract(t, func() bool {
+		row, getErr := env.healthRepo.GetFileHealth(context.Background(), filePath)
+		return getErr == nil && row != nil && row.Status != database.HealthStatusChecking && !env.hw.IsCheckActive(filePath)
+	}, "timed out waiting for background health check completion")
+}
 
 func TestWorkerAdmissionFailurePerformsNoCheckEffectOrPublication(t *testing.T) {
 	client := fakepool.New()
