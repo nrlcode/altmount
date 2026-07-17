@@ -76,6 +76,41 @@ func TestObservedAutomaticCleanupPreservesSamePathReplacement(t *testing.T) {
 	assert.JSONEq(t, `{"revision":"replacement"}`, *current.Metadata)
 }
 
+func TestObservedAutomaticCleanupPreservesSubsecondReplacement(t *testing.T) {
+	repo := setupTestDB(t)
+	ctx := context.Background()
+	const path = "cleanup/observed-subsecond-replacement.mkv"
+	_, err := repo.db.ExecContext(ctx, `
+		INSERT INTO file_health (file_path, status, metadata, updated_at)
+		VALUES (?, 'corrupted', '{"revision":"same"}', '2026-07-16 12:34:56.100000000')
+	`, path)
+	require.NoError(t, err)
+	observed, err := repo.GetFileHealth(ctx, path)
+	require.NoError(t, err)
+	require.NotNil(t, observed)
+
+	// Model an otherwise-identical replacement/update within the same wall-clock
+	// second. Automatic cleanup must preserve it; truncating the observation to
+	// seconds would consume a row the scan never actually observed.
+	_, err = repo.db.ExecContext(ctx, `
+		UPDATE file_health
+		SET updated_at = '2026-07-16 12:34:56.900000000'
+		WHERE id = ?
+	`, observed.ID)
+	require.NoError(t, err)
+
+	deleted, err := requireObservedHealthCleanupAPI(t, repo).DeleteObservedHealthRecords(
+		ctx, []*FileHealth{observed},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted)
+	current, err := repo.GetFileHealth(ctx, path)
+	require.NoError(t, err)
+	require.NotNil(t, current)
+	assert.Equal(t, observed.ID, current.ID)
+	assert.NotEqual(t, observed.UpdatedAt, current.UpdatedAt)
+}
+
 func TestObservedAutomaticCleanupPreservesChangedOrActivelyOwnedRows(t *testing.T) {
 	repo := setupTestDB(t)
 	ctx := context.Background()
