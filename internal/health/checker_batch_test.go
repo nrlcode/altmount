@@ -130,10 +130,11 @@ func TestCheckFilesBatch(t *testing.T) {
 		assert.Equal(t, EventTypeFileHealthy, events[2].Type)
 		assert.Equal(t, int64(2), client.StatCalls(), "removed file must not be statted")
 
-		// The removed file's health record must be deleted.
+		// Missing metadata is evidence only; the checker cannot delete database authority.
 		fh, err := env.healthRepo.GetFileHealth(context.Background(), paths[1])
 		require.NoError(t, err)
-		assert.Nil(t, fh)
+		require.NotNil(t, fh)
+		assert.Equal(t, database.HealthStatusPending, fh.Status)
 	})
 
 	t.Run("pool down fails all non-early files", func(t *testing.T) {
