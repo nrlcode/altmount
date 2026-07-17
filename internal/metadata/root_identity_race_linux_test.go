@@ -12,6 +12,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestCleanupAuthorityRejectsDanglingRootSymlink(t *testing.T) {
+	base := t.TempDir()
+	rootPath := filepath.Join(base, "root")
+	require.NoError(t, os.Symlink(filepath.Join(base, "missing"), rootPath))
+
+	planner := newCleanupPlanner()
+	t.Cleanup(planner.close)
+	_, err := planner.authority(rootPath)
+	require.Error(t, err)
+}
+
 func TestCleanupAuthorityRetainsValidatedRootIdentity(t *testing.T) {
 	base := t.TempDir()
 	rootPath := filepath.Join(base, "root")
