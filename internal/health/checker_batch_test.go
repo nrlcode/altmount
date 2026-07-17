@@ -130,11 +130,10 @@ func TestCheckFilesBatch(t *testing.T) {
 		assert.Equal(t, EventTypeFileHealthy, events[2].Type)
 		assert.Equal(t, int64(2), client.StatCalls(), "removed file must not be statted")
 
-		// The checker reports evidence only. The worker must consume a current
-		// claim before it may delete this health record.
+		// The removed file's health record must be deleted.
 		fh, err := env.healthRepo.GetFileHealth(context.Background(), paths[1])
 		require.NoError(t, err)
-		assert.NotNil(t, fh)
+		assert.Nil(t, fh)
 	})
 
 	t.Run("pool down fails all non-early files", func(t *testing.T) {

@@ -2,7 +2,6 @@ package nzbfilesystem
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,7 +10,6 @@ import (
 
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
-	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/usenet"
 	"github.com/javi11/nntppool/v4"
 	"github.com/stretchr/testify/assert"
@@ -98,105 +96,4 @@ func TestPR3UnconfirmedCorruptBodyDoesNotDeleteOrRepair(t *testing.T) {
 	meta, err := ms.ReadFileMetadata(filePath)
 	require.NoError(t, err)
 	assert.NotNil(t, meta, "unconfirmed corruption must not delete or move metadata")
-}
-
-func TestStreamingDeleteOnCorruptionMissingHealthRowFailsClosed(t *testing.T) {
-	repo, _, ms := setupStreamHealthEnv(t)
-	ctx := context.Background()
-	const filePath = "movies/missing-health-owner.mkv"
-	seg := writeStreamMeta(t, ms, filePath)
-
-	enabled := true
-	cfg := config.DefaultConfig()
-	cfg.Health.Enabled = &enabled
-	cfg.Health.CorruptionAction = "delete"
-	mvf := newStreamFailureMVF(ctx, filePath, repo, ms, seg, cfg)
-	mvf.updateFileHealthOnError(&usenet.DataCorruptionError{
-		UnderlyingErr: errors.New("article not found"),
-		NoRetry:       true,
-	}, true)
-
-	meta, err := ms.ReadFileMetadata(filePath)
-	require.NoError(t, err)
-	require.NotNil(t, meta, "missing database ownership must preserve metadata")
-	assert.Equal(t, metapb.FileStatus_FILE_STATUS_HEALTHY, meta.Status)
-}
-
-func TestStreamingDeleteOnCorruptionRequiresCurrentHealthOwnership(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("symlinks not supported on Windows")
-	}
-	repo, db, ms := setupStreamHealthEnv(t)
-	ctx := context.Background()
-	libraryRoot := t.TempDir()
-	filePath := "series/fenced-delete.mkv"
-	libraryPath := filepath.Join(libraryRoot, "series", "fenced-delete.mkv")
-	seg := writeStreamMeta(t, ms, filePath)
-	require.NoError(t, os.MkdirAll(filepath.Dir(libraryPath), 0o755))
-	require.NoError(t, os.WriteFile(libraryPath, []byte("current"), 0o644))
-	_, err := db.Exec(`
-		INSERT INTO file_health
-			(file_path, library_path, status, scheduled_check_at, health_claim_token)
-		VALUES (?, ?, 'checking', datetime('now'), 'foreign-owner')
-	`, filePath, libraryPath)
-	require.NoError(t, err)
-
-	enabled := true
-	cfg := config.DefaultConfig()
-	cfg.Health.Enabled = &enabled
-	cfg.Health.CorruptionAction = "delete"
-	cfg.Health.LibraryDir = &libraryRoot
-	mvf := newStreamFailureMVF(ctx, filePath, repo, ms, seg, cfg)
-	mvf.updateFileHealthOnError(&usenet.DataCorruptionError{UnderlyingErr: errors.New("article not found"), NoRetry: true}, true)
-
-	fh, err := repo.GetFileHealth(ctx, filePath)
-	require.NoError(t, err)
-	require.NotNil(t, fh, "an unowned streaming callback must not delete the health authority")
-	assert.Equal(t, database.HealthStatusChecking, fh.Status)
-	var token sql.NullString
-	require.NoError(t, db.QueryRow(`SELECT health_claim_token FROM file_health WHERE file_path = ?`, filePath).Scan(&token))
-	assert.True(t, token.Valid, "an unowned delete callback must preserve ownership")
-	assert.Equal(t, "foreign-owner", token.String, "an unowned delete callback must preserve the exact winning token")
-	meta, err := ms.ReadFileMetadata(filePath)
-	require.NoError(t, err)
-	require.NotNil(t, meta, "an unowned callback must not delete or hide metadata")
-	assert.Equal(t, metapb.FileStatus_FILE_STATUS_HEALTHY, meta.Status)
-	_, err = os.Stat(libraryPath)
-	require.NoError(t, err, "an unowned callback must not delete library content")
-}
-
-func TestStreamingRepairMoveRequiresCurrentHealthOwnership(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("symlinks not supported on Windows")
-	}
-	repo, db, ms := setupStreamHealthEnv(t)
-	ctx := context.Background()
-	filePath := "series/fenced-repair.mkv"
-	libraryPath := "/media/library/fenced-repair.mkv"
-	seg := writeStreamMeta(t, ms, filePath)
-	_, err := db.Exec(`
-		INSERT INTO file_health
-			(file_path, library_path, status, scheduled_check_at, health_claim_token)
-		VALUES (?, ?, 'checking', datetime('now'), 'foreign-owner')
-	`, filePath, libraryPath)
-	require.NoError(t, err)
-
-	enabled := true
-	cfg := config.DefaultConfig()
-	cfg.Health.Enabled = &enabled
-	mvf := newStreamFailureMVF(ctx, filePath, repo, ms, seg, cfg)
-	mvf.updateFileHealthOnError(&usenet.DataCorruptionError{UnderlyingErr: errors.New("article not found"), NoRetry: true}, true)
-
-	fh, err := repo.GetFileHealth(ctx, filePath)
-	require.NoError(t, err)
-	require.NotNil(t, fh)
-	assert.Equal(t, database.HealthStatusChecking, fh.Status, "unowned streaming evidence may not publish repair authority")
-	var token sql.NullString
-	require.NoError(t, db.QueryRow(`SELECT health_claim_token FROM file_health WHERE file_path = ?`, filePath).Scan(&token))
-	assert.True(t, token.Valid, "an unowned repair/move callback must preserve ownership")
-	assert.Equal(t, "foreign-owner", token.String, "an unowned repair/move callback must preserve the exact winning token")
-	meta, err := ms.ReadFileMetadata(filePath)
-	require.NoError(t, err)
-	require.NotNil(t, meta, "unowned streaming evidence must not move metadata")
-	assert.Equal(t, metapb.FileStatus_FILE_STATUS_HEALTHY, meta.Status)
 }

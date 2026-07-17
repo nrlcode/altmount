@@ -50,17 +50,8 @@ func setupStreamHealthEnv(t *testing.T) (*database.HealthRepository, *sql.DB, *m
 			streaming_failure_count INTEGER DEFAULT 0,
 			is_masked BOOLEAN DEFAULT FALSE,
 			indexer TEXT DEFAULT NULL,
-			download_id TEXT DEFAULT NULL,
-			health_claim_token TEXT DEFAULT NULL
+			download_id TEXT DEFAULT NULL
 		);
-
-		CREATE TRIGGER revoke_stream_test_health_claim
-		AFTER UPDATE OF status, file_path, library_path, metadata, source_nzb_path ON file_health
-		WHEN OLD.health_claim_token IS NOT NULL
-		 AND NEW.health_claim_token = OLD.health_claim_token
-		BEGIN
-			UPDATE file_health SET health_claim_token = NULL WHERE id = NEW.id;
-		END;
 	`)
 	require.NoError(t, err)
 

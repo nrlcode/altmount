@@ -6,7 +6,6 @@ import (
 	"errors"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	"github.com/javi11/altmount/internal/arrs"
@@ -73,7 +72,6 @@ type mockARRsService struct {
 	mu        sync.Mutex
 	calls     []triggerCall
 	returnErr error
-	onTrigger func()
 }
 
 type triggerCall struct {
@@ -83,12 +81,8 @@ type triggerCall struct {
 
 func (m *mockARRsService) TriggerFileRescan(_ context.Context, pathForRescan string, relativePath string, _ *string) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.calls = append(m.calls, triggerCall{pathForRescan: pathForRescan, relativePath: relativePath})
-	onTrigger := m.onTrigger
-	m.mu.Unlock()
-	if onTrigger != nil {
-		onTrigger()
-	}
 	return m.returnErr
 }
 
@@ -99,11 +93,9 @@ func (m *mockARRsService) DiscoverFileMetadata(_ context.Context, _, _, _, _ str
 // mockImportService implements importer.ImportService for testing.
 type mockImportService struct {
 	importer.ImportService
-	calls atomic.Int64
 }
 
 func (m *mockImportService) RegenerateMetadata(_ context.Context, _ string) error {
-	m.calls.Add(1)
 	return nil
 }
 
@@ -147,38 +139,8 @@ func newRepairTestEnv(t *testing.T, tempDir string, arrsErr error, configure ...
 			streaming_failure_count INTEGER DEFAULT 0,
 			is_masked BOOLEAN DEFAULT FALSE,
 			indexer TEXT DEFAULT NULL,
-			download_id TEXT DEFAULT NULL,
-			health_claim_token TEXT DEFAULT NULL
+			download_id TEXT DEFAULT NULL
 		);
-
-		CREATE TRIGGER IF NOT EXISTS test_update_file_health_timestamp
-		AFTER UPDATE ON file_health
-		WHEN NEW.health_claim_token IS OLD.health_claim_token
-		BEGIN
-			UPDATE file_health SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
-		END;
-
-		CREATE TRIGGER IF NOT EXISTS test_revoke_health_claim
-		AFTER UPDATE OF status, file_path, library_path, metadata, source_nzb_path ON file_health
-		WHEN OLD.health_claim_token IS NOT NULL
-		 AND NEW.health_claim_token = OLD.health_claim_token
-		BEGIN
-			UPDATE file_health SET health_claim_token = NULL WHERE id = NEW.id;
-		END;
-
-		CREATE TABLE IF NOT EXISTS test_health_claim_audit (
-			file_path TEXT NOT NULL,
-			token TEXT NOT NULL UNIQUE
-		);
-
-		CREATE TRIGGER IF NOT EXISTS test_audit_health_claim_rotation
-		AFTER UPDATE OF health_claim_token ON file_health
-		WHEN NEW.health_claim_token IS NOT NULL
-		 AND NEW.health_claim_token IS NOT OLD.health_claim_token
-		BEGIN
-			INSERT INTO test_health_claim_audit(file_path, token)
-			VALUES (NEW.file_path, NEW.health_claim_token);
-		END;
 
 		CREATE TABLE IF NOT EXISTS system_state (
 			key TEXT PRIMARY KEY,
