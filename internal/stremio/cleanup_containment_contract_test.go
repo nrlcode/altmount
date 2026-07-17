@@ -81,6 +81,14 @@ func TestStremioDeleteItemEnforcesNZBAuthority(t *testing.T) {
 			wantDelete: true,
 		},
 		{
+			name: "contained queue path",
+			path: func(f cleanupContractFixture) string {
+				testRoot := filepath.Base(filepath.Dir(filepath.Dir(f.cfg.Database.Path)))
+				return filepath.Join(os.TempDir(), ".altmount-queue", testRoot, "item.nzb")
+			},
+			wantDelete: true,
+		},
+		{
 			name: "outside path",
 			path: func(f cleanupContractFixture) string {
 				return filepath.Join(filepath.Dir(f.cfg.Database.Path), "outside", "item.nzb")
