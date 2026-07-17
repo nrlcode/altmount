@@ -36,6 +36,7 @@ func newCleanupContractFixture(t *testing.T) cleanupContractFixture {
 	repo := database.NewRepository(db.Connection(), database.DialectSQLite)
 	require.NoError(t, os.MkdirAll(cfg.Metadata.RootPath, 0o755))
 	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
+	metadataService.SetStoreRefCounter(db.StoreRefRepo)
 	return cleanupContractFixture{
 		cfg:  cfg,
 		db:   db,
@@ -65,6 +66,91 @@ func writeCleanupContractNZB(t *testing.T, path string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
 	require.NoError(t, os.WriteFile(path, []byte("nzb"), 0o600))
+}
+
+func TestStremioDeleteItemCleansStorage(t *testing.T) {
+	tests := []struct {
+		name              string
+		storagePath       string
+		existingDirectory bool
+	}{
+		{
+			name:              "existing metadata directory",
+			storagePath:       filepath.Join("movies", "release"),
+			existingDirectory: true,
+		},
+		{
+			name:        "absent directory single file fallback",
+			storagePath: filepath.Join("movies", "release", "movie.mkv"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newCleanupContractFixture(t)
+			storeRoot := filepath.Join(filepath.Dir(f.cfg.Database.Path), ".nzbs")
+			caseName := filepath.Base(t.Name())
+			sourcePath := filepath.Join(storeRoot, "sources", caseName, "item.nzb")
+			storePath := filepath.Join(storeRoot, "stores", caseName, "item.nzbz")
+			virtualPath := filepath.Join("movies", "release", "movie.mkv")
+
+			writeCleanupContractNZB(t, sourcePath)
+			require.NoError(t, f.meta.Store().WriteStore(storePath, &metapb.NzbStore{}))
+			require.NoError(t, f.meta.WriteFileMetadataV3(
+				ctx,
+				virtualPath,
+				&metapb.FileMetadata{
+					FileSize: 1,
+					Status:   metapb.FileStatus_FILE_STATUS_HEALTHY,
+				},
+				nil,
+				storePath,
+			))
+
+			metaPath := f.meta.GetMetadataFilePath(virtualPath)
+			require.FileExists(t, metaPath)
+			require.FileExists(t, sourcePath)
+			require.FileExists(t, storePath)
+			count, err := f.db.StoreRefRepo.GetStoreRefCount(ctx, storePath)
+			require.NoError(t, err)
+			require.Equal(t, int64(1), count)
+			require.Equal(t, tt.existingDirectory, f.meta.DirectoryExists(tt.storagePath))
+
+			item := addCleanupContractItem(t, f.repo, sourcePath, &tt.storagePath)
+			require.NoError(t, f.db.Repository.AddStoragePath(ctx, item.ID, tt.storagePath))
+			persisted, err := f.repo.GetQueueItem(ctx, item.ID)
+			require.NoError(t, err)
+			require.NotNil(t, persisted)
+			require.NotNil(t, persisted.StoragePath)
+			require.Equal(t, tt.storagePath, *persisted.StoragePath)
+
+			f.service.deleteItem(ctx, persisted)
+
+			assert.NoFileExists(t, metaPath)
+			assert.NoFileExists(t, sourcePath)
+			assert.NoFileExists(t, storePath)
+			count, err = f.db.StoreRefRepo.GetStoreRefCount(ctx, storePath)
+			require.NoError(t, err)
+			assert.Zero(t, count)
+			assert.NoDirExists(t, filepath.Dir(sourcePath))
+			assert.NoDirExists(t, filepath.Dir(filepath.Dir(sourcePath)))
+			assert.DirExists(t, storeRoot)
+			assert.DirExists(t, f.cfg.Metadata.RootPath)
+
+			metadataReleaseDir := filepath.Dir(metaPath)
+			assert.NoDirExists(t, metadataReleaseDir)
+			if tt.existingDirectory {
+				assert.DirExists(t, filepath.Dir(metadataReleaseDir))
+			} else {
+				assert.NoDirExists(t, filepath.Dir(metadataReleaseDir))
+			}
+
+			got, err := f.repo.GetQueueItem(ctx, item.ID)
+			require.NoError(t, err)
+			assert.Nil(t, got)
+		})
+	}
 }
 
 func TestStremioDeleteItemEnforcesNZBAuthority(t *testing.T) {

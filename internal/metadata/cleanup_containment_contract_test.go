@@ -32,17 +32,9 @@ func (c *cleanupRefCounter) DecStoreRef(_ context.Context, path string) (int64, 
 	return c.count, c.err
 }
 
-type cleanupRootConfigurer interface {
-	configureCleanupRoots(storeRoot string, sourceRoots []string) error
-}
-
 func configureCleanupRootsForTest(t *testing.T, ms *MetadataService, storeRoot string, sourceRoots ...string) error {
 	t.Helper()
-	configurer, ok := any(ms).(cleanupRootConfigurer)
-	if !ok {
-		return errors.New("metadata service does not expose cleanup-root configuration")
-	}
-	return configurer.configureCleanupRoots(storeRoot, sourceRoots)
+	return ms.ConfigureCleanupRoots(storeRoot, sourceRoots...)
 }
 
 func writeCleanupMetadata(t *testing.T, ms *MetadataService, virtualPath, sourcePath, storePath string) string {
@@ -845,26 +837,31 @@ func TestCleanupContainment_ConcurrentDeleteConsumesMetadataReferenceOnce(t *tes
 	storeRoot := filepath.Join(base, "stores")
 	require.NoError(t, os.MkdirAll(storeRoot, 0o755))
 
-	ms := NewMetadataService(metadataRoot)
-	if _, supported := any(ms).(cleanupRootConfigurer); supported {
-		require.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot))
-	}
+	first := NewMetadataService(metadataRoot)
+	second := NewMetadataService(metadataRoot)
+	require.NoError(t, first.ConfigureCleanupRoots(storeRoot))
+	require.NoError(t, second.ConfigureCleanupRoots(storeRoot))
 
 	storePath := filepath.Join(storeRoot, "shared.nzbz")
-	require.NoError(t, ms.Store().WriteStore(storePath, &metapb.NzbStore{}))
-	targetMetaPath := writeCleanupMetadata(t, ms, "target.mkv", "", storePath)
-	survivorMetaPath := writeCleanupMetadata(t, ms, "survivor.mkv", "", storePath)
+	require.NoError(t, first.Store().WriteStore(storePath, &metapb.NzbStore{}))
+	targetMetaPath := writeCleanupMetadata(t, first, "target.mkv", "", storePath)
+	survivorMetaPath := writeCleanupMetadata(t, first, "survivor.mkv", "", storePath)
 
 	counter := newBlockingCleanupRefCounter(2, 5*time.Second)
-	ms.SetStoreRefCounter(counter)
+	first.SetStoreRefCounter(counter)
+	second.SetStoreRefCounter(counter)
 	results := make(chan error, 2)
-	deleteTarget := func() {
+	deleteTarget := func(ms *MetadataService) {
 		results <- ms.DeleteFileMetadataWithSourceNzb(context.Background(), "target.mkv", false)
 	}
 
-	go deleteTarget()
-	<-counter.firstEntered
-	go deleteTarget()
+	go deleteTarget(first)
+	select {
+	case <-counter.firstEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first cleanup did not reach the reference-count barrier")
+	}
+	go deleteTarget(second)
 
 	errs := []error{<-results, <-results}
 	for _, err := range errs {
@@ -872,7 +869,8 @@ func TestCleanupContainment_ConcurrentDeleteConsumesMetadataReferenceOnce(t *tes
 	}
 
 	calls, count, fallbacks := counter.snapshot()
-	t.Logf("concurrent cleanup barrier: calls=%d remaining=%d fallbacks=%d", len(calls), count, fallbacks)
+	require.Equal(t, 1, fallbacks,
+		"the second service must remain outside reference mutation until the first serialized call releases")
 	assert.Equal(t, []string{storePath}, calls,
 		"one metadata row owns one decrement even when concurrent callers planned it")
 	assert.Equal(t, int64(1), count,
@@ -919,9 +917,7 @@ func TestCleanupContainment_DeleteDirectoryRetryDoesNotRepeatConsumedDecrement(t
 	require.NoError(t, os.MkdirAll(storeRoot, 0o755))
 
 	ms := NewMetadataService(metadataRoot)
-	if _, supported := any(ms).(cleanupRootConfigurer); supported {
-		require.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot))
-	}
+	require.NoError(t, ms.ConfigureCleanupRoots(storeRoot))
 
 	storePath := filepath.Join(storeRoot, "shared.nzbz")
 	require.NoError(t, ms.Store().WriteStore(storePath, &metapb.NzbStore{}))
