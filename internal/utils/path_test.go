@@ -78,10 +78,6 @@ func TestRemoveEmptyDirs(t *testing.T) {
 }
 
 func TestRemoveEmptyDirsRejectsEscapedPaths(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("containment contract uses Unix symlink semantics")
-	}
-
 	t.Run("sibling prefix", func(t *testing.T) {
 		base := t.TempDir()
 		root := filepath.Join(base, "root")
@@ -101,6 +97,9 @@ func TestRemoveEmptyDirsRejectsEscapedPaths(t *testing.T) {
 	})
 
 	t.Run("parent symlink", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink semantics differ on Windows")
+		}
 		base := t.TempDir()
 		root := filepath.Join(base, "root")
 		outside := filepath.Join(base, "outside")

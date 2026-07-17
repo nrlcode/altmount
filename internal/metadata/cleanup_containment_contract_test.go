@@ -37,7 +37,7 @@ func configureCleanupRootsForTest(t *testing.T, ms *MetadataService, storeRoot s
 	t.Helper()
 	configurer, ok := any(ms).(cleanupRootConfigurer)
 	if !ok {
-		t.Skip("cleanup root options are introduced by the tests-first implementation")
+		return errors.New("metadata service does not expose cleanup-root configuration")
 	}
 	return configurer.configureCleanupRoots(storeRoot, sourceRoots)
 }
@@ -70,19 +70,18 @@ func writeCleanupFile(t *testing.T, path string) {
 }
 
 func TestCleanupContainment_RejectsUntrustedTargetsBeforeMutation(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("containment contract uses Unix symlink semantics")
-	}
-
 	tests := []struct {
-		name  string
-		setup func(t *testing.T) (delete func() error, protected []string, refCounter *cleanupRefCounter)
+		name    string
+		symlink bool
+		setup   func(t *testing.T) (delete func() error, protected []string, refCounter *cleanupRefCounter)
 	}{
 		{
 			name: "metadata lexical traversal",
 			setup: func(t *testing.T) (func() error, []string, *cleanupRefCounter) {
 				base := t.TempDir()
-				ms := NewMetadataService(filepath.Join(base, "metadata"))
+				metadataRoot := filepath.Join(base, "metadata")
+				require.NoError(t, os.MkdirAll(metadataRoot, 0o755))
+				ms := NewMetadataService(metadataRoot)
 				virtualPath := filepath.Join("..", "outside", "victim")
 				metaPath := writeCleanupMetadata(t, ms, virtualPath, "", "")
 				return func() error {
@@ -91,7 +90,8 @@ func TestCleanupContainment_RejectsUntrustedTargetsBeforeMutation(t *testing.T) 
 			},
 		},
 		{
-			name: "metadata parent symlink",
+			name:    "metadata parent symlink",
+			symlink: true,
 			setup: func(t *testing.T) (func() error, []string, *cleanupRefCounter) {
 				base := t.TempDir()
 				root := filepath.Join(base, "metadata")
@@ -139,10 +139,13 @@ func TestCleanupContainment_RejectsUntrustedTargetsBeforeMutation(t *testing.T) 
 			name: "physical lexical escape",
 			setup: func(t *testing.T) (func() error, []string, *cleanupRefCounter) {
 				base := t.TempDir()
-				ms := NewMetadataService(filepath.Join(base, "metadata"))
+				metadataRoot := filepath.Join(base, "metadata")
+				require.NoError(t, os.MkdirAll(metadataRoot, 0o755))
+				ms := NewMetadataService(metadataRoot)
 				metaPath := writeCleanupMetadata(t, ms, "movie.mkv", "", "")
 				physicalRoot := filepath.Join(base, "library")
 				physicalPath := filepath.Join(base, "library-sibling", "victim.mkv")
+				require.NoError(t, os.MkdirAll(physicalRoot, 0o755))
 				writeCleanupFile(t, physicalPath)
 				return func() error {
 					return ms.DeleteCorruptedFile(context.Background(), "movie.mkv", false, physicalPath, physicalRoot)
@@ -150,7 +153,8 @@ func TestCleanupContainment_RejectsUntrustedTargetsBeforeMutation(t *testing.T) 
 			},
 		},
 		{
-			name: "physical parent symlink",
+			name:    "physical parent symlink",
+			symlink: true,
 			setup: func(t *testing.T) (func() error, []string, *cleanupRefCounter) {
 				base := t.TempDir()
 				ms := NewMetadataService(filepath.Join(base, "metadata"))
@@ -198,6 +202,9 @@ func TestCleanupContainment_RejectsUntrustedTargetsBeforeMutation(t *testing.T) 
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.symlink && runtime.GOOS == "windows" {
+				t.Skip("symlink semantics differ on Windows")
+			}
 			deleteTarget, protected, counter := tt.setup(t)
 			err := deleteTarget()
 			assert.Error(t, err)
@@ -250,13 +257,10 @@ func TestCleanupContainment_PropagatesMutationErrors(t *testing.T) {
 }
 
 func TestCleanupContainment_ConfiguredRootsRejectEscapesBeforeMutation(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("containment contract uses Unix symlink semantics")
-	}
-
 	tests := []struct {
 		name    string
 		isStore bool
+		symlink bool
 		target  func(t *testing.T, base, trustedRoot, outsideRoot string) string
 	}{
 		{
@@ -268,7 +272,8 @@ func TestCleanupContainment_ConfiguredRootsRejectEscapesBeforeMutation(t *testin
 			},
 		},
 		{
-			name: "source parent symlink escape",
+			name:    "source parent symlink escape",
+			symlink: true,
 			target: func(t *testing.T, _, trustedRoot, outsideRoot string) string {
 				require.NoError(t, os.Symlink(outsideRoot, filepath.Join(trustedRoot, "linked")))
 				path := filepath.Join(trustedRoot, "linked", "victim.nzb")
@@ -288,6 +293,7 @@ func TestCleanupContainment_ConfiguredRootsRejectEscapesBeforeMutation(t *testin
 		{
 			name:    "store parent symlink escape",
 			isStore: true,
+			symlink: true,
 			target: func(t *testing.T, _, trustedRoot, outsideRoot string) string {
 				require.NoError(t, os.Symlink(outsideRoot, filepath.Join(trustedRoot, "linked")))
 				path := filepath.Join(trustedRoot, "linked", "victim.nzbz")
@@ -299,6 +305,9 @@ func TestCleanupContainment_ConfiguredRootsRejectEscapesBeforeMutation(t *testin
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.symlink && runtime.GOOS == "windows" {
+				t.Skip("symlink semantics differ on Windows")
+			}
 			base := t.TempDir()
 			metadataRoot := filepath.Join(base, "metadata")
 			sourceRoot := filepath.Join(base, "sources")
@@ -374,6 +383,40 @@ func TestCleanupContainment_ConfiguredContainedTargetsDelete(t *testing.T) {
 	require.DirExists(t, sourceRoot)
 	require.DirExists(t, storeRoot)
 	require.DirExists(t, physicalRoot, "pruning must stop at the trusted root")
+}
+
+func TestCleanupContainment_PreflightsAllTargetsBeforeAnyMutation(t *testing.T) {
+	base := t.TempDir()
+	metadataRoot := filepath.Join(base, "metadata")
+	sourceRoot := filepath.Join(base, "sources")
+	storeRoot := filepath.Join(base, "stores")
+	physicalRoot := filepath.Join(base, "library")
+	for _, root := range []string{metadataRoot, sourceRoot, storeRoot, physicalRoot} {
+		require.NoError(t, os.MkdirAll(root, 0o755))
+	}
+
+	ms := NewMetadataService(metadataRoot)
+	assert.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot, sourceRoot))
+	counter := &cleanupRefCounter{count: 0}
+	ms.SetStoreRefCounter(counter)
+
+	sourcePath := filepath.Join(sourceRoot, "movie.nzb")
+	storePath := filepath.Join(storeRoot, "movie.nzbz")
+	unsafePhysicalPath := filepath.Join(base, "outside", "movie.mkv")
+	for _, path := range []string{sourcePath, unsafePhysicalPath} {
+		writeCleanupFile(t, path)
+	}
+	require.NoError(t, ms.Store().WriteStore(storePath, &metapb.NzbStore{}))
+	metaPath := writeCleanupMetadata(t, ms, "movie.mkv", sourcePath, storePath)
+
+	err := ms.DeleteCorruptedFile(
+		context.Background(), "movie.mkv", true, unsafePhysicalPath, physicalRoot,
+	)
+	assert.Error(t, err)
+	for _, path := range []string{metaPath, sourcePath, storePath, unsafePhysicalPath} {
+		assert.FileExists(t, path, "preflight must complete before any target mutation")
+	}
+	assert.Empty(t, counter.calls)
 }
 
 func TestCleanupContainment_MissingContainedTargetsAreIdempotent(t *testing.T) {
@@ -514,12 +557,9 @@ func TestCleanupContainment_ConfiguredRootTypeAmbiguityFailsClosed(t *testing.T)
 }
 
 func TestCleanupContainment_DeleteDirectoryRejectsEscapes(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("containment contract uses Unix symlink semantics")
-	}
-
 	tests := []struct {
 		name        string
+		symlink     bool
 		virtualPath func(t *testing.T, metadataRoot, outsideRoot string) string
 	}{
 		{
@@ -529,7 +569,8 @@ func TestCleanupContainment_DeleteDirectoryRejectsEscapes(t *testing.T) {
 			},
 		},
 		{
-			name: "parent symlink",
+			name:    "parent symlink",
+			symlink: true,
 			virtualPath: func(t *testing.T, metadataRoot, outsideRoot string) string {
 				require.NoError(t, os.Symlink(outsideRoot, filepath.Join(metadataRoot, "linked")))
 				return filepath.Join("linked", "victim")
@@ -539,6 +580,9 @@ func TestCleanupContainment_DeleteDirectoryRejectsEscapes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.symlink && runtime.GOOS == "windows" {
+				t.Skip("symlink semantics differ on Windows")
+			}
 			base := t.TempDir()
 			metadataRoot := filepath.Join(base, "metadata")
 			outsideRoot := filepath.Join(base, "outside")
@@ -557,17 +601,27 @@ func TestCleanupContainment_DeleteDirectoryRejectsEscapes(t *testing.T) {
 func TestCleanupContainment_DeleteDirectoryPreflightsStoreRefs(t *testing.T) {
 	base := t.TempDir()
 	metadataRoot := filepath.Join(base, "metadata")
+	storeRoot := filepath.Join(base, "stores")
+	require.NoError(t, os.MkdirAll(storeRoot, 0o755))
 	ms := NewMetadataService(metadataRoot)
-	storePath := filepath.Join(base, "outside", "victim.nzbz")
-	writeCleanupFile(t, storePath)
-	metaPath := writeCleanupMetadata(t, ms, filepath.Join("movies", "movie.mkv"), "", storePath)
+	assert.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot))
+
+	safeStorePath := filepath.Join(storeRoot, "safe.nzbz")
+	unsafeStorePath := filepath.Join(base, "outside", "victim.nzbz")
+	for _, path := range []string{safeStorePath, unsafeStorePath} {
+		writeCleanupFile(t, path)
+	}
+	safeMetaPath := writeCleanupMetadata(t, ms, filepath.Join("movies", "a-safe.mkv"), "", safeStorePath)
+	unsafeMetaPath := writeCleanupMetadata(t, ms, filepath.Join("movies", "z-unsafe.mkv"), "", unsafeStorePath)
 	counter := &cleanupRefCounter{count: 0}
 	ms.SetStoreRefCounter(counter)
 
 	err := ms.DeleteDirectory("movies")
 	assert.Error(t, err)
-	assert.FileExists(t, metaPath, "an unsafe child must preserve the complete directory")
-	assert.FileExists(t, storePath)
+	assert.DirExists(t, filepath.Join(metadataRoot, "movies"))
+	for _, path := range []string{safeMetaPath, unsafeMetaPath, safeStorePath, unsafeStorePath} {
+		assert.FileExists(t, path, "an unsafe child must preserve every directory target")
+	}
 	assert.Empty(t, counter.calls, "directory preflight must finish before reference-count mutation")
 }
 
@@ -577,4 +631,36 @@ func TestCleanupContainment_DeleteContainedDirectoryRemainsCompatible(t *testing
 
 	require.NoError(t, ms.DeleteDirectory("movies"))
 	require.NoFileExists(t, metaPath)
+}
+
+func TestCleanupContainment_DeleteDirectoryRootAndMissingGuards(t *testing.T) {
+	root := t.TempDir()
+	ms := NewMetadataService(root)
+	protected := filepath.Join(root, "keep.meta")
+	writeCleanupFile(t, protected)
+
+	require.Error(t, ms.DeleteDirectory(filepath.Join("child", "..")))
+	require.FileExists(t, protected)
+	require.NoError(t, ms.DeleteDirectory("already-gone"))
+}
+
+func TestCleanupContainment_DeleteDirectoryReturnsRefCounterErrors(t *testing.T) {
+	base := t.TempDir()
+	metadataRoot := filepath.Join(base, "metadata")
+	storeRoot := filepath.Join(base, "stores")
+	require.NoError(t, os.MkdirAll(storeRoot, 0o755))
+	ms := NewMetadataService(metadataRoot)
+	assert.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot))
+
+	storePath := filepath.Join(storeRoot, "movie.nzbz")
+	writeCleanupFile(t, storePath)
+	writeCleanupMetadata(t, ms, filepath.Join("movies", "movie.mkv"), "", storePath)
+	counterErr := errors.New("reference database unavailable")
+	counter := &cleanupRefCounter{err: counterErr}
+	ms.SetStoreRefCounter(counter)
+
+	err := ms.DeleteDirectory("movies")
+	assert.ErrorIs(t, err, counterErr)
+	assert.FileExists(t, storePath)
+	assert.Equal(t, []string{storePath}, counter.calls)
 }
