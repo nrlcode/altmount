@@ -23,6 +23,17 @@ func setEffectTestClaim(file *database.FileHealth, token *string) {
 	}
 }
 
+type healthSideEffectApplier interface {
+	applyHealthSideEffect(context.Context, *database.FileHealth, func() error) error
+}
+
+func requireHealthSideEffectApplier(t *testing.T, worker *HealthWorker) healthSideEffectApplier {
+	t.Helper()
+	applier, ok := any(worker).(healthSideEffectApplier)
+	require.True(t, ok, "HealthWorker must centralize ownership checks around every external health effect")
+	return applier
+}
+
 func TestHealthSideEffectFailsClosedWithoutNonEmptyOwnership(t *testing.T) {
 	env := newRepairTestEnv(t, t.TempDir(), nil)
 
@@ -39,7 +50,7 @@ func TestHealthSideEffectFailsClosedWithoutNonEmptyOwnership(t *testing.T) {
 			setEffectTestClaim(file, test.token)
 			var called atomic.Bool
 
-			err := env.hw.applyHealthSideEffect(context.Background(), file, func() error {
+			err := requireHealthSideEffectApplier(t, env.hw).applyHealthSideEffect(context.Background(), file, func() error {
 				called.Store(true)
 				return nil
 			})
@@ -55,12 +66,16 @@ func TestHealthSideEffectAllowsCurrentNonEmptyOwnership(t *testing.T) {
 	file := &database.FileHealth{FilePath: "complete/owned-effect.mkv"}
 	token := "effect-owner"
 	setEffectTestClaim(file, &token)
-	if reflect.ValueOf(file).Elem().FieldByName("HealthClaimToken").IsValid() == false {
+	if !reflect.ValueOf(file).Elem().FieldByName("HealthClaimToken").IsValid() {
 		t.Skip("accepted parent does not yet expose health ownership in the model")
+	}
+	applier, ok := any(env.hw).(healthSideEffectApplier)
+	if !ok {
+		t.Skip("accepted parent does not yet centralize health side effects")
 	}
 	var called atomic.Bool
 
-	require.NoError(t, env.hw.applyHealthSideEffect(context.Background(), file, func() error {
+	require.NoError(t, applier.applyHealthSideEffect(context.Background(), file, func() error {
 		called.Store(true)
 		return nil
 	}))
