@@ -133,44 +133,72 @@ func TestClaimFilesCheckingBulkWriteFailureRollsBack(t *testing.T) {
 	}
 }
 
-func TestPublishClaimedHealthStatusBulkRejectsReplacementAtomically(t *testing.T) {
-	repo := setupTestDB(t)
-	ctx := context.Background()
-	_, err := repo.db.ExecContext(ctx, `
-		INSERT INTO file_health (file_path, status)
-		VALUES ('a.mkv', 'pending'), ('b.mkv', 'pending')
-	`)
-	require.NoError(t, err)
-	selected := make([]*FileHealth, 0, 2)
-	for _, path := range []string{"a.mkv", "b.mkv"} {
-		row, getErr := repo.GetFileHealth(ctx, path)
-		require.NoError(t, getErr)
-		selected = append(selected, row)
+func TestPublishClaimedHealthStatusBulkRejectsLostClaimAtomically(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, *HealthRepository, *FileHealth) *FileHealth
+	}{
+		{
+			name: "same-path replacement removes claimed ID",
+			mutate: func(t *testing.T, repo *HealthRepository, claimed *FileHealth) *FileHealth {
+				_, err := repo.db.ExecContext(context.Background(), `
+					DELETE FROM file_health WHERE id = ?;
+					INSERT INTO file_health (file_path, status) VALUES ('b.mkv', 'checking');
+				`, claimed.ID)
+				require.NoError(t, err)
+				current, err := repo.GetFileHealth(context.Background(), "b.mkv")
+				require.NoError(t, err)
+				require.NotEqual(t, claimed.ID, current.ID)
+				return current
+			},
+		},
+		{
+			name: "claimed ID leaves checking",
+			mutate: func(t *testing.T, repo *HealthRepository, claimed *FileHealth) *FileHealth {
+				_, err := repo.db.ExecContext(context.Background(),
+					`UPDATE file_health SET status = 'pending' WHERE id = ?`, claimed.ID)
+				require.NoError(t, err)
+				current, err := repo.GetFileHealth(context.Background(), "b.mkv")
+				require.NoError(t, err)
+				require.Equal(t, claimed.ID, current.ID)
+				require.Equal(t, HealthStatusPending, current.Status)
+				return current
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := setupTestDB(t)
+			ctx := context.Background()
+			_, err := repo.db.ExecContext(ctx, `
+				INSERT INTO file_health (file_path, status)
+				VALUES ('a.mkv', 'pending'), ('b.mkv', 'pending')
+			`)
+			require.NoError(t, err)
+			selected := make([]*FileHealth, 0, 2)
+			for _, path := range []string{"a.mkv", "b.mkv"} {
+				row, getErr := repo.GetFileHealth(ctx, path)
+				require.NoError(t, getErr)
+				selected = append(selected, row)
+			}
+			api := requireSchemaFreeHealthEvidence(t, repo)
+			claimed, err := api.ClaimFilesCheckingBulk(ctx, selected)
+			require.NoError(t, err)
+			beforeB := tc.mutate(t, repo, claimed[1])
+			beforeA, err := repo.GetFileHealth(ctx, "a.mkv")
+			require.NoError(t, err)
+
+			next := time.Now().UTC().Add(time.Hour)
+			err = api.PublishClaimedHealthStatusBulk(ctx, claimed, []HealthStatusUpdate{
+				{Type: UpdateTypeHealthy, FilePath: "a.mkv", ScheduledCheckAt: next},
+				{Type: UpdateTypeHealthy, FilePath: "b.mkv", ScheduledCheckAt: next},
+			})
+			require.Error(t, err, "publication must require every claimed ID to remain checking")
+			afterA, err := repo.GetFileHealth(ctx, "a.mkv")
+			require.NoError(t, err)
+			assert.Equal(t, beforeA, afterA, "a rejected member must roll back all evidence publication")
+			afterB, err := repo.GetFileHealth(ctx, "b.mkv")
+			require.NoError(t, err)
+			assert.Equal(t, beforeB, afterB, "rejected publication must not touch the current second row")
+		})
 	}
-	api := requireSchemaFreeHealthEvidence(t, repo)
-	claimed, err := api.ClaimFilesCheckingBulk(ctx, selected)
-	require.NoError(t, err)
-
-	_, err = repo.db.ExecContext(ctx, `
-		DELETE FROM file_health WHERE id = ?;
-		INSERT INTO file_health (file_path, status) VALUES ('b.mkv', 'checking');
-	`, claimed[1].ID)
-	require.NoError(t, err)
-	replacement, err := repo.GetFileHealth(ctx, "b.mkv")
-	require.NoError(t, err)
-	require.NotEqual(t, claimed[1].ID, replacement.ID)
-
-	next := time.Now().UTC().Add(time.Hour)
-	err = api.PublishClaimedHealthStatusBulk(ctx, claimed, []HealthStatusUpdate{
-		{Type: UpdateTypeHealthy, FilePath: "a.mkv", ScheduledCheckAt: next},
-		{Type: UpdateTypeHealthy, FilePath: "b.mkv", ScheduledCheckAt: next},
-	})
-	require.Error(t, err, "publication must require every claimed ID to remain checking")
-	a, err := repo.GetFileHealth(ctx, "a.mkv")
-	require.NoError(t, err)
-	assert.Equal(t, HealthStatusChecking, a.Status, "a rejected member must roll back all evidence publication")
-	currentB, err := repo.GetFileHealth(ctx, "b.mkv")
-	require.NoError(t, err)
-	assert.Equal(t, replacement.ID, currentB.ID)
-	assert.Equal(t, HealthStatusChecking, currentB.Status)
 }

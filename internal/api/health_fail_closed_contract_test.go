@@ -74,9 +74,21 @@ func stableNon2xx(t *testing.T, app *fiber.App, request func() *http.Request) {
 	defer second.Body.Close()
 	secondBody, err := io.ReadAll(second.Body)
 	require.NoError(t, err)
+	type errorEnvelope struct {
+		Success bool `json:"success"`
+		Error   struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	var firstEnvelope, secondEnvelope errorEnvelope
+	require.NoError(t, json.Unmarshal(firstBody, &firstEnvelope))
+	require.NoError(t, json.Unmarshal(secondBody, &secondEnvelope))
 	assert.Equal(t, http.StatusConflict, first.StatusCode)
 	assert.Equal(t, http.StatusConflict, second.StatusCode)
-	assert.Contains(t, string(firstBody), "health_effects_temporarily_disabled")
+	assert.False(t, firstEnvelope.Success)
+	assert.False(t, secondEnvelope.Success)
+	assert.Equal(t, "health_effects_temporarily_disabled", firstEnvelope.Error.Code)
+	assert.Equal(t, "health_effects_temporarily_disabled", secondEnvelope.Error.Code)
 	assert.Equal(t, string(firstBody), string(secondBody), "the fail-closed response body must be stable")
 }
 
@@ -92,10 +104,19 @@ func TestManualRepairHandlersFailClosedBeforeARR(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			db, repo, _, cfg := newFailClosedHealthAPI(t)
 			var requests atomic.Int64
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				requests.Add(1)
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`[]`))
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v3/movie/1":
+					_, _ = w.Write([]byte(`{"id":1,"title":"Manual repair fixture","path":"/movies/manual","hasFile":false,"monitored":true}`))
+				case r.Method == http.MethodGet && r.URL.Path == "/api/v3/history":
+					_, _ = w.Write([]byte(`{"page":1,"pageSize":100,"totalRecords":0,"records":[]}`))
+				case r.Method == http.MethodPost && r.URL.Path == "/api/v3/command":
+					_, _ = w.Write([]byte(`{"id":7,"name":"MoviesSearch","commandName":"MoviesSearch","status":"queued"}`))
+				default:
+					http.NotFound(w, r)
+				}
 			}))
 			t.Cleanup(upstream.Close)
 			enabled := true

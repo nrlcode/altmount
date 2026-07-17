@@ -90,6 +90,7 @@ func TestStreamingFailureDoesNotOverwriteOrDeleteExistingRow(t *testing.T) {
 	require.NoError(t, err)
 	before, err := repo.GetFileHealth(context.Background(), path)
 	require.NoError(t, err)
+	require.NotNil(t, before)
 	enabled := true
 	cfg := config.DefaultConfig()
 	cfg.Health.Enabled = &enabled
@@ -104,10 +105,7 @@ func TestStreamingFailureDoesNotOverwriteOrDeleteExistingRow(t *testing.T) {
 	after, err := repo.GetFileHealth(context.Background(), path)
 	require.NoError(t, err)
 	require.NotNil(t, after, "existing same-path authority must never be consumed")
-	assert.Equal(t, before.ID, after.ID)
-	assert.Equal(t, before.Status, after.Status)
-	assert.Equal(t, before.LastError, after.LastError)
-	assert.Equal(t, before.Metadata, after.Metadata)
+	assert.Equal(t, before, after, "streaming evidence must not mutate any existing health field")
 	meta, err := ms.ReadFileMetadata(path)
 	require.NoError(t, err)
 	require.NotNil(t, meta)
