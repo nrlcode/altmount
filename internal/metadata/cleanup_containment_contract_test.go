@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -386,37 +387,49 @@ func TestCleanupContainment_ConfiguredContainedTargetsDelete(t *testing.T) {
 }
 
 func TestCleanupContainment_PreflightsAllTargetsBeforeAnyMutation(t *testing.T) {
-	base := t.TempDir()
-	metadataRoot := filepath.Join(base, "metadata")
-	sourceRoot := filepath.Join(base, "sources")
-	storeRoot := filepath.Join(base, "stores")
-	physicalRoot := filepath.Join(base, "library")
-	for _, root := range []string{metadataRoot, sourceRoot, storeRoot, physicalRoot} {
-		require.NoError(t, os.MkdirAll(root, 0o755))
-	}
+	for _, unsafeTarget := range []string{"source", "store", "physical"} {
+		t.Run(unsafeTarget, func(t *testing.T) {
+			base := t.TempDir()
+			metadataRoot := filepath.Join(base, "metadata")
+			sourceRoot := filepath.Join(base, "sources")
+			storeRoot := filepath.Join(base, "stores")
+			physicalRoot := filepath.Join(base, "library")
+			for _, root := range []string{metadataRoot, sourceRoot, storeRoot, physicalRoot} {
+				require.NoError(t, os.MkdirAll(root, 0o755))
+			}
 
-	ms := NewMetadataService(metadataRoot)
-	assert.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot, sourceRoot))
-	counter := &cleanupRefCounter{count: 0}
-	ms.SetStoreRefCounter(counter)
+			ms := NewMetadataService(metadataRoot)
+			assert.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot, sourceRoot))
+			counter := &cleanupRefCounter{count: 0}
+			ms.SetStoreRefCounter(counter)
 
-	sourcePath := filepath.Join(sourceRoot, "movie.nzb")
-	storePath := filepath.Join(storeRoot, "movie.nzbz")
-	unsafePhysicalPath := filepath.Join(base, "outside", "movie.mkv")
-	for _, path := range []string{sourcePath, unsafePhysicalPath} {
-		writeCleanupFile(t, path)
-	}
-	require.NoError(t, ms.Store().WriteStore(storePath, &metapb.NzbStore{}))
-	metaPath := writeCleanupMetadata(t, ms, "movie.mkv", sourcePath, storePath)
+			sourcePath := filepath.Join(sourceRoot, "movie.nzb")
+			storePath := filepath.Join(storeRoot, "movie.nzbz")
+			physicalPath := filepath.Join(physicalRoot, "movie.mkv")
+			switch unsafeTarget {
+			case "source":
+				sourcePath = filepath.Join(base, "outside-source", "movie.nzb")
+			case "store":
+				storePath = filepath.Join(base, "outside-store", "movie.nzbz")
+			case "physical":
+				physicalPath = filepath.Join(base, "outside-library", "movie.mkv")
+			}
+			for _, path := range []string{sourcePath, physicalPath} {
+				writeCleanupFile(t, path)
+			}
+			require.NoError(t, ms.Store().WriteStore(storePath, &metapb.NzbStore{}))
+			metaPath := writeCleanupMetadata(t, ms, "movie.mkv", sourcePath, storePath)
 
-	err := ms.DeleteCorruptedFile(
-		context.Background(), "movie.mkv", true, unsafePhysicalPath, physicalRoot,
-	)
-	assert.Error(t, err)
-	for _, path := range []string{metaPath, sourcePath, storePath, unsafePhysicalPath} {
-		assert.FileExists(t, path, "preflight must complete before any target mutation")
+			err := ms.DeleteCorruptedFile(
+				context.Background(), "movie.mkv", true, physicalPath, physicalRoot,
+			)
+			assert.Error(t, err)
+			for _, path := range []string{metaPath, sourcePath, storePath, physicalPath} {
+				assert.FileExists(t, path, "preflight must complete before any target mutation")
+			}
+			assert.Empty(t, counter.calls)
+		})
 	}
-	assert.Empty(t, counter.calls)
 }
 
 func TestCleanupContainment_MissingContainedTargetsAreIdempotent(t *testing.T) {
@@ -451,12 +464,13 @@ func TestCleanupContainment_MissingContainedTargetsAreIdempotent(t *testing.T) {
 func TestCleanupContainment_StoreReferenceOwnership(t *testing.T) {
 	counterErr := errors.New("reference database unavailable")
 	tests := []struct {
-		name          string
-		counter       *cleanupRefCounter
-		sourceIsStore bool
-		wantErr       error
-		wantStore     bool
-		wantCalls     int
+		name                string
+		counter             *cleanupRefCounter
+		sourceIsStore       bool
+		canonicalEquivalent bool
+		wantErr             error
+		wantStore           bool
+		wantCalls           int
 	}{
 		{name: "nil counter retains store", wantStore: true},
 		{name: "counter error retains store", counter: &cleanupRefCounter{err: counterErr}, wantErr: counterErr, wantStore: true, wantCalls: 1},
@@ -465,6 +479,7 @@ func TestCleanupContainment_StoreReferenceOwnership(t *testing.T) {
 		{name: "deduplicated nil counter retains store", sourceIsStore: true, wantStore: true},
 		{name: "deduplicated nonzero count retains store", counter: &cleanupRefCounter{count: 1}, sourceIsStore: true, wantStore: true, wantCalls: 1},
 		{name: "deduplicated zero count deletes store", counter: &cleanupRefCounter{count: 0}, sourceIsStore: true, wantCalls: 1},
+		{name: "canonical-equivalent paths deduplicate", counter: &cleanupRefCounter{count: 1}, canonicalEquivalent: true, wantStore: true, wantCalls: 1},
 	}
 
 	for _, tt := range tests {
@@ -476,24 +491,30 @@ func TestCleanupContainment_StoreReferenceOwnership(t *testing.T) {
 			require.NoError(t, os.MkdirAll(sourceRoot, 0o755))
 			require.NoError(t, os.MkdirAll(storeRoot, 0o755))
 			ms := NewMetadataService(metadataRoot)
-			require.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot, sourceRoot, storeRoot))
+			assert.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot, sourceRoot, storeRoot))
 			if tt.counter != nil {
 				ms.SetStoreRefCounter(tt.counter)
 			}
 
 			storePath := filepath.Join(storeRoot, "movie.nzbz")
-			writeCleanupFile(t, storePath)
+			require.NoError(t, ms.Store().WriteStore(storePath, &metapb.NzbStore{}))
 			sourcePath := ""
 			deleteSource := false
 			if tt.sourceIsStore {
 				sourcePath = storePath
 				deleteSource = true
 			}
+			if tt.canonicalEquivalent {
+				subdir := filepath.Join(storeRoot, "subdir")
+				require.NoError(t, os.MkdirAll(subdir, 0o755))
+				sourcePath = subdir + string(os.PathSeparator) + ".." + string(os.PathSeparator) + filepath.Base(storePath)
+				deleteSource = true
+			}
 			metaPath := writeCleanupMetadata(t, ms, "movie.mkv", sourcePath, storePath)
 
 			err := ms.DeleteFileMetadataWithSourceNzb(context.Background(), "movie.mkv", deleteSource)
 			if tt.wantErr != nil {
-				require.ErrorIs(t, err, tt.wantErr)
+				assert.ErrorIs(t, err, tt.wantErr)
 			} else {
 				require.NoError(t, err)
 			}
@@ -507,7 +528,47 @@ func TestCleanupContainment_StoreReferenceOwnership(t *testing.T) {
 			}
 			if tt.wantErr == nil {
 				require.NoFileExists(t, metaPath)
+			} else {
+				require.FileExists(t, metaPath, "the first failed refcount mutation must be fail-closed")
 			}
+		})
+	}
+}
+
+func TestCleanupContainment_ContainedExternalTargetTypesFailClosed(t *testing.T) {
+	for _, targetType := range []string{"source", "store"} {
+		t.Run(targetType, func(t *testing.T) {
+			base := t.TempDir()
+			metadataRoot := filepath.Join(base, "metadata")
+			sourceRoot := filepath.Join(base, "sources")
+			storeRoot := filepath.Join(base, "stores")
+			for _, root := range []string{sourceRoot, storeRoot} {
+				require.NoError(t, os.MkdirAll(root, 0o755))
+			}
+			ms := NewMetadataService(metadataRoot)
+			assert.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot, sourceRoot))
+			counter := &cleanupRefCounter{count: 0}
+			ms.SetStoreRefCounter(counter)
+
+			targetRoot := sourceRoot
+			if targetType == "store" {
+				targetRoot = storeRoot
+			}
+			target := filepath.Join(targetRoot, "not-a-file")
+			protected := filepath.Join(target, "child")
+			writeCleanupFile(t, protected)
+			sourcePath, storePath := target, ""
+			if targetType == "store" {
+				sourcePath, storePath = "", target
+			}
+			metaPath := writeCleanupMetadata(t, ms, "movie.mkv", sourcePath, storePath)
+
+			err := ms.DeleteFileMetadataWithSourceNzb(context.Background(), "movie.mkv", sourcePath != "")
+			assert.Error(t, err)
+			assert.FileExists(t, metaPath)
+			assert.DirExists(t, target)
+			assert.FileExists(t, protected)
+			assert.Empty(t, counter.calls)
 		})
 	}
 }
@@ -633,6 +694,58 @@ func TestCleanupContainment_DeleteContainedDirectoryRemainsCompatible(t *testing
 	require.NoFileExists(t, metaPath)
 }
 
+func TestCleanupContainment_ContainedFileCleanupGuards(t *testing.T) {
+	t.Run("source survives when cleanup is disabled", func(t *testing.T) {
+		base := t.TempDir()
+		ms := NewMetadataService(filepath.Join(base, "metadata"))
+		sourcePath := filepath.Join(base, "source", "movie.nzb")
+		writeCleanupFile(t, sourcePath)
+		metaPath := writeCleanupMetadata(t, ms, "movie.mkv", sourcePath, "")
+
+		require.NoError(t, ms.DeleteFileMetadataWithSourceNzb(context.Background(), "movie.mkv", false))
+		require.NoFileExists(t, metaPath)
+		require.FileExists(t, sourcePath)
+	})
+
+	t.Run("regular id sidecar deletes", func(t *testing.T) {
+		ms := NewMetadataService(t.TempDir())
+		metaPath := writeCleanupMetadata(t, ms, "movie.mkv", "", "")
+		writeCleanupFile(t, metaPath+".id")
+
+		require.NoError(t, ms.DeleteFileMetadataWithSourceNzb(context.Background(), "movie.mkv", false))
+		require.NoFileExists(t, metaPath)
+		require.NoFileExists(t, metaPath+".id")
+	})
+}
+
+func TestCleanupContainment_DeleteDirectoryStoreRefOutcomes(t *testing.T) {
+	for _, count := range []int64{0, 2} {
+		t.Run(fmt.Sprintf("count_%d", count), func(t *testing.T) {
+			base := t.TempDir()
+			metadataRoot := filepath.Join(base, "metadata")
+			storeRoot := filepath.Join(base, "stores")
+			require.NoError(t, os.MkdirAll(storeRoot, 0o755))
+			ms := NewMetadataService(metadataRoot)
+			assert.NoError(t, configureCleanupRootsForTest(t, ms, storeRoot))
+			counter := &cleanupRefCounter{count: count}
+			ms.SetStoreRefCounter(counter)
+
+			storePath := filepath.Join(storeRoot, "movie.nzbz")
+			require.NoError(t, ms.Store().WriteStore(storePath, &metapb.NzbStore{}))
+			metaPath := writeCleanupMetadata(t, ms, filepath.Join("movies", "movie.mkv"), "", storePath)
+
+			require.NoError(t, ms.DeleteDirectory("movies"))
+			require.NoFileExists(t, metaPath)
+			if count == 0 {
+				require.NoFileExists(t, storePath)
+			} else {
+				require.FileExists(t, storePath)
+			}
+			require.Equal(t, []string{storePath}, counter.calls)
+		})
+	}
+}
+
 func TestCleanupContainment_DeleteDirectoryRootAndMissingGuards(t *testing.T) {
 	root := t.TempDir()
 	ms := NewMetadataService(root)
@@ -654,13 +767,14 @@ func TestCleanupContainment_DeleteDirectoryReturnsRefCounterErrors(t *testing.T)
 
 	storePath := filepath.Join(storeRoot, "movie.nzbz")
 	writeCleanupFile(t, storePath)
-	writeCleanupMetadata(t, ms, filepath.Join("movies", "movie.mkv"), "", storePath)
+	metaPath := writeCleanupMetadata(t, ms, filepath.Join("movies", "movie.mkv"), "", storePath)
 	counterErr := errors.New("reference database unavailable")
 	counter := &cleanupRefCounter{err: counterErr}
 	ms.SetStoreRefCounter(counter)
 
 	err := ms.DeleteDirectory("movies")
 	assert.ErrorIs(t, err, counterErr)
+	assert.FileExists(t, metaPath, "the first failed refcount mutation must preserve the directory")
 	assert.FileExists(t, storePath)
 	assert.Equal(t, []string{storePath}, counter.calls)
 }
