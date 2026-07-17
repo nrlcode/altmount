@@ -9,13 +9,16 @@ import (
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
 	"github.com/javi11/altmount/internal/metadata"
+	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 type cleanupContractFixture struct {
 	cfg     *config.Config
+	db      *database.DB
 	repo    *database.Repository
+	meta    *metadata.MetadataService
 	service *StremioCleanupService
 }
 
@@ -35,7 +38,9 @@ func newCleanupContractFixture(t *testing.T) cleanupContractFixture {
 	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
 	return cleanupContractFixture{
 		cfg:  cfg,
+		db:   db,
 		repo: repo,
+		meta: metadataService,
 		service: NewStremioCleanupService(repo, metadataService, func() *config.Config {
 			return cfg
 		}),
@@ -122,4 +127,36 @@ func TestStremioDeleteItemStopsAfterMetadataCleanupFailure(t *testing.T) {
 	require.NoError(t, err)
 	assert.FileExists(t, nzbPath)
 	assert.NotNil(t, got, "failed metadata cleanup must preserve its retry record")
+}
+
+func TestStremioDeleteItemPreflightsDBPathBeforeMetadata(t *testing.T) {
+	f := newCleanupContractFixture(t)
+	outsideNZB := filepath.Join(filepath.Dir(f.cfg.Database.Path), "outside", "item.nzb")
+	writeCleanupContractNZB(t, outsideNZB)
+	storagePath := filepath.Join("movies", "release")
+	virtualPath := filepath.Join(storagePath, "movie.mkv")
+	require.NoError(t, f.meta.WriteFileMetadata(virtualPath, &metapb.FileMetadata{
+		FileSize: 1,
+		Status:   metapb.FileStatus_FILE_STATUS_HEALTHY,
+	}))
+	metaPath := f.meta.GetMetadataFilePath(virtualPath)
+
+	item := addCleanupContractItem(t, f.repo, outsideNZB, &storagePath)
+	_, err := f.db.Connection().ExecContext(
+		context.Background(), `UPDATE import_queue SET storage_path = ? WHERE id = ?`, storagePath, item.ID,
+	)
+	require.NoError(t, err)
+	persisted, err := f.repo.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	require.NotNil(t, persisted.StoragePath)
+
+	f.service.deleteItem(context.Background(), persisted)
+
+	got, err := f.repo.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, err)
+	assert.FileExists(t, metaPath, "NZB authority must be preflighted before metadata mutation")
+	assert.FileExists(t, outsideNZB)
+	assert.DirExists(t, filepath.Dir(outsideNZB))
+	assert.NotNil(t, got, "unsafe cleanup must preserve its retry record")
 }
