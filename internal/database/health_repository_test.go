@@ -716,3 +716,4 @@ func TestRelinkFileByFilename_ConflictMerge(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, oldH)
 }
+

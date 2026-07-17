@@ -224,3 +224,4 @@ func TestUpdateFileHealthOnError_FailureMasking_MasksRepair(t *testing.T) {
 	original, _ = ms.ReadFileMetadata(filePath)
 	assert.Nil(t, original, "metadata should be moved to corrupted folder now")
 }
+
