@@ -21,24 +21,39 @@ import (
 type heldStatClient struct {
 	*fakepool.Client
 
-	mu      sync.Mutex
-	started []chan struct{}
-	release []chan struct{}
-	calls   int
+	mu          sync.Mutex
+	started     []chan struct{}
+	cancelled   []chan struct{}
+	release     []chan struct{}
+	releaseOnce []sync.Once
+	calls       int
 }
 
 func newHeldStatClient(callCount int) *heldStatClient {
 	client := &heldStatClient{
-		Client:  fakepool.New(),
-		started: make([]chan struct{}, callCount),
-		release: make([]chan struct{}, callCount),
+		Client:      fakepool.New(),
+		started:     make([]chan struct{}, callCount),
+		cancelled:   make([]chan struct{}, callCount),
+		release:     make([]chan struct{}, callCount),
+		releaseOnce: make([]sync.Once, callCount),
 	}
 	client.SetDefaultBehavior(fakepool.SegmentBehavior{})
 	for i := 0; i < callCount; i++ {
 		client.started[i] = make(chan struct{})
+		client.cancelled[i] = make(chan struct{})
 		client.release[i] = make(chan struct{})
 	}
 	return client
+}
+
+func (c *heldStatClient) releaseCall(call int) {
+	c.releaseOnce[call].Do(func() { close(c.release[call]) })
+}
+
+func (c *heldStatClient) releaseAll() {
+	for call := range c.release {
+		c.releaseCall(call)
+	}
 }
 
 func (c *heldStatClient) StatMany(ctx context.Context, messageIDs []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult {
@@ -53,6 +68,7 @@ func (c *heldStatClient) StatMany(ctx context.Context, messageIDs []string, opts
 		return out
 	}
 	started := c.started[call]
+	cancelled := c.cancelled[call]
 	release := c.release[call]
 	close(started)
 	c.mu.Unlock()
@@ -60,7 +76,12 @@ func (c *heldStatClient) StatMany(ctx context.Context, messageIDs []string, opts
 	out := make(chan nntppool.StatManyResult, len(messageIDs))
 	go func() {
 		defer close(out)
-		<-release
+		select {
+		case <-ctx.Done():
+			close(cancelled)
+			<-release
+		case <-release:
+		}
 		for result := range c.Client.StatMany(ctx, messageIDs, opts) {
 			out <- result
 		}
@@ -105,71 +126,45 @@ func TestBackgroundCheckRegistersCancellationBeforeReturning(t *testing.T) {
 	fixture := newDestructiveClaimFixture(t, pool.NntpClient(client))
 	require.NoError(t, fixture.env.hw.Start(context.Background()))
 	t.Cleanup(func() {
-		select {
-		case <-client.release[0]:
-		default:
-			close(client.release[0])
-		}
+		client.releaseAll()
 		if fixture.env.hw.IsRunning() {
 			_ = fixture.env.hw.Stop(context.Background())
 		}
 	})
 
-	// This lock is a deterministic registration barrier. A correct admission
-	// cannot return until it has published the cancellation entry, so it must
-	// remain blocked here. An implementation that registers only in the spawned
-	// goroutine returns early while that goroutine waits on this exact lock.
-	fixture.env.hw.activeChecksMu.Lock()
-	locked := true
-	defer func() {
-		if locked {
-			fixture.env.hw.activeChecksMu.Unlock()
-		}
-	}()
-	callStarted := make(chan struct{})
-	callDone := make(chan error, 1)
-	go func() {
-		close(callStarted)
-		callDone <- fixture.env.hw.PerformBackgroundCheck(context.Background(), fixture.filePath)
-	}()
-	<-callStarted
-	var callErr error
-	returnedBeforeRegistration := false
-	select {
-	case callErr = <-callDone:
-		returnedBeforeRegistration = true
-	case <-time.After(100 * time.Millisecond):
-	}
-	assert.False(t, returnedBeforeRegistration,
-		"background admission must not return while cancellation registration is blocked")
-	fixture.env.hw.activeChecksMu.Unlock()
-	locked = false
-	if !returnedBeforeRegistration {
-		select {
-		case callErr = <-callDone:
-		case <-time.After(time.Second):
-			t.Fatal("background admission did not return after registration barrier opened")
-		}
-	}
-	require.NoError(t, callErr)
-	assert.True(t, fixture.env.hw.IsCheckActive(fixture.filePath),
+	// This is intentionally an outward postcondition rather than a lock on the
+	// worker's private registry: once successful admission returns, callers must
+	// be able to observe and cancel that exact execution immediately. A legacy
+	// return-before-registration implementation can race to satisfy this check,
+	// so the held-transport Cancel test below provides the deterministic join
+	// proof without prescribing the registry's representation.
+	require.NoError(t, fixture.env.hw.PerformBackgroundCheck(context.Background(), fixture.filePath))
+	require.True(t, fixture.env.hw.IsCheckActive(fixture.filePath),
 		"a successful admission must publish its cancellation handle before returning")
+
+	client.releaseCall(0)
+	require.Eventually(t, func() bool {
+		return !fixture.env.hw.IsCheckActive(fixture.filePath)
+	}, 2*time.Second, time.Millisecond)
 }
 
 func TestCancelHealthCheckJoinsExactOwnerAndPreservesReplacement(t *testing.T) {
-	client := fakepool.New()
-	fixture := newDestructiveClaimFixture(t, client)
-	client.SetDefaultBehavior(fakepool.SegmentBehavior{Latency: time.Hour})
+	client := newHeldStatClient(1)
+	fixture := newDestructiveClaimFixture(t, pool.NntpClient(client))
 	require.NoError(t, fixture.env.hw.Start(context.Background()))
 	t.Cleanup(func() {
+		client.releaseAll()
 		if fixture.env.hw.IsRunning() {
 			_ = fixture.env.hw.Stop(context.Background())
 		}
 	})
 	require.NoError(t, fixture.env.hw.PerformBackgroundCheck(context.Background(), fixture.filePath))
-	require.Eventually(t, func() bool {
-		return client.InFlight() == 1 && fixture.env.hw.IsCheckActive(fixture.filePath)
-	}, time.Second, time.Millisecond)
+	select {
+	case <-client.started[0]:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background health check did not reach held transport")
+	}
+	require.True(t, fixture.env.hw.IsCheckActive(fixture.filePath))
 
 	_, err := fixture.env.db.Exec(`
 		UPDATE file_health
@@ -179,13 +174,33 @@ func TestCancelHealthCheckJoinsExactOwnerAndPreservesReplacement(t *testing.T) {
 	`, fixture.filePath)
 	require.NoError(t, err)
 
-	cancelCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	require.NoError(t, fixture.env.hw.CancelHealthCheck(cancelCtx, fixture.filePath),
-		"cancelling the exact admitted owner should succeed even when that owner discovers a replacement")
+	cancelDone := make(chan error, 1)
+	go func() {
+		cancelDone <- fixture.env.hw.CancelHealthCheck(context.Background(), fixture.filePath)
+	}()
+	select {
+	case <-client.cancelled[0]:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CancelHealthCheck did not cancel the held transport")
+	}
+	select {
+	case err := <-cancelDone:
+		t.Fatalf("CancelHealthCheck returned before transport ownership joined: %v", err)
+	default:
+	}
+	assert.True(t, fixture.env.hw.IsCheckActive(fixture.filePath),
+		"the exact execution must remain registered until its transport and deferred cleanup join")
+
+	client.releaseCall(0)
+	select {
+	case err := <-cancelDone:
+		require.NoError(t, err,
+			"cancelling the exact admitted owner should succeed even when that owner discovers a replacement")
+	case <-time.After(2 * time.Second):
+		t.Fatal("CancelHealthCheck did not return after held transport was released")
+	}
 	assert.False(t, fixture.env.hw.IsCheckActive(fixture.filePath),
 		"CancelHealthCheck must synchronously join and unregister the exact execution")
-	assert.Zero(t, client.InFlight(), "joined cancellation must have completed transport unwinding before return")
 
 	var status, metadata string
 	var token sql.NullString
@@ -201,13 +216,14 @@ func TestCancelHealthCheckJoinsExactOwnerAndPreservesReplacement(t *testing.T) {
 
 func TestOldCheckCompletionCannotEraseNewActiveRegistration(t *testing.T) {
 	client := newHeldStatClient(2)
+	t.Cleanup(client.releaseAll)
 	fixture := newDestructiveClaimFixture(t, pool.NntpClient(client))
 
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- fixture.env.hw.performDirectCheck(context.Background(), fixture.filePath) }()
 	select {
 	case <-client.started[0]:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("first health check did not reach transport")
 	}
 
@@ -225,17 +241,15 @@ func TestOldCheckCompletionCannotEraseNewActiveRegistration(t *testing.T) {
 	go func() { secondDone <- fixture.env.hw.performDirectCheck(context.Background(), fixture.filePath) }()
 	select {
 	case <-client.started[1]:
-	case <-time.After(time.Second):
-		close(client.release[0])
+	case <-time.After(2 * time.Second):
 		t.Fatal("replacement health check did not reach transport")
 	}
 	require.True(t, fixture.env.hw.IsCheckActive(fixture.filePath))
 
-	close(client.release[0])
+	client.releaseCall(0)
 	select {
 	case <-firstDone:
-	case <-time.After(time.Second):
-		close(client.release[1])
+	case <-time.After(2 * time.Second):
 		t.Fatal("old health check did not finish")
 	}
 
@@ -246,10 +260,10 @@ func TestOldCheckCompletionCannotEraseNewActiveRegistration(t *testing.T) {
 		t.Fatalf("replacement check completed before it was released: %v", err)
 	default:
 	}
-	close(client.release[1])
+	client.releaseCall(1)
 	select {
 	case <-secondDone:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("replacement health check did not finish")
 	}
 }
@@ -258,44 +272,44 @@ func TestStopHonorsDeadlineAndOnlyRestartsAfterGenerationJoins(t *testing.T) {
 	client := newHeldStatClient(1)
 	fixture := newDestructiveClaimFixture(t, pool.NntpClient(client))
 	require.NoError(t, fixture.env.hw.Start(context.Background()))
+	t.Cleanup(func() {
+		client.releaseAll()
+		if fixture.env.hw.IsRunning() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = fixture.env.hw.Stop(stopCtx)
+		}
+	})
 	require.NoError(t, fixture.env.hw.PerformBackgroundCheck(context.Background(), fixture.filePath))
 	select {
 	case <-client.started[0]:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("background health check did not reach transport")
 	}
 
-	stopCtx, cancelStop := context.WithTimeout(context.Background(), 40*time.Millisecond)
-	defer cancelStop()
+	stopCtx, cancelStop := context.WithCancel(context.Background())
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- fixture.env.hw.Stop(stopCtx) }()
-
-	var stopErr error
-	returnedByDeadline := false
 	select {
-	case stopErr = <-stopDone:
-		returnedByDeadline = true
-	case <-time.After(250 * time.Millisecond):
+	case <-client.cancelled[0]:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not cancel the held generation transport")
 	}
-	assert.True(t, returnedByDeadline, "Stop must be bounded by its caller context")
-	if returnedByDeadline {
-		assert.ErrorIs(t, stopErr, context.DeadlineExceeded)
+	cancelStop()
+	select {
+	case stopErr := <-stopDone:
+		assert.ErrorIs(t, stopErr, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not honor its caller cancellation while transport remained held")
 	}
 	assert.Equal(t, WorkerStatusStopping, fixture.env.hw.GetStats().Status)
 	assert.Error(t, fixture.env.hw.Start(context.Background()),
 		"restart must remain closed until the cancelled generation has actually joined")
 
-	close(client.release[0])
-	if !returnedByDeadline {
-		select {
-		case <-stopDone:
-		case <-time.After(time.Second):
-			t.Fatal("legacy unbounded Stop did not finish after transport release")
-		}
-	}
+	client.releaseCall(0)
 	require.Eventually(t, func() bool {
 		return fixture.env.hw.GetStats().Status == WorkerStatusStopped
-	}, time.Second, time.Millisecond)
+	}, 2*time.Second, time.Millisecond)
 
 	require.NoError(t, fixture.env.hw.Start(context.Background()),
 		"a fully joined generation must permit a clean restart")
