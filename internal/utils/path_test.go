@@ -3,6 +3,7 @@ package utils
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -74,4 +75,53 @@ func TestRemoveEmptyDirs(t *testing.T) {
 	if _, err := os.Stat(keepFile); os.IsNotExist(err) {
 		t.Error("Expected keep.txt to still exist")
 	}
+}
+
+func TestRemoveEmptyDirsRejectsEscapedPaths(t *testing.T) {
+	t.Run("sibling prefix", func(t *testing.T) {
+		base := t.TempDir()
+		root := filepath.Join(base, "root")
+		escaped := filepath.Join(base, "root-escape", "a", "b")
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(escaped, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		RemoveEmptyDirs(root, escaped)
+
+		if _, err := os.Stat(escaped); err != nil {
+			t.Errorf("escaped sibling path was mutated: %v", err)
+		}
+	})
+
+	t.Run("parent symlink", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("symlink semantics differ on Windows")
+		}
+		base := t.TempDir()
+		root := filepath.Join(base, "root")
+		outside := filepath.Join(base, "outside")
+		escaped := filepath.Join(outside, "a", "b")
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(escaped, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(root, "linked")
+		if err := os.Symlink(outside, link); err != nil {
+			t.Fatal(err)
+		}
+
+		RemoveEmptyDirs(root, filepath.Join(link, "a", "b"))
+
+		if _, err := os.Stat(escaped); err != nil {
+			t.Errorf("path reached through parent symlink was mutated: %v", err)
+		}
+		if _, err := os.Lstat(link); err != nil {
+			t.Errorf("parent symlink was mutated: %v", err)
+		}
+	})
 }
