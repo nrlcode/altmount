@@ -30,7 +30,6 @@ import (
 	"github.com/javi11/altmount/internal/usenet"
 	"github.com/javi11/altmount/internal/utils"
 	"github.com/javi11/altmount/pkg/rclonecli"
-	"github.com/javi11/nntppool/v4"
 	"github.com/spf13/afero"
 )
 
@@ -2063,208 +2062,19 @@ func (mvf *MetadataVirtualFile) wrapWithEncryption(start, end int64) (io.ReadClo
 	}
 }
 
-// updateFileHealthOnError updates both metadata and database health status when corruption is detected.
-// Uses synchronous operations with timeout to prevent goroutine leaks.
-//
-// A streaming-failure repair trigger for the same path is debounced through the
-// shared RepairCoalescer so that repeated corrupt reads of one file (or a batch
-// of corrupt files) cannot fan out into one DB write + one rclone VFS refresh
-// per call. See issue #539 for the failure mode this guards against.
+// updateFileHealthOnError records insert-only corruption evidence. A streaming
+// observation has no authority to overwrite an existing row or trigger metadata,
+// filesystem, rclone, masking, or ARR effects.
 func (mvf *MetadataVirtualFile) updateFileHealthOnError(dataCorruptionErr *usenet.DataCorruptionError, noRetry bool) {
-	// A transport-validated corrupt BODY is evidence about one bounded read, not
-	// proof that the file is absent or durably corrupt across the active provider
-	// set. Preserve the file and schedule an ordinary health recheck; never let
-	// this isolated outcome enter masking, padding, delete, safety-move, or Arr
-	// repair paths.
-	if dataCorruptionErr != nil && dataCorruptionErr.Outcome == nntppool.OutcomeCorruptBody {
-		ctx, cancel := context.WithTimeout(mvf.ctx, 5*time.Second)
-		defer cancel()
-
-		cfg := mvf.configGetter()
-		errorMsg := dataCorruptionErr.Error()
-		sourceNzbPath := &mvf.meta.SourceNzbPath
-		if *sourceNzbPath == "" {
-			sourceNzbPath = nil
-		}
-		details := (&database.HealthErrorDetails{
-			ErrorType:       "CorruptBodyUnconfirmed",
-			MissingArticles: 0,
-			TotalArticles:   len(mvf.meta.SegmentData),
-		}).Marshal()
-		nextCheck := time.Now().UTC().Add(cfg.GetCheckInterval())
-		if err := mvf.healthRepository.UpdateFileHealthScheduled(
-			ctx,
-			mvf.name,
-			database.HealthStatusPending,
-			&errorMsg,
-			sourceNzbPath,
-			details,
-			false,
-			nextCheck,
-		); err != nil {
-			slog.WarnContext(ctx, "Failed to schedule verification for unconfirmed corrupt body", "file", mvf.name, "error", err)
-		}
+	_ = noRetry
+	if dataCorruptionErr == nil || mvf.healthRepository == nil {
 		return
 	}
-
-	// Per-path debounce: short-circuit if this file already triggered a repair
-	// inside the debounce window. ShouldTrigger handles a nil coalescer
-	// (test harness) by returning true.
-	if !mvf.repairCoalescer.ShouldTrigger(mvf.name) {
-		slog.DebugContext(mvf.ctx, "Streaming failure repair already triggered recently, debouncing",
-			"file", mvf.name)
-		return
-	}
-
-	// Use a short timeout context to prevent blocking indefinitely
 	ctx, cancel := context.WithTimeout(mvf.ctx, 5*time.Second)
 	defer cancel()
-
-	cfg := mvf.configGetter()
-	healthEnabled := cfg.GetHealthEnabled()
-
-	// Classify playback impact via the hole model — the verdict decides
-	// whether this failure triggers a repair at all. Note that with hole
-	// hooks wired, within-caps misses are zero-filled and never reach this
-	// path; a degraded verdict here is the exception (e.g. hooks disabled).
-	classification := mvf.classifyStreamingFailure(dataCorruptionErr)
-	isDegraded := healthEnabled && classification != nil &&
-		classification.Verdict == holes.VerdictDegraded
-
-	// Increment failure count for tracking/masking if explicitly enabled with a valid
-	// threshold. Masking must be opt-in: Enabled == nil means disabled (not on-by-default),
-	// and Threshold <= 0 would make every file immediately masked (count+1 >= 0 is always
-	// true), suppressing all repairs. Degraded files are also exempt: masking a still-
-	// playable file defeats the point of keeping it available.
-	shouldRepair := true
-	isMasked := false
-	if !isDegraded && cfg.Streaming.FailureMasking.Enabled != nil && *cfg.Streaming.FailureMasking.Enabled && cfg.Streaming.FailureMasking.Threshold > 0 {
-		var err error
-		isMasked, shouldRepair, err = mvf.healthRepository.IncrementStreamingFailureCount(ctx, mvf.name, cfg.Streaming.FailureMasking.Threshold)
-		if err != nil {
-			slog.WarnContext(ctx, "Failed to update streaming failure count, proceeding with repair", "file", mvf.name, "error", err)
-			shouldRepair = true
-		} else if isMasked && !shouldRepair {
-			slog.InfoContext(ctx, "File masked due to streaming failure (threshold not reached)", "file", mvf.name)
-		}
-	}
-
-	// Any file with missing segments or corruption is marked as corrupted in metadata
-	// and DB so it stays visible on the Health page, regardless of whether repair runs.
-	// Degraded files instead keep a status that leaves them visible AND streamable
-	// (FILE_STATUS_CORRUPTED hides the file from listings and blocks opens).
-	// Masked files keep their healthy metadata status so they remain openable.
-	metadataStatus := metapb.FileStatus_FILE_STATUS_CORRUPTED
-	if isDegraded {
-		metadataStatus = metapb.FileStatus_FILE_STATUS_DEGRADED
-	} else if isMasked && !shouldRepair {
-		metadataStatus = metapb.FileStatus_FILE_STATUS_HEALTHY
-	}
-
-	// Update metadata status (blocking with timeout)
-	if err := mvf.metadataService.UpdateFileStatus(mvf.name, metadataStatus); err != nil {
-		slog.WarnContext(ctx, "Failed to update metadata status", "file", mvf.name, "error", err)
-	}
-
-	// Update database health tracking (blocking with timeout)
 	errorMsg := dataCorruptionErr.Error()
-	sourceNzbPath := &mvf.meta.SourceNzbPath
-	if *sourceNzbPath == "" {
-		sourceNzbPath = nil
-	}
-
-	details := database.HealthErrorDetails{
-		ErrorType:       "ArticleNotFound",
-		MissingArticles: 1,
-		TotalArticles:   len(mvf.meta.SegmentData),
-		PlaybackImpact:  classification,
-	}
-	errorDetails := details.Marshal()
-
-	// The repair action (repair_triggered status + metadata safety-folder move + Arr
-	// redownload) only runs when the health system is enabled. When it is disabled we
-	// record the corruption for visibility but take no repair action whatsoever.
-	var dbStatus database.HealthStatus
-	scheduleImmediately := false
-	if isDegraded {
-		// Playable with glitches: record as degraded, no repair trigger, no
-		// safety-folder move, no immediate scheduling — the health worker
-		// re-checks it on its normal schedule.
-		slog.InfoContext(ctx, "Streaming failure classified as degraded (still playable), skipping repair",
-			"file", mvf.name,
-			"total_missing", classification.TotalMissing,
-			"longest_run", classification.LongestRun)
-		dbStatus = database.HealthStatusDegraded
-	} else if healthEnabled && cfg.GetHealthDeleteOnCorruption() {
-		// Delete-on-corruption is enabled: remove the file instead of triggering a repair.
-		slog.WarnContext(ctx, "Streaming failure detected, deleting corrupted file instead of triggering repair", "file", mvf.name)
-
-		var physicalPath, rootPath string
-		if health, err := mvf.healthRepository.GetFileHealth(ctx, mvf.name); err == nil && health != nil && health.LibraryPath != nil {
-			physicalPath = *health.LibraryPath
-			rootPath = cfg.MountPath
-			if cfg.Health.LibraryDir != nil && *cfg.Health.LibraryDir != "" {
-				rootPath = *cfg.Health.LibraryDir
-			}
-		}
-
-		if err := mvf.metadataService.DeleteCorruptedFile(ctx, mvf.name, cfg.Metadata.ShouldDeleteSourceNzb(), physicalPath, rootPath); err != nil {
-			slog.ErrorContext(ctx, "Failed to delete corrupted file after streaming failure", "file", mvf.name, "error", err)
-		} else if err := mvf.healthRepository.DeleteHealthRecord(ctx, mvf.name); err != nil {
-			slog.ErrorContext(ctx, "Failed to delete health record after deleting corrupted file", "file", mvf.name, "error", err)
-		}
-		return
-	} else if healthEnabled && shouldRepair {
-		// Mark as repair_triggered with high priority to trigger the replacement immediately.
-		// We skip the re-verification phase because a streaming failure is a definitive indicator of corruption.
-		slog.InfoContext(ctx, "Streaming failure detected, triggering immediate ARR repair", "file", mvf.name)
-		dbStatus = database.HealthStatusRepairTriggered
-		// noRetry signals a definitive corruption (e.g. article-not-found); force immediate
-		// pick-up by the HealthWorker so the replacement is scheduled without re-verification.
-		scheduleImmediately = noRetry
-
-		// If the file has already been imported (has a library path), move metadata to the safety folder
-		// so that the ARR rescan definitively sees the file as missing and triggers a redownload.
-		if health, err := mvf.healthRepository.GetFileHealth(ctx, mvf.name); err == nil && health != nil {
-			if health.LibraryPath != nil && *health.LibraryPath != "" {
-				relativePath := strings.TrimPrefix(mvf.name, cfg.MountPath)
-				relativePath = strings.TrimPrefix(relativePath, "/")
-				slog.InfoContext(ctx, "Moving metadata file for corrupted item to safety folder to trigger replacement", "file_path", mvf.name)
-				if moveErr := mvf.metadataService.MoveToCorrupted(ctx, relativePath); moveErr == nil {
-					// Successfully moved metadata, enqueue a coalesced rclone VFS
-					// refresh. Multiple files in the same directory collapse into a
-					// single RC call; concurrent failures across directories are
-					// batched into one call as well. EnqueueRefresh is a no-op on a
-					// nil coalescer (test harness).
-					mvf.repairCoalescer.EnqueueRefresh(filepath.Dir(mvf.name))
-				} else {
-					slog.WarnContext(ctx, "Failed to move corrupted metadata file, proceeding with repair trigger status", "error", moveErr)
-				}
-			}
-		}
-	} else {
-		// Health system disabled or failure count has not reached the threshold:
-		// record the corruption for visibility only and skip every repair action.
-		if healthEnabled && !shouldRepair {
-			slog.InfoContext(ctx, "Streaming failure detected but masked (threshold not reached), skipping repair", "file", mvf.name)
-			dbStatus = database.HealthStatusPending // Re-schedule it for verification later
-		} else {
-			slog.InfoContext(ctx, "Streaming failure detected but health system disabled, marking corrupted without triggering repair", "file", mvf.name)
-			dbStatus = database.HealthStatusCorrupted
-		}
-	}
-
-	// Update database health tracking. scheduleImmediately (noRetry) forces immediate
-	if err := mvf.healthRepository.UpdateFileHealthScheduled(ctx,
-		mvf.name,
-		dbStatus,
-		&errorMsg,
-		sourceNzbPath,
-		errorDetails,
-		scheduleImmediately,
-		time.Now().UTC(),
-	); err != nil {
-		slog.WarnContext(ctx, "Failed to update health database for streaming failure", "file", mvf.name, "error", err)
+	if err := mvf.healthRepository.InsertCorruptionEvidenceIfAbsent(ctx, mvf.name, errorMsg); err != nil {
+		slog.WarnContext(ctx, "Failed to insert streaming corruption evidence", "file", mvf.name, "error", err)
 	}
 }
 

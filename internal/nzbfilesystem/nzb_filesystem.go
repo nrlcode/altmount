@@ -76,31 +76,12 @@ func (nfs *NzbFilesystem) Stat(ctx context.Context, name string) (fs.FileInfo, e
 
 // Remove removes a file (not supported)
 func (nfs *NzbFilesystem) Remove(ctx context.Context, name string) error {
-	defer func() {
-		_ = nfs.remoteFile.healthRepository.DeleteHealthRecord(ctx, name)
-	}()
-
-	ok, err := nfs.remoteFile.RemoveFile(ctx, name)
-	if err != nil {
-		return err
-	}
-
-	if !ok {
-		return os.ErrNotExist
-	}
-
-	return nil
+	return os.ErrPermission
 }
 
 // RemoveAll removes a file and any children
 func (nfs *NzbFilesystem) RemoveAll(ctx context.Context, name string) error {
-	err := nfs.Remove(ctx, name)
-	if err != nil && os.IsNotExist(err) {
-		// If the file/directory is already gone, consider it a success
-		// This prevents Sonarr/Radarr from crashing when trying to delete folders we've already cleaned up
-		return nil
-	}
-	return err
+	return os.ErrPermission
 }
 
 // Rename renames a file (not supported)
@@ -126,4 +107,3 @@ func (nfs *NzbFilesystem) Mkdir(ctx context.Context, name string, perm os.FileMo
 func (nfs *NzbFilesystem) MkdirAll(ctx context.Context, name string, perm os.FileMode) error {
 	return nfs.remoteFile.MkdirAll(ctx, name, perm)
 }
-

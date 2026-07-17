@@ -50,7 +50,6 @@ type CheckOptions struct {
 
 // HealthChecker manages file health checking logic
 type HealthChecker struct {
-	healthRepo      *database.HealthRepository
 	metadataService *metadata.MetadataService
 	poolManager     pool.Manager
 	configGetter    config.ConfigGetter
@@ -66,7 +65,6 @@ func NewHealthChecker(
 	rcloneClient rclonecli.RcloneRcClient,
 ) *HealthChecker {
 	return &HealthChecker{
-		healthRepo:      healthRepo,
 		metadataService: metadataService,
 		poolManager:     poolManager,
 		configGetter:    configGetter,
@@ -141,15 +139,12 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 		return prep
 	}
 	if fileMeta == nil {
-		// File not found - remove from health database
-		if err := hc.healthRepo.DeleteHealthRecord(ctx, filePath); err != nil {
-			slog.ErrorContext(ctx, "Failed to delete health record for removed file", "file_path", filePath, "error", err)
-		}
-
+		// Missing metadata is inconclusive evidence. Keep database authority so a
+		// checked publication can record a retry without consuming the row.
 		event := HealthEvent{
 			Type:      EventTypeFileRemoved,
 			FilePath:  filePath,
-			Status:    database.HealthStatusCorrupted,
+			Status:    database.HealthStatusPending,
 			Error:     fmt.Errorf("file not found: %s", filePath),
 			Timestamp: time.Now(),
 		}
