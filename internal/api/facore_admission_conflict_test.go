@@ -26,6 +26,7 @@ func TestDirectHealthCheckMapsStaleAdmissionToConflict(t *testing.T) {
 	var (
 		db          *sql.DB
 		armed       atomic.Bool
+		calls       atomic.Int64
 		fired       atomic.Bool
 		mutationErr atomic.Value
 	)
@@ -33,11 +34,20 @@ func TestDirectHealthCheckMapsStaleAdmissionToConflict(t *testing.T) {
 	sql.Register(driverName, &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 			return conn.RegisterFunc("facore_stale_claim", func(id int64) (string, error) {
-				if !armed.Load() || !fired.CompareAndSwap(false, true) {
+				if !armed.Load() || calls.Add(1) != 2 || !fired.CompareAndSwap(false, true) {
 					return "", nil
 				}
-				_, err := db.ExecContext(context.Background(),
-					`UPDATE file_health SET status = 'checking' WHERE id = ?`, id)
+				result, err := db.ExecContext(context.Background(), `
+					UPDATE file_health SET status = 'checking'
+					WHERE id = ? AND status = 'pending'
+				`, id)
+				if err == nil {
+					var rows int64
+					rows, err = result.RowsAffected()
+					if err == nil && rows != 1 {
+						err = fmt.Errorf("stale admission fixture changed %d rows, want 1", rows)
+					}
+				}
 				if err != nil {
 					mutationErr.Store(err)
 				}
@@ -119,6 +129,8 @@ func TestDirectHealthCheckMapsStaleAdmissionToConflict(t *testing.T) {
 
 	assert.Equal(t, http.StatusConflict, response.StatusCode,
 		"a claim lost after the handler precheck is the same conflict as an initially checking row")
+	assert.GreaterOrEqual(t, calls.Load(), int64(2),
+		"the handler read and worker snapshot must both evaluate the fixture barrier")
 	assert.True(t, fired.Load(), "the fixture must advance the row after the handler's observed snapshot")
 	if value := mutationErr.Load(); value != nil {
 		require.NoError(t, value.(error))
