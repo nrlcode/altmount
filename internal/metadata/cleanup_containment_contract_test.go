@@ -512,3 +512,69 @@ func TestCleanupContainment_ConfiguredRootTypeAmbiguityFailsClosed(t *testing.T)
 		})
 	}
 }
+
+func TestCleanupContainment_DeleteDirectoryRejectsEscapes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("containment contract uses Unix symlink semantics")
+	}
+
+	tests := []struct {
+		name        string
+		virtualPath func(t *testing.T, metadataRoot, outsideRoot string) string
+	}{
+		{
+			name: "lexical traversal",
+			virtualPath: func(_ *testing.T, _, _ string) string {
+				return filepath.Join("..", "outside", "victim")
+			},
+		},
+		{
+			name: "parent symlink",
+			virtualPath: func(t *testing.T, metadataRoot, outsideRoot string) string {
+				require.NoError(t, os.Symlink(outsideRoot, filepath.Join(metadataRoot, "linked")))
+				return filepath.Join("linked", "victim")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := t.TempDir()
+			metadataRoot := filepath.Join(base, "metadata")
+			outsideRoot := filepath.Join(base, "outside")
+			require.NoError(t, os.MkdirAll(metadataRoot, 0o755))
+			protected := filepath.Join(outsideRoot, "victim", "keep.meta")
+			writeCleanupFile(t, protected)
+			ms := NewMetadataService(metadataRoot)
+
+			err := ms.DeleteDirectory(tt.virtualPath(t, metadataRoot, outsideRoot))
+			assert.Error(t, err)
+			require.FileExists(t, protected)
+		})
+	}
+}
+
+func TestCleanupContainment_DeleteDirectoryPreflightsStoreRefs(t *testing.T) {
+	base := t.TempDir()
+	metadataRoot := filepath.Join(base, "metadata")
+	ms := NewMetadataService(metadataRoot)
+	storePath := filepath.Join(base, "outside", "victim.nzbz")
+	writeCleanupFile(t, storePath)
+	metaPath := writeCleanupMetadata(t, ms, filepath.Join("movies", "movie.mkv"), "", storePath)
+	counter := &cleanupRefCounter{count: 0}
+	ms.SetStoreRefCounter(counter)
+
+	err := ms.DeleteDirectory("movies")
+	assert.Error(t, err)
+	assert.FileExists(t, metaPath, "an unsafe child must preserve the complete directory")
+	assert.FileExists(t, storePath)
+	assert.Empty(t, counter.calls, "directory preflight must finish before reference-count mutation")
+}
+
+func TestCleanupContainment_DeleteContainedDirectoryRemainsCompatible(t *testing.T) {
+	ms := NewMetadataService(t.TempDir())
+	metaPath := writeCleanupMetadata(t, ms, filepath.Join("movies", "movie.mkv"), "", "")
+
+	require.NoError(t, ms.DeleteDirectory("movies"))
+	require.NoFileExists(t, metaPath)
+}
