@@ -73,41 +73,27 @@ func (s *StremioCleanupService) cleanupExpired(ctx context.Context) {
 }
 
 func (s *StremioCleanupService) deleteItem(ctx context.Context, item *database.ImportQueueItem) {
-	if item.StoragePath != nil && *item.StoragePath != "" {
-		storagePath := *item.StoragePath
-		if s.metadataService.DirectoryExists(storagePath) {
-			// Multi-file: remove the entire metadata subtree (including nested .meta files)
-			if err := s.metadataService.DeleteDirectory(storagePath); err != nil {
-				slog.ErrorContext(ctx, "StremioCleanup: failed to delete storage directory",
-					"path", storagePath, "error", err)
-			}
-			// Remove the persistent NZB file (one source NZB shared by all files in the dir)
-			if err := os.Remove(item.NzbPath); err != nil && !os.IsNotExist(err) {
-				slog.ErrorContext(ctx, "StremioCleanup: failed to delete persistent NZB",
-					"path", item.NzbPath, "error", err)
-			}
-		} else {
-			// Single file: delete .meta + source NZB together
-			if err := s.metadataService.DeleteFileMetadataWithSourceNzb(ctx, storagePath, true); err != nil {
-				slog.ErrorContext(ctx, "StremioCleanup: failed to delete meta+nzb",
-					"path", storagePath, "error", err)
-			}
-		}
-	} else {
-		// No storage path recorded — just delete the persistent NZB if it still exists
-		if err := os.Remove(item.NzbPath); err != nil && !os.IsNotExist(err) {
-			slog.ErrorContext(ctx, "StremioCleanup: failed to delete persistent NZB",
-				"path", item.NzbPath, "error", err)
-		}
+	cfg := s.configGetter()
+	storeRoot := filepath.Join(filepath.Dir(cfg.Database.Path), ".nzbs")
+	if err := s.metadataService.ConfigureCleanupRoots(
+		storeRoot,
+		filepath.Join(os.TempDir(), ".altmount-queue"),
+		storeRoot,
+	); err != nil {
+		slog.ErrorContext(ctx, "StremioCleanup: failed to configure cleanup authority", "error", err)
+		return
 	}
 
-	// Best-effort: prune the per-id parent folder under .nzbs (e.g. /config/.nzbs/Movies/123/)
-	// once it is empty. os.Remove only succeeds on empty directories, so this is safe.
-	if parent := filepath.Dir(item.NzbPath); parent != "" && parent != "." && parent != "/" {
-		_ = os.Remove(parent)
+	storagePath := ""
+	if item.StoragePath != nil {
+		storagePath = *item.StoragePath
+	}
+	if err := s.metadataService.DeleteStoragePathWithSourceNzb(ctx, storagePath, item.NzbPath); err != nil {
+		slog.ErrorContext(ctx, "StremioCleanup: failed to delete item",
+			"storage_path", storagePath, "nzb_path", item.NzbPath, "error", err)
+		return
 	}
 
-	// Remove queue DB entry regardless of file deletion outcome
 	if err := s.queueRepo.RemoveFromQueue(ctx, item.ID); err != nil {
 		slog.ErrorContext(ctx, "StremioCleanup: failed to remove queue item", "id", item.ID, "error", err)
 	}

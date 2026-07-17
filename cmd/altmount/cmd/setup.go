@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -56,9 +58,20 @@ func initializeDatabase(ctx context.Context, cfg *config.Config) (*database.DB, 
 
 // initializeMetadata creates metadata service and reader
 func initializeMetadata(cfg *config.Config) (*metadata.MetadataService, *metadata.MetadataReader) {
-	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
+	metadataService := newMetadataService(cfg)
 	metadataReader := metadata.NewMetadataReader(metadataService)
 	return metadataService, metadataReader
+}
+
+func newMetadataService(cfg *config.Config) *metadata.MetadataService {
+	storeRoot := filepath.Join(filepath.Dir(cfg.Database.Path), ".nzbs")
+	service := metadata.NewMetadataService(cfg.Metadata.RootPath)
+	_ = service.ConfigureCleanupRoots(
+		storeRoot,
+		filepath.Join(os.TempDir(), ".altmount-queue"),
+		storeRoot,
+	)
+	return service
 }
 
 // initializeImporter creates and starts the importer service
@@ -383,7 +396,7 @@ func startHealthWorker(
 	playbackSource health.PlaybackActivitySource,
 ) (*health.HealthWorker, *health.LibrarySyncWorker, error) {
 	// Create metadata service for health worker
-	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
+	metadataService := newMetadataService(cfg)
 
 	// Create health checker
 	healthChecker := health.NewHealthChecker(

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -67,15 +68,26 @@ type MetadataService struct {
 	// storeRefCounter tracks reference counts for shared NzbStore files.
 	// nil means reference counting is disabled.
 	storeRefCounter StoreRefCounter
+	// cleanupMu protects the cleanup authority configuration. Cleanup plans
+	// retain their own os.Root descriptors after taking a configuration snapshot.
+	cleanupMu         sync.RWMutex
+	metadataRoot      string
+	metadataRootErr   error
+	cleanupStoreRoot  string
+	cleanupSourceRoot []string
+	cleanupConfigErr  error
 }
 
 // NewMetadataService creates a new metadata service
 func NewMetadataService(rootPath string) *MetadataService {
 	liteCache, _ := lru.New[string, *FileMetadataLite](defaultMetadataCacheSize)
+	metadataRoot, metadataRootErr := canonicalCleanupRoot(rootPath)
 	return &MetadataService{
-		rootPath:  rootPath,
-		liteCache: liteCache,
-		store:     NewStoreService(rootPath),
+		rootPath:        rootPath,
+		liteCache:       liteCache,
+		store:           NewStoreService(rootPath),
+		metadataRoot:    metadataRoot,
+		metadataRootErr: metadataRootErr,
 	}
 }
 
@@ -103,24 +115,6 @@ func (ms *MetadataService) IncStoreRef(ctx context.Context, storePath string) {
 		slog.WarnContext(ctx, "failed to increment store ref count",
 			"store_path", storePath, "error", err)
 	}
-}
-
-// readStoreRef reads just the StoreRef field from a .meta file without resolving segments.
-// Returns "" if the file is not v3 or cannot be read.
-func (ms *MetadataService) readStoreRef(metaFilePath string) string {
-	data, err := os.ReadFile(metaFilePath)
-	if err != nil {
-		return ""
-	}
-	if !isV3Meta(data) {
-		return ""
-	}
-	payload := data[len(metaMagicV3):]
-	var fm metapb.FileMetadata
-	if err := proto.Unmarshal(payload, &fm); err != nil {
-		return ""
-	}
-	return fm.StoreRef
 }
 
 // truncateFilename truncates the filename if it's too long to prevent filesystem issues
@@ -675,154 +669,18 @@ func (ms *MetadataService) DeleteFileMetadata(virtualPath string) error {
 
 // DeleteFileMetadataWithSourceNzb deletes a metadata file and optionally its source NZB
 func (ms *MetadataService) DeleteFileMetadataWithSourceNzb(ctx context.Context, virtualPath string, deleteSourceNzb bool) error {
-	ms.liteCache.Remove(virtualPath)
-
-	filename := filepath.Base(virtualPath)
-	metadataDir := filepath.Join(ms.rootPath, filepath.Dir(virtualPath))
-	metadataPath := filepath.Join(metadataDir, filename+".meta")
-
-	// Always read metadata first to capture SourceNzbPath and StoreRef before deletion.
-	var sourceNzbPath string
-	var storeRef string
-	if metadata, err := ms.ReadFileMetadata(virtualPath); err == nil && metadata != nil {
-		if deleteSourceNzb {
-			sourceNzbPath = metadata.SourceNzbPath
-		}
-		storeRef = metadata.StoreRef
-	}
-
-	// Delete the metadata file
-	err := os.Remove(metadataPath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to delete metadata file: %w", err)
-	}
-
-	// Clean up .id sidecar file
-	idPath := metadataPath + ".id"
-	if removeErr := os.Remove(idPath); removeErr != nil && !os.IsNotExist(removeErr) {
-		slog.DebugContext(ctx, "Failed to remove .id sidecar file", "path", idPath, "error", removeErr)
-	}
-
-	// Clean up empty parent directories in metadata path
-	utils.RemoveEmptyDirs(ms.rootPath, metadataDir)
-
-	// Optionally delete the source NZB file (error-tolerant)
-	if deleteSourceNzb && sourceNzbPath != "" {
-		if err := os.Remove(sourceNzbPath); err != nil {
-			if !os.IsNotExist(err) {
-				slog.DebugContext(ctx, "Failed to delete source NZB file",
-					"nzb_path", sourceNzbPath,
-					"error", err)
-			}
-		} else {
-			slog.DebugContext(ctx, "Deleted source NZB file",
-				"nzb_path", sourceNzbPath,
-				"virtual_path", virtualPath)
-		}
-	}
-
-	// Decrement reference count for shared store file and delete it if no more refs.
-	if ms.storeRefCounter != nil && storeRef != "" {
-		newCount, err := ms.storeRefCounter.DecStoreRef(ctx, storeRef)
-		if err != nil {
-			slog.WarnContext(ctx, "failed to decrement store ref count",
-				"store_path", storeRef, "error", err)
-		} else if newCount == 0 {
-			if removeErr := os.Remove(storeRef); removeErr != nil && !os.IsNotExist(removeErr) {
-				slog.WarnContext(ctx, "failed to delete orphaned store file",
-					"store_path", storeRef, "error", removeErr)
-			}
-		}
-	}
-
-	return nil
+	return ms.deleteFileMetadata(ctx, virtualPath, deleteSourceNzb, "", "")
 }
 
-// DeleteCorruptedFile removes a file's metadata (and optionally its source NZB), then
-// removes the physical library file (if any) and cleans up now-empty parent directories
-// in the physical library tree. Metadata-tree cleanup is already handled by
-// DeleteFileMetadataWithSourceNzb; the physical-path removal is error-tolerant since
-// physicalPath is often just a view into the same mount and may already be gone.
+// DeleteCorruptedFile removes a file's metadata, optional source NZB, and
+// optional physical file after every target has passed cleanup preflight.
 func (ms *MetadataService) DeleteCorruptedFile(ctx context.Context, virtualPath string, deleteSourceNzb bool, physicalPath string, physicalRoot string) error {
-	if err := ms.DeleteFileMetadataWithSourceNzb(ctx, virtualPath, deleteSourceNzb); err != nil {
-		return err
-	}
-	if physicalPath == "" {
-		return nil
-	}
-	if err := os.Remove(physicalPath); err != nil && !os.IsNotExist(err) {
-		slog.WarnContext(ctx, "Failed to delete physical library file", "path", physicalPath, "error", err)
-	}
-	if physicalRoot != "" {
-		utils.RemoveEmptyDirs(physicalRoot, filepath.Dir(physicalPath))
-	}
-	return nil
+	return ms.deleteFileMetadata(ctx, virtualPath, deleteSourceNzb, physicalPath, physicalRoot)
 }
 
 // DeleteDirectory deletes a metadata directory and all its contents
 func (ms *MetadataService) DeleteDirectory(virtualPath string) error {
-	ctx := context.Background()
-
-	// Purge all cached entries under this directory
-	prefix := virtualPath + string(filepath.Separator)
-	for _, key := range ms.liteCache.Keys() {
-		if key == virtualPath || strings.HasPrefix(key, prefix) {
-			ms.liteCache.Remove(key)
-		}
-	}
-
-	metadataDir := filepath.Join(ms.rootPath, virtualPath)
-
-	// HARD SAFETY: Never delete the root metadata path
-	cleanMetadataDir := filepath.Clean(metadataDir)
-	if cleanMetadataDir == filepath.Clean(ms.rootPath) || cleanMetadataDir == "/" || cleanMetadataDir == "." {
-		return fmt.Errorf("safety block: refusing to remove root metadata directory: %s", cleanMetadataDir)
-	}
-
-	// Pre-pass: if refcounting is enabled, collect all v3 store refs before deletion.
-	var storeRefCounts map[string]int
-	if ms.storeRefCounter != nil {
-		storeRefCounts = make(map[string]int)
-		_ = filepath.WalkDir(metadataDir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".meta") {
-				return nil
-			}
-			if ref := ms.readStoreRef(path); ref != "" {
-				storeRefCounts[ref]++
-			}
-			return nil
-		})
-	}
-
-	err := os.RemoveAll(metadataDir)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to delete metadata directory: %w", err)
-	}
-
-	// Post-pass: decrement ref counts and delete orphaned store files.
-	if ms.storeRefCounter != nil {
-		for storePath, count := range storeRefCounts {
-			var lastCount int64
-			for range count {
-				newCount, decErr := ms.storeRefCounter.DecStoreRef(ctx, storePath)
-				if decErr != nil {
-					slog.WarnContext(ctx, "failed to decrement store ref count",
-						"store_path", storePath, "error", decErr)
-					lastCount = -1 // mark as unknown; don't delete
-					break
-				}
-				lastCount = newCount
-			}
-			if lastCount == 0 {
-				if removeErr := os.Remove(storePath); removeErr != nil && !os.IsNotExist(removeErr) {
-					slog.WarnContext(ctx, "failed to delete orphaned store file",
-						"store_path", storePath, "error", removeErr)
-				}
-			}
-		}
-	}
-
-	return nil
+	return ms.deleteDirectory(context.Background(), virtualPath)
 }
 
 // RenameFileMetadata atomically renames a metadata file (and its .id sidecar) from oldVirtualPath to newVirtualPath.
@@ -1038,8 +896,10 @@ func (ms *MetadataService) CleanupOrphanedIDSymlinks(ctx context.Context) (int, 
 		return removed, err
 	}
 
-	// Clean empty shard directories bottom-up
-	utils.RemoveEmptyDirs(ms.rootPath, idsRoot)
+	// Clean empty shard directories bottom-up.
+	if err := utils.RemoveEmptyDirsSafe(ms.rootPath, idsRoot); err != nil {
+		return removed, fmt.Errorf("cleanup empty ID directories: %w", err)
+	}
 
 	return removed, nil
 }

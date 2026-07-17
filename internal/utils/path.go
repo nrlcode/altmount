@@ -1,10 +1,13 @@
 package utils
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // CheckDirectoryWritable checks if a directory exists and is writable.
@@ -63,29 +66,74 @@ func CheckDirectoryWritable(path string) error {
 // up towards 'root' (exclusive). It stops if it encounters a non-empty directory
 // or reaches the root.
 func RemoveEmptyDirs(root, path string) {
+	_ = RemoveEmptyDirsSafe(root, path)
+}
+
+// RemoveEmptyDirsSafe removes empty directories below root while reporting
+// authority, traversal, symlink, and filesystem errors.
+func RemoveEmptyDirsSafe(root, path string) error {
 	if root == "" || path == "" {
-		return
+		return nil
 	}
-
-	// Clean paths for consistent comparison
-	root = filepath.Clean(root)
-	path = filepath.Clean(path)
-
-	// If path is root or not under root, stop
-	if path == root || !strings.HasPrefix(path, root) {
-		return
-	}
-
-	// Try to remove the directory
-	err := os.Remove(path)
+	root, err := filepath.Abs(root)
 	if err != nil {
-		// Directory is likely not empty or we lack permissions
-		return
+		return err
 	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(root, path)
+	if err != nil || !filepath.IsLocal(relative) {
+		return fmt.Errorf("path %q is outside root %q", path, root)
+	}
+	if relative == "." {
+		return nil
+	}
+	info, err := os.Lstat(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("root %q is not an unambiguous directory", root)
+	}
+	rooted, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer rooted.Close()
 
-	// Successfully removed, try the parent
-	parent := filepath.Dir(path)
-	RemoveEmptyDirs(root, parent)
+	var parents []string
+	missing := false
+	for current := relative; current != "."; current = filepath.Dir(current) {
+		parents = append(parents, current)
+		info, statErr := rooted.Lstat(current)
+		if errors.Is(statErr, fs.ErrNotExist) {
+			missing = true
+			continue
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("path component %q is not an unambiguous directory", current)
+		}
+	}
+	if missing {
+		return nil
+	}
+	for _, current := range parents {
+		if removeErr := rooted.Remove(current); removeErr != nil {
+			if errors.Is(removeErr, syscall.ENOTEMPTY) || errors.Is(removeErr, syscall.EEXIST) {
+				return nil
+			}
+			return removeErr
+		}
+	}
+	return nil
 }
 
 // JoinAbsPath safely joins a base path with another path (which could be absolute or relative).
