@@ -132,10 +132,7 @@ func (g *facoreGeneration) Close() error {
 	return nil
 }
 
-func (g *facoreGeneration) NumProviders() int                   { return len(g.Stats().Providers) }
-func (g *facoreGeneration) AddProvider(nntppool.Provider) error { return nil }
-func (g *facoreGeneration) RemoveProvider(string) error         { return nil }
-func (g *facoreGeneration) ResetProviderQuota(string) error     { return nil }
+func (g *facoreGeneration) ResetProviderQuota(string) error { return nil }
 
 func facoreManager(t *testing.T, repo StatsRepository, generations ...*facoreGeneration) *manager {
 	t.Helper()
@@ -441,4 +438,20 @@ func TestFACORECHG003RestoreFailureAndTimeoutRollback(t *testing.T) {
 			require.Equal(t, int32(1), failed.closeCalls.Load(), "failed candidate was closed more than once")
 		})
 	}
+}
+
+func TestFACORECHG003ClearPoolAfterManagerContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	old := newFACOREGeneration("old", nntppool.ProviderStats{ProviderID: "shared"})
+	m := NewManager(ctx, nil).(*manager)
+	m.newClient = func(context.Context, []nntppool.Provider) (generationClient, error) {
+		return old, nil
+	}
+	m.handoverTimeout = 100 * time.Millisecond
+	require.NoError(t, m.SetProviders(facoreProviders("shared")))
+
+	cancel()
+	require.NoError(t, m.ClearPool())
+	require.False(t, m.HasPool())
+	require.Equal(t, int32(1), old.closeCalls.Load())
 }

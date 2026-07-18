@@ -86,6 +86,7 @@ func TestHandleGetPoolMetricsUsesCanonicalProviderID(t *testing.T) {
 	client := &authorityNntpClient{stats: nntppool.ClientStats{Providers: []nntppool.ProviderStats{
 		{Name: aliases[0], ProviderID: providers[0].ID, AvgSpeed: 10, Missing: 3, MaxConnections: 1},
 		{Name: aliases[1], ProviderID: providers[1].ID, AvgSpeed: 20, Missing: 4, MaxConnections: 2},
+		{Name: "legacy-alias-without-id", AvgSpeed: 1000, MaxConnections: 99},
 	}}}
 	metrics := pool.MetricsSnapshot{
 		ProviderErrors:         map[string]int64{"account-a": 11, "account-b": 22, aliases[0]: 1001, aliases[1]: 1002},
@@ -210,5 +211,100 @@ func TestProviderSpeedTestUsesFacadeAndCanonicalID(t *testing.T) {
 	}
 	if got := cm.casCandidate.Providers[0].LastSpeedTestMbps; got != 7 {
 		t.Errorf("saved speed = %.1f MB/s, want canonical provider's 7.0 MB/s", got)
+	}
+}
+
+func TestProviderSpeedTestPersistsExactZeroForCanonicalProvider(t *testing.T) {
+	p := config.ProviderConfig{ID: "zero-speed-account", Host: "news.invalid", Port: 563, Username: "alias"}
+	cfg := config.DefaultConfig()
+	cfg.Providers = []config.ProviderConfig{p}
+	client := &authorityNntpClient{speedResult: &nntppool.SpeedTestResult{
+		Elapsed:      time.Second,
+		WireSpeedBps: 9 * 1024 * 1024,
+		Providers:    []nntppool.ProviderStats{{ProviderID: p.ID, AvgSpeed: 0}},
+	}}
+	cm := &authorityConfigManager{cfg: cfg, revision: 7, writeErr: errors.New("observe CAS")}
+	s := &Server{configManager: cm, poolManager: &authorityPoolManager{client: client}}
+	app := fiber.New()
+	app.Post("/providers/:id/speedtest", s.handleTestProviderSpeed)
+
+	resp, err := app.Test(httptest.NewRequest("POST", "/providers/zero-speed-account/speedtest", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if cm.casCandidate == nil {
+		t.Fatal("zero canonical speed was not submitted through CompareAndSwap")
+	}
+	if got := cm.casCandidate.Providers[0].LastSpeedTestMbps; got != 0 {
+		t.Fatalf("saved speed = %.1f MB/s, want exact canonical zero (not aggregate fallback)", got)
+	}
+}
+
+func TestProviderSpeedTestRejectsResultWithoutCanonicalProvider(t *testing.T) {
+	p := config.ProviderConfig{ID: "missing-speed-account", Host: "news.invalid", Port: 563, Username: "alias"}
+	cfg := config.DefaultConfig()
+	cfg.Providers = []config.ProviderConfig{p}
+	client := &authorityNntpClient{speedResult: &nntppool.SpeedTestResult{
+		Elapsed:      time.Second,
+		WireSpeedBps: 9 * 1024 * 1024,
+		Providers:    []nntppool.ProviderStats{{ProviderID: "other-account", AvgSpeed: 3 * 1024 * 1024}},
+	}}
+	cm := &authorityConfigManager{cfg: cfg, revision: 8}
+	s := &Server{configManager: cm, poolManager: &authorityPoolManager{client: client}}
+	app := fiber.New()
+	app.Post("/providers/:id/speedtest", s.handleTestProviderSpeed)
+
+	resp, err := app.Test(httptest.NewRequest("POST", "/providers/missing-speed-account/speedtest", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	if cm.casCalls != 0 {
+		t.Fatalf("CompareAndSwap calls = %d, want 0 for incomplete speed-test result", cm.casCalls)
+	}
+}
+
+func TestHandleGetPoolMetricsPreservesRemovedProviderCounters(t *testing.T) {
+	client := &authorityNntpClient{stats: nntppool.ClientStats{Providers: []nntppool.ProviderStats{
+		{ProviderID: "current-account", MaxConnections: 1},
+	}}}
+	metrics := pool.MetricsSnapshot{
+		TotalErrors:    12,
+		ProviderErrors: map[string]int64{"current-account": 5, "removed-account": 7},
+		ProviderBytes:  map[string]int64{"current-account": 50, "removed-account": 70},
+	}
+	cfg := config.DefaultConfig()
+	cfg.Providers = []config.ProviderConfig{{ID: "current-account", Name: "Current"}}
+	s := &Server{configManager: &authorityConfigManager{cfg: cfg}, poolManager: &authorityPoolManager{client: client, metrics: metrics}}
+	app := fiber.New()
+	app.Get("/metrics", s.handleGetPoolMetrics)
+
+	resp, err := app.Test(httptest.NewRequest("GET", "/metrics", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var envelope struct {
+		Data PoolMetricsResponse `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	if got := envelope.Data.ProviderErrors["removed-account"]; got != 7 {
+		t.Fatalf("removed provider errors = %d, want folded cumulative 7", got)
+	}
+	if got := envelope.Data.ProviderBytes["removed-account"]; got != 70 {
+		t.Fatalf("removed provider bytes = %d, want folded cumulative 70", got)
+	}
+	var errorSum int64
+	for _, count := range envelope.Data.ProviderErrors {
+		errorSum += count
+	}
+	if errorSum != envelope.Data.TotalErrors {
+		t.Fatalf("provider error breakdown sum = %d, total = %d", errorSum, envelope.Data.TotalErrors)
 	}
 }

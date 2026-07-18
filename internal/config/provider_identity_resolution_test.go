@@ -116,15 +116,31 @@ func TestConfigValidateReservesProviderIDsAndOperationalAliasesGlobally(t *testi
 
 func TestManagerResolvesEmptyProviderIDsFromOneRegistrySnapshot(t *testing.T) {
 	match := identityGeneration(t, "retained-one", 1, "match.invalid", "Account")
+	mismatched := match
+	mismatched.IdentityFingerprint = "sha256:inconsistent"
 	tombstonedAt := time.Unix(99, 0).UTC()
 	tests := []struct {
-		name        string
-		snapshot    ProviderIdentityRegistrySnapshot
-		sourceError error
-		wantID      string
-		wantError   bool
+		name          string
+		snapshot      ProviderIdentityRegistrySnapshot
+		sourceError   error
+		withoutSource bool
+		wantID        string
+		wantError     bool
 	}{
 		{name: "zero retained matches", wantID: "generated-id"},
+		{name: "identity source missing", withoutSource: true, wantError: true},
+		{
+			name: "inconsistent retained fingerprint",
+			snapshot: ProviderIdentityRegistrySnapshot{
+				Providers:   []ProviderIdentityRecord{{ID: "retained-one"}},
+				Generations: []ProviderIdentityGeneration{mismatched},
+			}, wantError: true,
+		},
+		{
+			name:      "empty retained provider id",
+			snapshot:  ProviderIdentityRegistrySnapshot{Providers: []ProviderIdentityRecord{{}}},
+			wantError: true,
+		},
 		{
 			name: "one tombstoned retained match",
 			snapshot: ProviderIdentityRegistrySnapshot{
@@ -152,7 +168,9 @@ func TestManagerResolvesEmptyProviderIDsFromOneRegistrySnapshot(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			m, path := newResolutionManager(t)
 			source := &staticProviderIdentitySource{snapshot: test.snapshot, err: test.sourceError}
-			m.SetProviderIdentitySource(source)
+			if !test.withoutSource {
+				m.SetProviderIdentitySource(source)
+			}
 			generatorCalls := 0
 			m.newProviderID = func() string {
 				generatorCalls++
@@ -203,7 +221,11 @@ func TestManagerResolvesEmptyProviderIDsFromOneRegistrySnapshot(t *testing.T) {
 				}
 			}
 			assert.Empty(t, candidate.Providers[0].ID)
-			assert.Equal(t, 1, source.reads)
+			if test.withoutSource {
+				assert.Zero(t, source.reads)
+			} else {
+				assert.Equal(t, 1, source.reads)
+			}
 		})
 	}
 }

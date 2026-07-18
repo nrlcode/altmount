@@ -120,8 +120,8 @@ func TestMetricsTracker_ResetProviderErrors(t *testing.T) {
 
 	poolStats := nntppool.ClientStats{
 		Providers: []nntppool.ProviderStats{
-			{Name: "provider-a", Errors: 10},
-			{Name: "provider-b", Errors: 5},
+			{Name: "provider-a", ProviderID: "provider-a", Errors: 10},
+			{Name: "provider-b", ProviderID: "provider-b", Errors: 5},
 		},
 	}
 

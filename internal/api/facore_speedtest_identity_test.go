@@ -163,3 +163,31 @@ func TestSpeedtestCacheAndSingleflightUseCompoundKey(t *testing.T) {
 		}
 	}
 }
+
+func TestSpeedtestBuilderUsesCacheLifetimeAndRejectsEmptyID(t *testing.T) {
+	sc := coordinatorWithoutJanitor()
+	t.Cleanup(sc.shutdown)
+	buildCalls := 0
+	sc.buildClient = func(ctx context.Context, _ *config.ProviderConfig, _, _ int) (*nntppool.Client, error) {
+		buildCalls++
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("cached client builder inherited request cancellation: %v", err)
+		}
+		return nil, nil
+	}
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	provider := baseSpeedtestProvider()
+	if _, _, err := sc.getOrBuildClient(requestCtx, &provider); err != nil {
+		t.Fatal(err)
+	}
+
+	provider.ID = ""
+	if _, _, err := sc.getOrBuildClient(context.Background(), &provider); err == nil {
+		t.Fatal("empty canonical provider ID was accepted")
+	}
+	if buildCalls != 1 {
+		t.Fatalf("builder calls = %d, want 1 (empty ID must fail before build)", buildCalls)
+	}
+}
