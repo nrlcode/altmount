@@ -18,20 +18,17 @@ import (
 
 type identityRecordingDriver struct {
 	driver.Driver
-	mu          sync.Mutex
-	armed       bool
-	queries     []string
-	execs       []string
-	begins      int
-	prepares    int
-	stmtQueries int
-	stmtExecs   int
+	mu       sync.Mutex
+	armed    bool
+	queries  []string
+	execs    []string
+	begins   int
+	prepares int
 }
 
 type identityDriverRecords struct {
-	queries, execs              []string
-	begins, prepares            int
-	stmtQueries, stmtExecutions int
+	queries, execs   []string
+	begins, prepares int
 }
 
 func (d *identityRecordingDriver) Open(name string) (driver.Conn, error) {
@@ -46,7 +43,7 @@ func (d *identityRecordingDriver) arm() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.queries, d.execs = nil, nil
-	d.begins, d.prepares, d.stmtQueries, d.stmtExecs = 0, 0, 0, 0
+	d.begins, d.prepares = 0, 0
 	d.armed = true
 }
 
@@ -79,37 +76,18 @@ func (d *identityRecordingDriver) recordPrepare() {
 	}
 }
 
-func (d *identityRecordingDriver) recordStatement(exec bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if !d.armed {
-		return
-	}
-	if exec {
-		d.stmtExecs++
-	} else {
-		d.stmtQueries++
-	}
-}
-
 func (d *identityRecordingDriver) records() identityDriverRecords {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return identityDriverRecords{
 		queries: append([]string(nil), d.queries...), execs: append([]string(nil), d.execs...),
 		begins: d.begins, prepares: d.prepares,
-		stmtQueries: d.stmtQueries, stmtExecutions: d.stmtExecs,
 	}
 }
 
 type identityRecordingConn struct {
 	driver.Conn
 	owner *identityRecordingDriver
-}
-
-func (c *identityRecordingConn) Begin() (driver.Tx, error) {
-	c.owner.recordBegin()
-	return c.Conn.Begin()
 }
 
 func (c *identityRecordingConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
@@ -127,7 +105,7 @@ func (c *identityRecordingConn) Prepare(query string) (driver.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &identityRecordingStmt{Stmt: stmt, owner: c.owner}, nil
+	return stmt, nil
 }
 
 func (c *identityRecordingConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
@@ -140,7 +118,7 @@ func (c *identityRecordingConn) PrepareContext(ctx context.Context, query string
 	if err != nil {
 		return nil, err
 	}
-	return &identityRecordingStmt{Stmt: stmt, owner: c.owner}, nil
+	return stmt, nil
 }
 
 func (c *identityRecordingConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -159,39 +137,6 @@ func (c *identityRecordingConn) ExecContext(ctx context.Context, query string, a
 		return nil, driver.ErrSkip
 	}
 	return execer.ExecContext(ctx, query, args)
-}
-
-type identityRecordingStmt struct {
-	driver.Stmt
-	owner *identityRecordingDriver
-}
-
-func (s *identityRecordingStmt) Exec(args []driver.Value) (driver.Result, error) {
-	s.owner.recordStatement(true)
-	return s.Stmt.Exec(args)
-}
-
-func (s *identityRecordingStmt) Query(args []driver.Value) (driver.Rows, error) {
-	s.owner.recordStatement(false)
-	return s.Stmt.Query(args)
-}
-
-func (s *identityRecordingStmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
-	s.owner.recordStatement(true)
-	execer, ok := s.Stmt.(driver.StmtExecContext)
-	if !ok {
-		return nil, driver.ErrSkip
-	}
-	return execer.ExecContext(ctx, args)
-}
-
-func (s *identityRecordingStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	s.owner.recordStatement(false)
-	queryer, ok := s.Stmt.(driver.StmtQueryContext)
-	if !ok {
-		return nil, driver.ErrSkip
-	}
-	return queryer.QueryContext(ctx, args)
 }
 
 func createIdentityRegistryTables(t *testing.T, db *sql.DB, temporary bool) {
@@ -332,8 +277,6 @@ func TestReadProviderIdentityRegistrySnapshotSQLiteIsOneReadOnlyJoin(t *testing.
 	assert.Empty(t, records.execs, "a registry read must not execute writes or setup statements")
 	assert.Zero(t, records.begins, "one SELECT needs no transaction escape hatch")
 	assert.Zero(t, records.prepares, "the coherent read must execute directly")
-	assert.Zero(t, records.stmtQueries)
-	assert.Zero(t, records.stmtExecutions)
 	query := strings.ToUpper(records.queries[0])
 	assert.Contains(t, query, "LEFT JOIN")
 	assert.Contains(t, query, "HEALTH_PROVIDERS")
