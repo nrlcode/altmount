@@ -298,6 +298,7 @@ func TestManagerCASCommitsAfterPostRenameDirectorySyncFailure(t *testing.T) {
 	var events []string
 	staged := false
 	syncCalls := 0
+	syncSawCandidate := false
 	m.SetPrecommit(func(context.Context, *Config, *Config) (PreparedChange, error) {
 		events = append(events, "precommit")
 		staged = true
@@ -317,6 +318,11 @@ func TestManagerCASCommitsAfterPostRenameDirectorySyncFailure(t *testing.T) {
 		return saveToFileWithDirectorySync(config, filename, func(*os.File) error {
 			events = append(events, "dir-sync")
 			syncCalls++
+			data, readErr := os.ReadFile(filename)
+			require.NoError(t, readErr)
+			var visible Config
+			require.NoError(t, yaml.Unmarshal(data, &visible))
+			syncSawCandidate = visible.Network.NoProxy == "committed.invalid"
 			return assert.AnError
 		})
 	}
@@ -328,6 +334,7 @@ func TestManagerCASCommitsAfterPostRenameDirectorySyncFailure(t *testing.T) {
 	assert.Equal(t, "committed.invalid", committed.Config.Network.NoProxy)
 	assert.False(t, staged)
 	assert.Equal(t, 1, syncCalls)
+	assert.True(t, syncSawCandidate, "directory sync ran before the candidate rename was visible")
 	assert.Equal(t, []string{"precommit", "persist", "dir-sync", "commit", "callback"}, events)
 
 	current, err := m.Snapshot()
