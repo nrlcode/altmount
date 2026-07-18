@@ -1804,6 +1804,10 @@ func DefaultConfig(configDir ...string) *Config {
 
 // SaveToFile saves a configuration to a YAML file
 func SaveToFile(config *Config, filename string) error {
+	return saveToFileWithDirectorySync(config, filename, (*os.File).Sync)
+}
+
+func saveToFileWithDirectorySync(config *Config, filename string, syncDirectory func(*os.File) error) error {
 	if filename == "" {
 		return fmt.Errorf("no config file path provided")
 	}
@@ -1869,8 +1873,8 @@ func SaveToFile(config *Config, filename string) error {
 	if err := os.Rename(tempName, filename); err != nil {
 		return fmt.Errorf("failed to replace config file: %w", err)
 	}
-	if err := directory.Sync(); err != nil {
-		return fmt.Errorf("failed to sync config directory: %w", err)
+	if err := syncDirectory(directory); err != nil {
+		slog.Warn("Config file replaced but directory sync failed", "path", filename, "error", err)
 	}
 
 	return nil
