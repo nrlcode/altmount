@@ -129,7 +129,6 @@ export function ProviderStatusTable({
 		for (const p of configData?.providers ?? []) {
 			if (!p.account_expiration_date) continue;
 			map.set(p.id, p.account_expiration_date);
-			map.set(p.host, p.account_expiration_date);
 		}
 		return map;
 	}, [configData?.providers]);
@@ -202,8 +201,8 @@ export function ProviderStatusTable({
 	const sortedProviders = [...providers].sort((a, b) => {
 		// Missing expiration dates sort last.
 		if (sortField === "expiration") {
-			const aExp = expirationByKey.get(a.id) ?? expirationByKey.get(a.host) ?? "";
-			const bExp = expirationByKey.get(b.id) ?? expirationByKey.get(b.host) ?? "";
+			const aExp = expirationByKey.get(a.id) ?? "";
+			const bExp = expirationByKey.get(b.id) ?? "";
 			if (!aExp && !bExp) return 0;
 			if (!aExp) return 1;
 			if (!bExp) return -1;
@@ -506,8 +505,7 @@ export function ProviderStatusTable({
 										</td>
 										<td>
 											{(() => {
-												const expiration =
-													expirationByKey.get(provider.id) ?? expirationByKey.get(provider.host);
+												const expiration = expirationByKey.get(provider.id);
 												return expiration ? (
 													<span className="font-mono text-[11px] text-base-content/70">
 														{formatExpirationDate(expiration)}

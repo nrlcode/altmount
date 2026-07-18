@@ -26,34 +26,34 @@ type ProviderQuotaSnapshot struct {
 
 // MetricsSnapshot represents pool metrics at a point in time with calculated values
 type MetricsSnapshot struct {
-	BytesDownloaded             int64                                `json:"bytes_downloaded"`
-	BytesUploaded               int64                                `json:"bytes_uploaded"`
-	ArticlesDownloaded          int64                                `json:"articles_downloaded"`
-	ArticlesPosted              int64                                `json:"articles_posted"`
-	TotalErrors                 int64                                `json:"total_errors"`
-	ProviderErrors              map[string]int64                     `json:"provider_errors"`
-	ProviderBytes               map[string]int64                     `json:"provider_bytes"`
-	ProviderBytes24h            map[string]int64                     `json:"provider_bytes_24h"`
-	ProviderStartedAt           map[string]time.Time                 `json:"provider_started_at"`
-	ProviderQuotas              map[string]ProviderQuotaSnapshot     `json:"provider_quotas,omitempty"`
-	DownloadSpeedBytesPerSec    float64                              `json:"download_speed_bytes_per_sec"`
-	MaxDownloadSpeedBytesPerSec float64                              `json:"max_download_speed_bytes_per_sec"`
-	UploadSpeedBytesPerSec      float64                              `json:"upload_speed_bytes_per_sec"`
-	Timestamp                   time.Time                            `json:"timestamp"`
-	StartedAt                   time.Time                            `json:"started_at"`
-	ProviderMissingRates        map[string]float64                   `json:"provider_missing_rates"`
-	ProviderMissingWarning      map[string]bool                      `json:"provider_missing_warning"`
-	ProviderSpeeds              map[string]float64                   `json:"provider_speeds"`
+	BytesDownloaded             int64                            `json:"bytes_downloaded"`
+	BytesUploaded               int64                            `json:"bytes_uploaded"`
+	ArticlesDownloaded          int64                            `json:"articles_downloaded"`
+	ArticlesPosted              int64                            `json:"articles_posted"`
+	TotalErrors                 int64                            `json:"total_errors"`
+	ProviderErrors              map[string]int64                 `json:"provider_errors"`
+	ProviderBytes               map[string]int64                 `json:"provider_bytes"`
+	ProviderBytes24h            map[string]int64                 `json:"provider_bytes_24h"`
+	ProviderStartedAt           map[string]time.Time             `json:"provider_started_at"`
+	ProviderQuotas              map[string]ProviderQuotaSnapshot `json:"provider_quotas,omitempty"`
+	DownloadSpeedBytesPerSec    float64                          `json:"download_speed_bytes_per_sec"`
+	MaxDownloadSpeedBytesPerSec float64                          `json:"max_download_speed_bytes_per_sec"`
+	UploadSpeedBytesPerSec      float64                          `json:"upload_speed_bytes_per_sec"`
+	Timestamp                   time.Time                        `json:"timestamp"`
+	StartedAt                   time.Time                        `json:"started_at"`
+	ProviderMissingRates        map[string]float64               `json:"provider_missing_rates"`
+	ProviderMissingWarning      map[string]bool                  `json:"provider_missing_warning"`
+	ProviderSpeeds              map[string]float64               `json:"provider_speeds"`
 }
 
 // MetricsTracker tracks pool metrics over time and calculates rates
 type MetricsTracker struct {
-	pool              *nntppool.Client
-	repo              StatsRepository
-	mu                sync.RWMutex
-	startedAt         time.Time
-	samples           []metricsample
-	providerIDMap     map[string]string
+	pool      generationClient
+	repo      StatsRepository
+	mu        sync.RWMutex
+	saveMu    sync.Mutex
+	startedAt time.Time
+	samples   []metricsample
 
 	sampleInterval    time.Duration
 	retentionPeriod   time.Duration
@@ -90,30 +90,56 @@ type metricsample struct {
 }
 
 // NewMetricsTracker creates a new metrics tracker
-func NewMetricsTracker(pool *nntppool.Client, repo StatsRepository) *MetricsTracker {
+func NewMetricsTracker(pool generationClient, repo StatsRepository) *MetricsTracker {
 	mt := &MetricsTracker{
-		pool:                  pool,
-		repo:                  repo,
-		samples:               make([]metricsample, 0, 60), // Preallocate for 60 samples
-		initialProviderErrors: make(map[string]int64),
-		initialProviderBytes:  make(map[string]int64),
+		pool:                     pool,
+		repo:                     repo,
+		samples:                  make([]metricsample, 0, 60), // Preallocate for 60 samples
+		initialProviderErrors:    make(map[string]int64),
+		initialProviderBytes:     make(map[string]int64),
 		initialProviderStartedAt: make(map[string]time.Time),
-		lastSavedProviderBytes: make(map[string]int64),
-		sampleInterval:        2 * time.Second, // Match playback sampling for "live" feel
-		retentionPeriod:       60 * time.Second,
-		calculationWindow:     10 * time.Second,   // Use 10s window for more accurate real-time speeds
-		persistenceThreshold:  1024 * 1024 * 1024, // Save every 1GB downloaded
-		startedAt:             time.Now(),
-		logger:                slog.Default().With("component", "metrics-tracker"),
+		lastSavedProviderBytes:   make(map[string]int64),
+		sampleInterval:           2 * time.Second, // Match playback sampling for "live" feel
+		retentionPeriod:          60 * time.Second,
+		calculationWindow:        10 * time.Second,   // Use 10s window for more accurate real-time speeds
+		persistenceThreshold:     1024 * 1024 * 1024, // Save every 1GB downloaded
+		startedAt:                time.Now(),
+		logger:                   slog.Default().With("component", "metrics-tracker"),
 	}
 
 	return mt
+}
+
+// providerStatsID is the sole identity projection used by metrics and quota
+// persistence. Empty IDs are ignored rather than remapped to mutable aliases.
+func providerStatsID(provider nntppool.ProviderStats) string {
+	return provider.ProviderID
+}
+
+func persistedProviderKeyID(key string) (string, bool) {
+	for _, prefix := range [...]string{
+		"provider_error:", "provider_bytes:", "provider_started_at:",
+		"quota_used:", "quota_reset_at:",
+	} {
+		if providerID, ok := strings.CutPrefix(key, prefix); ok {
+			return providerID, true
+		}
+	}
+	return "", false
 }
 
 // Start begins collecting metrics samples
 func (mt *MetricsTracker) Start(ctx context.Context) {
 	childCtx, cancel := context.WithCancel(ctx)
 	mt.cancel = cancel
+	currentProviderIDs := make(map[string]struct{})
+	if mt.pool != nil {
+		for _, provider := range mt.pool.Stats().Providers {
+			if provider.ProviderID != "" {
+				currentProviderIDs[provider.ProviderID] = struct{}{}
+			}
+		}
+	}
 
 	// Load initial stats from DB
 	if mt.repo != nil {
@@ -132,15 +158,18 @@ func (mt *MetricsTracker) Start(ctx context.Context) {
 			// 1. Load provider stats (prefixed with provider_error: or provider_bytes: or provider_started_at:)
 			for k, v := range stats {
 				if after, ok := strings.CutPrefix(k, "provider_error:"); ok {
-					providerID := after
-					mt.initialProviderErrors[providerID] = v
+					if _, current := currentProviderIDs[after]; current {
+						mt.initialProviderErrors[after] = v
+					}
 				} else if after, ok := strings.CutPrefix(k, "provider_bytes:"); ok {
-					providerID := after
-					mt.initialProviderBytes[providerID] = v
-					mt.lastSavedProviderBytes[providerID] = v
+					if _, current := currentProviderIDs[after]; current {
+						mt.initialProviderBytes[after] = v
+						mt.lastSavedProviderBytes[after] = v
+					}
 				} else if after, ok := strings.CutPrefix(k, "provider_started_at:"); ok {
-					providerID := after
-					mt.initialProviderStartedAt[providerID] = time.Unix(v, 0)
+					if _, current := currentProviderIDs[after]; current {
+						mt.initialProviderStartedAt[after] = time.Unix(v, 0)
+					}
 				}
 			}
 
@@ -164,6 +193,9 @@ func (mt *MetricsTracker) Start(ctx context.Context) {
 			providerOldest, err := mt.repo.GetOldestProviderStatDates(ctx)
 			if err == nil {
 				for pid, oldestDate := range providerOldest {
+					if _, current := currentProviderIDs[pid]; !current {
+						continue
+					}
 					savedDate, exists := mt.initialProviderStartedAt[pid]
 					// If no date exists OR if the saved date is more recent than actual history
 					if !exists || oldestDate.Before(savedDate) {
@@ -172,10 +204,10 @@ func (mt *MetricsTracker) Start(ctx context.Context) {
 				}
 			}
 
-			// 4. Trigger a save if any date was initialized or corrected
-			go mt.saveStats(ctx)
-
 			mt.mu.Unlock()
+			// Persist any initialized/corrected dates before background sampling
+			// starts; lifecycle saves are always tracked and fully awaited.
+			mt.saveStats(ctx)
 
 			mt.logger.InfoContext(ctx, "Loaded persistent system stats",
 				"articles", mt.initialArticlesDownloaded,
@@ -212,18 +244,24 @@ func (mt *MetricsTracker) GetSnapshot() MetricsSnapshot {
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
 
-	return mt.getSnapshot(time.Now(), mt.pool.Stats())
+	var stats nntppool.ClientStats
+	if mt.pool != nil {
+		stats = mt.pool.Stats()
+	}
+	return mt.getSnapshot(time.Now(), stats)
 }
 
 func (mt *MetricsTracker) getSnapshot(now time.Time, stats nntppool.ClientStats) MetricsSnapshot {
 	// Calculate total errors and provider errors/bytes from v4 stats
-	var totalErrors int64
 	providerErrors := make(map[string]int64)
 	providerBytes := make(map[string]int64)
 	for _, ps := range stats.Providers {
-		totalErrors += ps.Errors
-		providerErrors[ps.Name] = ps.Errors
-		providerBytes[ps.Name] = ps.BytesConsumed
+		providerID := providerStatsID(ps)
+		if providerID == "" {
+			continue
+		}
+		providerErrors[providerID] = ps.Errors
+		providerBytes[providerID] = ps.BytesConsumed
 	}
 
 	// Use live counter for speed and totals
@@ -295,7 +333,9 @@ func (mt *MetricsTracker) getSnapshot(now time.Time, stats nntppool.ClientStats)
 	// Collect current missing counts from pool stats
 	currentMissing := make(map[string]int64)
 	for _, ps := range stats.Providers {
-		currentMissing[ps.Name] = ps.Missing
+		if providerID := providerStatsID(ps); providerID != "" {
+			currentMissing[providerID] = ps.Missing
+		}
 	}
 
 	// Find the oldest sample within the calculation window
@@ -327,11 +367,12 @@ func (mt *MetricsTracker) getSnapshot(now time.Time, stats nntppool.ClientStats)
 	// Collect per-provider quota snapshots
 	var providerQuotas map[string]ProviderQuotaSnapshot
 	for _, ps := range stats.Providers {
-		if ps.QuotaBytes > 0 {
+		providerID := providerStatsID(ps)
+		if providerID != "" && ps.QuotaBytes > 0 {
 			if providerQuotas == nil {
 				providerQuotas = make(map[string]ProviderQuotaSnapshot)
 			}
-			providerQuotas[ps.Name] = ProviderQuotaSnapshot{
+			providerQuotas[providerID] = ProviderQuotaSnapshot{
 				QuotaBytes:    ps.QuotaBytes,
 				QuotaUsed:     ps.QuotaUsed,
 				QuotaResetAt:  ps.QuotaResetAt,
@@ -347,7 +388,11 @@ func (mt *MetricsTracker) getSnapshot(now time.Time, stats nntppool.ClientStats)
 		// For now, simple call is fine as it's infrequent or cached by DB
 		stats24h, err := mt.repo.GetProviderHourlyStats(context.Background(), 24)
 		if err == nil {
-			providerBytes24h = stats24h
+			for providerID, bytes := range stats24h {
+				if _, known := mergedProviderBytes[providerID]; known {
+					providerBytes24h[providerID] = bytes
+				}
+			}
 		}
 	}
 
@@ -355,17 +400,29 @@ func (mt *MetricsTracker) getSnapshot(now time.Time, stats nntppool.ClientStats)
 	providerSpeeds := make(map[string]float64)
 	var totalPoolAvgSpeed float64
 	for _, ps := range stats.Providers {
+		providerID := providerStatsID(ps)
+		if providerID == "" {
+			continue
+		}
 		totalPoolAvgSpeed += ps.AvgSpeed
 	}
 
 	for _, ps := range stats.Providers {
+		providerID := providerStatsID(ps)
+		if providerID == "" {
+			continue
+		}
 		// Calculate proportional speed using our accurate global speed distributed by pool's relative speeds
 		currentProviderSpeed := ps.AvgSpeed
 		if totalPoolAvgSpeed > 0 && downloadSpeed > 0 {
 			weight := ps.AvgSpeed / totalPoolAvgSpeed
 			currentProviderSpeed = downloadSpeed * weight
 		}
-		providerSpeeds[ps.Name] = currentProviderSpeed
+		providerSpeeds[providerID] = currentProviderSpeed
+	}
+	var totalErrors int64
+	for _, count := range mergedProviderErrors {
+		totalErrors += count
 	}
 
 	return MetricsSnapshot{
@@ -431,6 +488,12 @@ func (mt *MetricsTracker) samplingLoop(ctx context.Context) {
 
 // saveStats persists current totals to the database
 func (mt *MetricsTracker) saveStats(ctx context.Context) {
+	mt.saveMu.Lock()
+	defer mt.saveMu.Unlock()
+	mt.saveStatsLocked(ctx, nil)
+}
+
+func (mt *MetricsTracker) saveStatsLocked(ctx context.Context, quotaProviders []nntppool.ProviderStats) {
 	if mt.repo == nil {
 		return
 	}
@@ -462,13 +525,24 @@ func (mt *MetricsTracker) saveStats(ctx context.Context) {
 		stats["provider_started_at:"+providerID] = startedAt.Unix()
 	}
 
-	// Persist per-provider quota state for restore across restarts
-	poolStats := mt.pool.Stats()
-	for _, ps := range poolStats.Providers {
-		if ps.QuotaBytes > 0 {
-			stats["quota_used:"+ps.Name] = ps.QuotaUsed
-			if !ps.QuotaResetAt.IsZero() {
-				stats["quota_reset_at:"+ps.Name] = ps.QuotaResetAt.UnixNano()
+	// Persist only the authoritative generation's canonical quota keys. A
+	// retiring generation is supplied explicitly after it has fully settled.
+	if quotaProviders == nil {
+		for providerID, quota := range snapshot.ProviderQuotas {
+			stats["quota_used:"+providerID] = quota.QuotaUsed
+			if !quota.QuotaResetAt.IsZero() {
+				stats["quota_reset_at:"+providerID] = quota.QuotaResetAt.UnixNano()
+			}
+		}
+	} else {
+		for _, provider := range quotaProviders {
+			providerID := providerStatsID(provider)
+			if providerID == "" || provider.QuotaBytes == 0 {
+				continue
+			}
+			stats["quota_used:"+providerID] = provider.QuotaUsed
+			if !provider.QuotaResetAt.IsZero() {
+				stats["quota_reset_at:"+providerID] = provider.QuotaResetAt.UnixNano()
 			}
 		}
 	}
@@ -507,20 +581,12 @@ func (mt *MetricsTracker) saveStats(ctx context.Context) {
 		}
 
 		// Record current speed to history for charting (MBps)
-		for poolName, speedBytes := range snapshot.ProviderSpeeds {
+		for providerID, speedBytes := range snapshot.ProviderSpeeds {
 			if speedBytes > 1024*1024 { // Only record if speed > 1MB/s to show active performance
 				speedMbps := speedBytes / (1024 * 1024)
-				
-				// Map pool name to config ID
-				id := poolName
-				mt.mu.RLock()
-				if mappedID, ok := mt.providerIDMap[poolName]; ok {
-					id = mappedID
-				}
-				mt.mu.RUnlock()
 
-				if err := mt.repo.RecordProviderSpeedTest(ctx, id, speedMbps); err != nil {
-					mt.logger.ErrorContext(ctx, "Failed to record provider speed history", "provider", id, "error", err)
+				if err := mt.repo.RecordProviderSpeedTest(ctx, providerID, speedMbps); err != nil {
+					mt.logger.ErrorContext(ctx, "Failed to record provider speed history", "provider", providerID, "error", err)
 				}
 			}
 		}
@@ -529,8 +595,24 @@ func (mt *MetricsTracker) saveStats(ctx context.Context) {
 
 // Reset resets cumulative metrics both in memory and in the database based on flags
 func (mt *MetricsTracker) Reset(ctx context.Context, resetPeak bool, resetTotals bool) error {
+	mt.saveMu.Lock()
+	defer mt.saveMu.Unlock()
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
+	knownProviderIDs := make(map[string]struct{})
+	for providerID := range mt.initialProviderErrors {
+		knownProviderIDs[providerID] = struct{}{}
+	}
+	for providerID := range mt.initialProviderBytes {
+		knownProviderIDs[providerID] = struct{}{}
+	}
+	if mt.pool != nil {
+		for _, provider := range mt.pool.Stats().Providers {
+			if provider.ProviderID != "" {
+				knownProviderIDs[provider.ProviderID] = struct{}{}
+			}
+		}
+	}
 
 	if resetTotals {
 		mt.initialBytesDownloaded = 0
@@ -572,6 +654,11 @@ func (mt *MetricsTracker) Reset(ctx context.Context, resetPeak bool, resetTotals
 
 			if resetTotals {
 				for k := range currentStats {
+					if providerID, scoped := persistedProviderKeyID(k); scoped {
+						if _, known := knownProviderIDs[providerID]; !known {
+							continue
+						}
+					}
 					resetMap[k] = 0
 				}
 				// Ensure core keys are present
@@ -600,13 +687,24 @@ func (mt *MetricsTracker) Reset(ctx context.Context, resetPeak bool, resetTotals
 // ResetProviderErrors zeroes out all per-provider error counts by offsetting
 // the live pool error counts. Bytes, speed, and history are untouched.
 func (mt *MetricsTracker) ResetProviderErrors(ctx context.Context) error {
+	mt.saveMu.Lock()
+	defer mt.saveMu.Unlock()
 	mt.mu.Lock()
 	defer mt.mu.Unlock()
+	knownProviderIDs := make(map[string]struct{}, len(mt.initialProviderErrors))
+	for providerID := range mt.initialProviderErrors {
+		mt.initialProviderErrors[providerID] = 0
+		knownProviderIDs[providerID] = struct{}{}
+	}
 
 	// Negate the live error counts so that displayed = initial + live = 0.
-	poolStats := mt.pool.Stats()
-	for _, ps := range poolStats.Providers {
-		mt.initialProviderErrors[ps.Name] = -ps.Errors
+	if mt.pool != nil {
+		for _, ps := range mt.pool.Stats().Providers {
+			if providerID := providerStatsID(ps); providerID != "" {
+				mt.initialProviderErrors[providerID] = -ps.Errors
+				knownProviderIDs[providerID] = struct{}{}
+			}
+		}
 	}
 
 	// Persist zeros for all provider_error:* keys in the database.
@@ -618,7 +716,10 @@ func (mt *MetricsTracker) ResetProviderErrors(ctx context.Context) error {
 
 		resetMap := make(map[string]int64)
 		for k := range currentStats {
-			if strings.HasPrefix(k, "provider_error:") {
+			if providerID, ok := strings.CutPrefix(k, "provider_error:"); ok {
+				if _, known := knownProviderIDs[providerID]; !known {
+					continue
+				}
 				resetMap[k] = 0
 			}
 		}
@@ -634,28 +735,63 @@ func (mt *MetricsTracker) ResetProviderErrors(ctx context.Context) error {
 	return nil
 }
 
-// SetProviderIDs sets the mapping from pool names to config IDs
-func (mt *MetricsTracker) SetProviderIDs(mapping map[string]string) {
+// FoldGeneration folds one fully settled retired generation into cumulative
+// counters and synchronously persists it before the generation can be closed.
+func (mt *MetricsTracker) FoldGeneration(ctx context.Context, stats nntppool.ClientStats) {
+	mt.saveMu.Lock()
+	defer mt.saveMu.Unlock()
+
 	mt.mu.Lock()
-	defer mt.mu.Unlock()
-	mt.providerIDMap = mapping
+	now := time.Now()
+	for _, provider := range stats.Providers {
+		providerID := providerStatsID(provider)
+		if providerID == "" {
+			continue
+		}
+		mt.initialProviderErrors[providerID] += provider.Errors
+		mt.initialProviderBytes[providerID] += provider.BytesConsumed
+		if _, ok := mt.initialProviderStartedAt[providerID]; !ok {
+			mt.initialProviderStartedAt[providerID] = now
+		}
+	}
+	mt.pool = nil
+	mt.samples = mt.samples[:0]
+	mt.mu.Unlock()
+
+	mt.saveStatsLocked(ctx, stats.Providers)
+}
+
+// SetClient installs the sole current-generation gauge source.
+func (mt *MetricsTracker) SetClient(client generationClient) {
+	mt.mu.Lock()
+	mt.pool = client
+	mt.samples = mt.samples[:0]
+	mt.mu.Unlock()
+	if client != nil {
+		mt.takeSample()
+	}
 }
 
 // takeSample captures a metrics snapshot and stores it
 func (mt *MetricsTracker) takeSample() {
-	stats := mt.pool.Stats()
-
 	mt.mu.Lock()
-	defer mt.mu.Unlock()
+	var stats nntppool.ClientStats
+	if mt.pool != nil {
+		stats = mt.pool.Stats()
+	}
 
 	// Calculate total errors, provider errors, and provider missing counts
 	var totalErrors int64
 	providerErrors := make(map[string]int64)
 	providerMissing := make(map[string]int64)
 	for _, ps := range stats.Providers {
+		providerID := providerStatsID(ps)
+		if providerID == "" {
+			continue
+		}
 		totalErrors += ps.Errors
-		providerErrors[ps.Name] = ps.Errors
-		providerMissing[ps.Name] = ps.Missing
+		providerErrors[providerID] = ps.Errors
+		providerMissing[providerID] = ps.Missing
 	}
 
 	bytesDownloaded := mt.liveBytesDownloaded.Load()
@@ -675,14 +811,14 @@ func (mt *MetricsTracker) takeSample() {
 
 	// Adaptive Persistence: Check if we should force a save due to high activity
 	totalBytesDownloaded := bytesDownloaded + mt.initialBytesDownloaded
-	if totalBytesDownloaded-mt.lastSavedBytesDownloaded >= mt.persistenceThreshold {
-		// Use a non-blocking save or a shorter context?
-		// For now, simple call is fine as it's a goroutine
-		go mt.saveStats(context.Background())
-	}
+	shouldSave := totalBytesDownloaded-mt.lastSavedBytesDownloaded >= mt.persistenceThreshold
 
 	// Clean up old samples
 	mt.cleanupOldSamples()
+	mt.mu.Unlock()
+	if shouldSave {
+		mt.saveStats(context.Background())
+	}
 }
 
 // cleanupOldSamples removes samples older than the retention period

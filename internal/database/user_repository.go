@@ -218,8 +218,10 @@ func (r *UserRepository) UpdatePassword(ctx context.Context, userID string, pass
 	return nil
 }
 
-// generateAPIKey generates a cryptographically secure API key
-func (r *UserRepository) generateAPIKey() (string, error) {
+// GenerateAPIKey generates a cryptographically secure 32-character API key.
+// It is deliberately pure with respect to repository state; callers persist the
+// exact returned key separately once any other authority has accepted it.
+func (r *UserRepository) GenerateAPIKey() (string, error) {
 	// Generate 24 random bytes (will become 32 characters in base64)
 	bytes := make([]byte, 24)
 	if _, err := rand.Read(bytes); err != nil {
@@ -231,15 +233,8 @@ func (r *UserRepository) generateAPIKey() (string, error) {
 	return apiKey, nil
 }
 
-// RegenerateAPIKey generates and updates a new API key for the user
-func (r *UserRepository) RegenerateAPIKey(ctx context.Context, userID string) (string, error) {
-	// Generate new API key
-	apiKey, err := r.generateAPIKey()
-	if err != nil {
-		return "", fmt.Errorf("failed to generate API key: %w", err)
-	}
-
-	// Update user's API key in database
+// UpdateAPIKey persists the exact API key supplied for an existing user.
+func (r *UserRepository) UpdateAPIKey(ctx context.Context, userID, apiKey string) error {
 	query := `
 		UPDATE users
 		SET api_key = ?, updated_at = datetime('now')
@@ -248,18 +243,31 @@ func (r *UserRepository) RegenerateAPIKey(ctx context.Context, userID string) (s
 
 	result, err := r.db.ExecContext(ctx, query, apiKey, userID)
 	if err != nil {
-		return "", fmt.Errorf("failed to update API key: %w", err)
+		return fmt.Errorf("failed to update API key: %w", err)
 	}
 
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
-		return "", fmt.Errorf("failed to get rows affected: %w", err)
+		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 
 	if rowsAffected == 0 {
-		return "", fmt.Errorf("user not found: %s", userID)
+		return fmt.Errorf("user not found: %s", userID)
 	}
 
+	return nil
+}
+
+// RegenerateAPIKey retains the repository's legacy combined operation for
+// callers that do not coordinate another API-key authority.
+func (r *UserRepository) RegenerateAPIKey(ctx context.Context, userID string) (string, error) {
+	apiKey, err := r.GenerateAPIKey()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate API key: %w", err)
+	}
+	if err := r.UpdateAPIKey(ctx, userID, apiKey); err != nil {
+		return "", err
+	}
 	return apiKey, nil
 }
 

@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
@@ -22,8 +24,7 @@ import (
 //
 // With this coordinator:
 //   - A singleflight.Group dedupes concurrent requests for the same
-//     provider — only one in-flight speed test per providerID. The
-//     other callers share its result.
+//     provider and transport fingerprint. The other callers share its result.
 //   - Each per-provider nntppool.Client is held in a short-lived cache
 //     (TTL clientTTL). Subsequent requests within the TTL reuse the
 //     same client rather than opening a fresh connection set.
@@ -36,7 +37,7 @@ import (
 type speedtestCoordinator struct {
 	sf      singleflight.Group
 	mu      sync.Mutex
-	clients map[string]*cachedSpeedtestClient // keyed by providerID
+	clients map[string]*cachedSpeedtestClient // keyed by canonical ID + transport fingerprint
 
 	// stopCh signals the janitor goroutine to exit. Closed exactly once
 	// by shutdown via stopOnce. The field itself is immutable after
@@ -47,6 +48,20 @@ type speedtestCoordinator struct {
 	stopOnce sync.Once
 	// wg tracks the janitor goroutine so shutdown can wait for it.
 	wg sync.WaitGroup
+
+	buildClient func(context.Context, *config.ProviderConfig, int, int) (*nntppool.Client, error)
+}
+
+func speedtestCacheKey(p *config.ProviderConfig) string {
+	inflight := p.InflightRequests
+	if inflight <= 0 {
+		inflight = 10
+	}
+	digest := sha256.New()
+	fmt.Fprintf(digest, "%d:%s|%d|%d:%s|%d:%s|%t|%t|%d|%d",
+		len(p.Host), p.Host, p.Port, len(p.Username), p.Username,
+		len(p.Password), p.Password, p.TLS, p.InsecureTLS, p.MaxConnections, inflight)
+	return p.ID + ":" + hex.EncodeToString(digest.Sum(nil))
 }
 
 type cachedSpeedtestClient struct {
@@ -121,23 +136,26 @@ func (sc *speedtestCoordinator) sweepExpired() {
 // getOrBuildClient returns a cached client for the provider or builds
 // a new one. The caller MUST NOT Close the returned client — the
 // coordinator owns its lifetime. Returns the client and the
-// nntppool-side provider name (used by SpeedTest).
+// canonical provider ID (used by SpeedTest).
 func (sc *speedtestCoordinator) getOrBuildClient(ctx context.Context, p *config.ProviderConfig) (*nntppool.Client, string, error) {
-	host := fmt.Sprintf("%s:%d", p.Host, p.Port)
-	providerName := host
-	if p.Username != "" {
-		providerName = host + "+" + p.Username
+	if p == nil || p.ID == "" {
+		return nil, "", fmt.Errorf("canonical provider ID is required")
 	}
+	host := fmt.Sprintf("%s:%d", p.Host, p.Port)
+	providerName := p.ID
+	key := speedtestCacheKey(p)
 
 	sc.mu.Lock()
-	if entry, ok := sc.clients[p.ID]; ok && time.Now().Before(entry.expiresAt) {
+	if entry, ok := sc.clients[key]; ok && time.Now().Before(entry.expiresAt) {
 		sc.mu.Unlock()
 		return entry.client, providerName, nil
 	}
 	// Drop stale entry before building a new one.
-	if entry, ok := sc.clients[p.ID]; ok {
-		entry.client.Close()
-		delete(sc.clients, p.ID)
+	if entry, ok := sc.clients[key]; ok {
+		if entry.client != nil {
+			entry.client.Close()
+		}
+		delete(sc.clients, key)
 	}
 	sc.mu.Unlock()
 
@@ -149,7 +167,11 @@ func (sc *speedtestCoordinator) getOrBuildClient(ctx context.Context, p *config.
 		inflight = 10
 	}
 
-	client, err := buildAdHocClient(ctx, p, p.MaxConnections, inflight)
+	builder := sc.buildClient
+	if builder == nil {
+		builder = buildAdHocClient
+	}
+	client, err := builder(context.WithoutCancel(ctx), p, p.MaxConnections, inflight)
 	if err != nil {
 		return nil, "", err
 	}
@@ -157,12 +179,14 @@ func (sc *speedtestCoordinator) getOrBuildClient(ctx context.Context, p *config.
 	sc.mu.Lock()
 	// Another goroutine may have raced ahead and built a client too;
 	// keep whichever was inserted first and close the loser.
-	if existing, ok := sc.clients[p.ID]; ok && time.Now().Before(existing.expiresAt) {
+	if existing, ok := sc.clients[key]; ok && time.Now().Before(existing.expiresAt) {
 		sc.mu.Unlock()
-		client.Close()
+		if client != nil {
+			client.Close()
+		}
 		return existing.client, providerName, nil
 	}
-	sc.clients[p.ID] = &cachedSpeedtestClient{
+	sc.clients[key] = &cachedSpeedtestClient{
 		client:    client,
 		expiresAt: time.Now().Add(clientTTL),
 		host:      host,
@@ -183,6 +207,7 @@ func buildAdHocClient(ctx context.Context, p *config.ProviderConfig, connections
 	}
 	return nntppool.NewClient(ctx, []nntppool.Provider{
 		{
+			ID:          p.ID,
 			Host:        fmt.Sprintf("%s:%d", p.Host, p.Port),
 			TLSConfig:   tlsCfg,
 			Auth:        nntppool.Auth{Username: p.Username, Password: p.Password},
@@ -193,15 +218,14 @@ func buildAdHocClient(ctx context.Context, p *config.ProviderConfig, connections
 	})
 }
 
-// run executes fn under the singleflight key for the given provider,
-// so concurrent callers share a single speed-test result. fn receives
-// the cached/built client and the nntppool provider name.
+// run executes fn under the compound cache key, so callers share a result only
+// when both canonical identity and transport configuration match.
 func (sc *speedtestCoordinator) run(
 	ctx context.Context,
 	p *config.ProviderConfig,
 	fn func(client *nntppool.Client, providerName string) (any, error),
 ) (any, error) {
-	v, err, _ := sc.sf.Do(p.ID, func() (any, error) {
+	v, err, _ := sc.sf.Do(speedtestCacheKey(p), func() (any, error) {
 		client, providerName, err := sc.getOrBuildClient(ctx, p)
 		if err != nil {
 			return nil, err

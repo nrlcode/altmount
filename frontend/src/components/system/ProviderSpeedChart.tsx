@@ -24,13 +24,15 @@ export function ProviderSpeedChart() {
 	const { data: historyResponse, isLoading: historyLoading } = useProviderSpeedHistory(days);
 	const { data: poolData } = usePoolMetrics();
 
-	const { chartData, providers } = useMemo(() => {
+	const { chartData, providers, providerLabels } = useMemo(() => {
 		const grouped: Record<string, ChartDatum> = {};
 		const maxes: Record<string, number> = {};
+		const labels: Record<string, string> = {};
 
 		if (poolData?.providers) {
 			poolData.providers.forEach((p) => {
-				maxes[p.host] = 0;
+				maxes[p.id] = 0;
+				labels[p.id] = p.name || p.host || p.id;
 			});
 		}
 
@@ -68,21 +70,22 @@ export function ProviderSpeedChart() {
 					grouped[timestamp] = { name: timestamp };
 				}
 
-				const provider = poolData?.providers.find((p) => p.id === stat.provider_id);
-				const label = provider ? provider.host : stat.provider_id;
-
-				grouped[timestamp][label] = stat.speed_mbps;
-				maxes[label] = Math.max(maxes[label] || 0, stat.speed_mbps);
+				grouped[timestamp][stat.provider_id] = stat.speed_mbps;
+				maxes[stat.provider_id] = Math.max(maxes[stat.provider_id] || 0, stat.speed_mbps);
 			});
 		}
 
 		const sortedProviders = Object.keys(maxes).sort((a, b) => maxes[b] - maxes[a]);
 
-		return { chartData: Object.values(grouped), providers: sortedProviders };
+		return {
+			chartData: Object.values(grouped),
+			providers: sortedProviders,
+			providerLabels: labels,
+		};
 	}, [historyResponse, poolData, days]);
 
 	const colorMap = useMemo(
-		() => buildProviderColorMap([...(poolData?.providers ?? []).map((p) => p.host), ...providers]),
+		() => buildProviderColorMap([...(poolData?.providers ?? []).map((p) => p.id), ...providers]),
 		[poolData, providers],
 	);
 
@@ -106,6 +109,7 @@ export function ProviderSpeedChart() {
 			chartData={chartData}
 			providers={providers}
 			colorMap={colorMap}
+			providerLabels={providerLabels}
 			gradientPrefix="colorSpeed"
 			formatValue={formatSpeed}
 			tooltipTotalClassName="text-success"

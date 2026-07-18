@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/javi11/altmount/internal/config"
 )
 
 // lastMissingWarnTime tracks the last time a missing article warning was logged per provider.
@@ -505,93 +506,44 @@ func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 	poolStats := pool.Stats()
 
 	// Get current configuration to access provider details and speed test results
-	config := s.configManager.GetConfig()
+	cfg := s.configManager.GetConfig()
+	configuredByID := make(map[string]config.ProviderConfig)
+	if cfg != nil {
+		configuredByID = make(map[string]config.ProviderConfig, len(cfg.Providers))
+		for _, provider := range cfg.Providers {
+			configuredByID[provider.ID] = provider
+		}
+	}
 
 	// Calculate total speed from all providers to use for proportional scaling
 	var totalProviderSpeed float64
 	for _, ps := range poolStats.Providers {
+		if ps.ProviderID == "" {
+			continue
+		}
 		totalProviderSpeed += ps.AvgSpeed
 	}
 
 	// Build provider response from pool stats + config
 	providers := make([]ProviderStatusResponse, 0, len(poolStats.Providers))
 	for _, ps := range poolStats.Providers {
-		// Try to find matching provider in config for additional details
-		var providerID string
-		var name string
-		var host string
-		var username string
-		var lastSpeedTestMbps float64
-		var lastSpeedTestTime *time.Time
-
-		if config != nil {
-			for _, p := range config.Providers {
-				// Match by provider name (v4 uses host:port or host:port+username)
-				if ps.Name == p.NNTPPoolName() {
-					providerID = p.ID
-					name = p.Name
-					host = p.Host
-					username = p.Username
-					lastSpeedTestMbps = p.LastSpeedTestMbps
-					lastSpeedTestTime = p.LastSpeedTestTime
-					break
-				}
-			}
-		}
-
-		// Fallback: use pool stats name if config match failed
-		if host == "" {
-			host = ps.Name
-		}
+		providerID := ps.ProviderID
 		if providerID == "" {
-			providerID = ps.Name
+			continue
 		}
-
-		// Get error count from metrics (sum from both names if they differ)
-		errorCount := int64(0)
-		if metrics.ProviderErrors != nil {
-			errorCount += metrics.ProviderErrors[ps.Name]
-			if providerID != ps.Name {
-				errorCount += metrics.ProviderErrors[providerID]
-			}
-		}
-
-		// Get byte count from metrics (sum from both names if they differ)
-		byteCount := int64(0)
-		if metrics.ProviderBytes != nil {
-			byteCount += metrics.ProviderBytes[ps.Name]
-			if providerID != ps.Name {
-				byteCount += metrics.ProviderBytes[providerID]
-			}
-		}
-
-		// Get 24h byte count from metrics (sum from both names if they differ)
-		byteCount24h := int64(0)
-		if metrics.ProviderBytes24h != nil {
-			byteCount24h += metrics.ProviderBytes24h[ps.Name]
-			if providerID != ps.Name {
-				byteCount24h += metrics.ProviderBytes24h[providerID]
-			}
-		}
-
-		// Get the earliest started_at date between the two names
-		startedAt := metrics.ProviderStartedAt[ps.Name]
-		if providerID != ps.Name {
-			if oldStartedAt, exists := metrics.ProviderStartedAt[providerID]; exists {
-				if startedAt.IsZero() || (!oldStartedAt.IsZero() && oldStartedAt.Before(startedAt)) {
-					startedAt = oldStartedAt
-				}
-			}
-		}
-
+		configured := configuredByID[providerID]
+		errorCount := metrics.ProviderErrors[providerID]
+		byteCount := metrics.ProviderBytes[providerID]
+		byteCount24h := metrics.ProviderBytes24h[providerID]
+		startedAt := metrics.ProviderStartedAt[providerID]
 		// Final fallback: if both are zero, use global startedAt
 		if startedAt.IsZero() {
 			startedAt = metrics.StartedAt
 		}
 
 		// Get missing rate and warning from metrics snapshot
-		missingRate := metrics.ProviderMissingRates[ps.Name]
-		missingWarning := metrics.ProviderMissingWarning[ps.Name]
+		missingRate := metrics.ProviderMissingRates[providerID]
+		missingWarning := metrics.ProviderMissingWarning[providerID]
 
 		// Calculate proportional speed
 		// We use our accurate global speed and distribute it based on pool's relative provider speeds
@@ -603,9 +555,9 @@ func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 
 		prov := ProviderStatusResponse{
 			ID:                      providerID,
-			Name:                    name,
-			Host:                    host,
-			Username:                username,
+			Name:                    configured.Name,
+			Host:                    configured.Host,
+			Username:                configured.Username,
 			UsedConnections:         ps.ActiveConnections,
 			MaxConnections:          ps.MaxConnections,
 			State:                   "active",
@@ -615,14 +567,14 @@ func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 			StartedAt:               startedAt,
 			CurrentSpeedBytesPerSec: currentProviderSpeed,
 			PingMs:                  ps.Ping.RTT.Milliseconds(),
-			LastSpeedTestMbps:       lastSpeedTestMbps,
-			LastSpeedTestTime:       lastSpeedTestTime,
+			LastSpeedTestMbps:       configured.LastSpeedTestMbps,
+			LastSpeedTestTime:       configured.LastSpeedTestTime,
 			MissingCount:            ps.Missing,
 			MissingRatePerMinute:    missingRate,
 			MissingWarning:          missingWarning,
 		}
 
-		if q, ok := metrics.ProviderQuotas[ps.Name]; ok {
+		if q, ok := metrics.ProviderQuotas[providerID]; ok {
 			prov.QuotaBytes = q.QuotaBytes
 			prov.QuotaUsed = q.QuotaUsed
 			if !q.QuotaResetAt.IsZero() {
@@ -638,10 +590,10 @@ func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 		if missingWarning {
 			const warnCooldown = 60 * time.Second
 			now := time.Now()
-			if lastWarn, ok := lastMissingWarnTime.Load(ps.Name); !ok || now.Sub(lastWarn.(time.Time)) >= warnCooldown {
-				lastMissingWarnTime.Store(ps.Name, now)
+			if lastWarn, ok := lastMissingWarnTime.Load(providerID); !ok || now.Sub(lastWarn.(time.Time)) >= warnCooldown {
+				lastMissingWarnTime.Store(providerID, now)
 				slog.WarnContext(c.Context(), "NNTP provider has high missing article rate — consider using a backup provider",
-					"provider", host,
+					"provider_id", providerID,
 					"missing_count", ps.Missing,
 					"missing_rate_per_minute", fmt.Sprintf("%.1f", missingRate),
 				)
@@ -662,12 +614,15 @@ func (s *Server) handleGetPoolMetrics(c *fiber.Ctx) error {
 
 	// Map pool metrics to API response format
 	response := PoolMetricsResponse{
-		BytesDownloaded:             metrics.BytesDownloaded,
-		BytesDownloaded24h:          bytesDownloaded24h,
-		BytesUploaded:               metrics.BytesUploaded,
-		ArticlesDownloaded:          metrics.ArticlesDownloaded,
-		ArticlesPosted:              metrics.ArticlesPosted,
-		TotalErrors:                 metrics.TotalErrors,
+		BytesDownloaded:    metrics.BytesDownloaded,
+		BytesDownloaded24h: bytesDownloaded24h,
+		BytesUploaded:      metrics.BytesUploaded,
+		ArticlesDownloaded: metrics.ArticlesDownloaded,
+		ArticlesPosted:     metrics.ArticlesPosted,
+		TotalErrors:        metrics.TotalErrors,
+		// These cumulative maps are authoritative independently of the current
+		// generation. Returning them intact preserves folded entries for removed
+		// providers so the breakdown reconciles with global totals.
 		ProviderErrors:              metrics.ProviderErrors,
 		ProviderBytes:               metrics.ProviderBytes,
 		DownloadSpeedBytesPerSec:    metrics.DownloadSpeedBytesPerSec,

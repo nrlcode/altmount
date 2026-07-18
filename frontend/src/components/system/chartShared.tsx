@@ -72,6 +72,7 @@ interface CustomTooltipProps {
 	label?: string;
 	formatValue: (value: number) => string;
 	totalClassName: string;
+	providerLabels?: Record<string, string>;
 }
 
 function CustomTooltip({
@@ -80,6 +81,7 @@ function CustomTooltip({
 	label,
 	formatValue,
 	totalClassName,
+	providerLabels,
 }: CustomTooltipProps) {
 	if (!active || !payload || payload.length === 0) return null;
 
@@ -96,7 +98,9 @@ function CustomTooltip({
 					<div key={p.dataKey} className="flex items-center justify-between gap-4 py-0.5">
 						<div className="flex items-center gap-1.5">
 							<span className="h-2 w-2 rounded-full" style={{ backgroundColor: p.stroke }} />
-							<span className="font-medium text-base-content/75">{p.dataKey}:</span>
+							<span className="font-medium text-base-content/75">
+								{providerLabels?.[p.dataKey] ?? p.dataKey}:
+							</span>
 						</div>
 						<span className="font-mono font-semibold text-base-content">
 							{formatValue(p.value)}
@@ -179,6 +183,7 @@ interface ProviderAreaChartProps {
 	chartData: ChartDatum[];
 	providers: string[];
 	colorMap: Record<string, string>;
+	providerLabels?: Record<string, string>;
 	gradientPrefix: string;
 	formatValue: (value: number) => string;
 	tooltipTotalClassName: string;
@@ -199,6 +204,7 @@ export function ProviderAreaChart({
 	chartData,
 	providers,
 	colorMap,
+	providerLabels,
 	gradientPrefix,
 	formatValue,
 	tooltipTotalClassName,
@@ -265,7 +271,11 @@ export function ProviderAreaChart({
 							/>
 							<Tooltip
 								content={
-									<CustomTooltip formatValue={formatValue} totalClassName={tooltipTotalClassName} />
+									<CustomTooltip
+										formatValue={formatValue}
+										totalClassName={tooltipTotalClassName}
+										providerLabels={providerLabels}
+									/>
 								}
 								cursor={{
 									stroke: "var(--color-base-content)",
@@ -286,7 +296,7 @@ export function ProviderAreaChart({
 								content={
 									<DefaultLegendContent
 										payload={providers.map<LegendPayload>((p, i) => ({
-											value: p,
+											value: providerLabels?.[p] ?? p,
 											type: "circle",
 											color: colorMap[p] ?? chartColorAt(i),
 											dataKey: p,

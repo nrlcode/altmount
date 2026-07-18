@@ -39,7 +39,11 @@ func (s *Server) handleTestProviderSpeed(c *fiber.Ctx) error {
 		return RespondInternalError(c, "Configuration management not available", "")
 	}
 
-	cfg := s.configManager.GetConfig()
+	snapshot, err := s.configManager.Snapshot()
+	if err != nil {
+		return RespondInternalError(c, "Configuration not available", err.Error())
+	}
+	cfg := snapshot.Config
 	var targetProvider *config.ProviderConfig
 	for _, p := range cfg.Providers {
 		if p.ID == providerID {
@@ -55,15 +59,6 @@ func (s *Server) handleTestProviderSpeed(c *fiber.Ctx) error {
 	testCtx, cancel := context.WithTimeout(c.Context(), 5*time.Minute)
 	defer cancel()
 
-	// Build the nntppool provider name the same way the production pool
-	// and coordinator do, so we can match the right per-provider stats
-	// entry in the result.
-	host := fmt.Sprintf("%s:%d", targetProvider.Host, targetProvider.Port)
-	providerName := host
-	if targetProvider.Username != "" {
-		providerName = host + "+" + targetProvider.Username
-	}
-
 	// Prefer the production pool when this provider is already part of
 	// it; otherwise fall back to the singleton coordinator so we never
 	// create a fresh nntppool.Client per request.
@@ -78,14 +73,19 @@ func (s *Server) handleTestProviderSpeed(c *fiber.Ctx) error {
 	// window inflates it. result.Providers carries the delta-based,
 	// per-provider speed for exactly the provider we targeted.
 	//
-	// Match by name to avoid picking a random provider when the result
-	// slice contains multiple entries (map iteration order is undefined).
-	wireBps := result.WireSpeedBps
+	// ProviderID is the only stable join key. Operational aliases and display
+	// names can change independently of account identity.
+	var wireBps float64
+	foundProvider := false
 	for _, ps := range result.Providers {
-		if ps.Name == providerName && ps.AvgSpeed > 0 {
+		if ps.ProviderID == providerID {
 			wireBps = ps.AvgSpeed
+			foundProvider = true
 			break
 		}
+	}
+	if !foundProvider {
+		return RespondInternalError(c, "Speed test failed", fmt.Sprintf("result did not include provider %q", providerID))
 	}
 	speed := wireBps / 1024 / 1024 // bytes/sec → MB/s
 	if speed < 0 {
@@ -94,8 +94,7 @@ func (s *Server) handleTestProviderSpeed(c *fiber.Ctx) error {
 
 	// Update provider config with speed test result
 	now := time.Now()
-	currentConfig := s.configManager.GetConfig()
-	newConfig := currentConfig.DeepCopy()
+	newConfig := snapshot.Config.DeepCopy()
 
 	for i, p := range newConfig.Providers {
 		if p.ID == providerID {
@@ -105,18 +104,16 @@ func (s *Server) handleTestProviderSpeed(c *fiber.Ctx) error {
 		}
 	}
 
-	if err := s.configManager.UpdateConfig(newConfig); err != nil {
+	if _, err := s.configManager.CompareAndSwap(c.Context(), snapshot.Revision, newConfig); err != nil {
 		slog.ErrorContext(c.Context(), "Failed to update provider speed test result in config", "provider_id", providerID, "err", err)
-		return RespondInternalError(c, "Failed to save speed test result", err.Error())
-	}
-
-	if err := s.configManager.SaveConfig(); err != nil {
-		slog.ErrorContext(c.Context(), "Failed to persist config after speed test", "err", err)
+		return respondConfigWriteError(c, "Failed to save speed test result", err)
 	}
 
 	// Record to database
-	if err := s.queueRepo.RecordProviderSpeedTest(c.Context(), providerID, speed); err != nil {
-		slog.ErrorContext(c.Context(), "Failed to record speed test history", "provider_id", providerID, "err", err)
+	if s.queueRepo != nil {
+		if err := s.queueRepo.RecordProviderSpeedTest(c.Context(), providerID, speed); err != nil {
+			slog.ErrorContext(c.Context(), "Failed to record speed test history", "provider_id", providerID, "err", err)
+		}
 	}
 
 	return RespondSuccess(c, ProviderSpeedTestResponse{
@@ -136,25 +133,10 @@ func (s *Server) runProviderSpeedTest(ctx context.Context, p *config.ProviderCon
 	// pool.Manager is required wiring; in tests it may return nil/err.
 	if s.poolManager != nil {
 		if cp, err := s.poolManager.GetPool(); err == nil && cp != nil {
-			if real, ok := cp.(*nntppool.Client); ok {
-				// Match the name the production pool registers for this
-				// provider: ToNNTPProvider sets Host = "host:port", and
-				// nntppool's resolveProviderName derives "host:port+user".
-				// Building the lookup from p.Host alone (no port) never
-				// matches, forcing the slow coordinator fallback.
-				host := fmt.Sprintf("%s:%d", p.Host, p.Port)
-				providerName := host
-				if p.Username != "" {
-					providerName = host + "+" + p.Username
-				}
-				// Try the production pool first. If the provider isn't
-				// in it, nntppool returns an error and we fall through
-				// to the coordinator.
-				if result, sterr := real.SpeedTest(ctx, nntppool.SpeedTestOptions{
-					ProviderName: providerName,
-				}); sterr == nil {
-					return result, nil
-				}
+			if result, sterr := cp.SpeedTest(ctx, nntppool.SpeedTestOptions{
+				ProviderName: p.ID,
+			}); sterr == nil {
+				return result, nil
 			}
 		}
 	}

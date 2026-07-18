@@ -1,7 +1,9 @@
 package config
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/javi11/altmount/internal/utils"
 	"github.com/javi11/nntppool/v4"
 	"github.com/jinzhu/copier"
@@ -611,9 +614,7 @@ func (c *Config) DeepCopy() *Config {
 
 	copyCfg := &Config{}
 	if err := copier.CopyWithOption(copyCfg, c, copier.Option{DeepCopy: true}); err != nil {
-		// Fallback to shallow copy if deep copy fails (should not happen)
-		shallowCopy := *c
-		return &shallowCopy
+		panic(fmt.Sprintf("deep copy config: %v", err))
 	}
 
 	return copyCfg
@@ -903,13 +904,11 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Validate each provider and the exact identities passed to nntppool. Keep
-	// non-empty config IDs unique even while disabled so map-based diffs and a
-	// later enable cannot become ambiguous. Legacy empty IDs remain supported;
-	// enabled providers then use nntppool's endpoint/account fallback identity.
+	// IDs and operational endpoint/account aliases share one global namespace,
+	// including disabled providers. The sole exception is a provider whose own
+	// stable ID intentionally equals its own operational alias.
 	configuredIDs := make(map[string]int, len(c.Providers))
-	enabledPoolNames := make(map[string]int, len(c.Providers))
-	enabledTransportIDs := make(map[string]int, len(c.Providers))
+	operationalAliases := make(map[string]int, len(c.Providers))
 	enabledProviders := 0
 	enabledPrimaries := 0
 	for i, provider := range c.Providers {
@@ -935,26 +934,25 @@ func (c *Config) Validate() error {
 			}
 			configuredIDs[provider.ID] = i
 		}
+		alias := provider.NNTPPoolName()
+		if previous, exists := operationalAliases[alias]; exists {
+			return fmt.Errorf("provider %d: operational alias duplicates provider %d", i, previous)
+		}
+		operationalAliases[alias] = i
+
+		if provider.ID != "" {
+			if aliasOwner, exists := operationalAliases[provider.ID]; exists && aliasOwner != i {
+				return fmt.Errorf("provider %d: stable id collides with provider %d operational alias", i, aliasOwner)
+			}
+		}
+		if idOwner, exists := configuredIDs[alias]; exists && idOwner != i {
+			return fmt.Errorf("provider %d: operational alias collides with provider %d stable id", i, idOwner)
+		}
 
 		if provider.Enabled == nil || !*provider.Enabled {
 			continue
 		}
 		enabledProviders++
-
-		poolName := provider.NNTPPoolName()
-		if previous, exists := enabledPoolNames[poolName]; exists {
-			return fmt.Errorf("provider %d: enabled transport endpoint/account duplicates provider %d", i, previous)
-		}
-		enabledPoolNames[poolName] = i
-
-		transportID := provider.ID
-		if transportID == "" {
-			transportID = poolName
-		}
-		if previous, exists := enabledTransportIDs[transportID]; exists {
-			return fmt.Errorf("provider %d: effective transport id duplicates provider %d", i, previous)
-		}
-		enabledTransportIDs[transportID] = i
 
 		if provider.IsBackupProvider == nil || !*provider.IsBackupProvider {
 			enabledPrimaries++
@@ -1022,23 +1020,6 @@ func (c *Config) ValidateDirectories() error {
 	return nil
 }
 
-// ProviderChangeType describes the kind of provider change detected by ProvidersDiff.
-type ProviderChangeType int
-
-const (
-	ProviderAdded ProviderChangeType = iota
-	ProviderRemoved
-	ProviderModified
-)
-
-// ProviderChange describes a single provider change between two configurations.
-type ProviderChange struct {
-	Type        ProviderChangeType
-	ProviderID  string
-	OldProvider *ProviderConfig // nil for Added
-	NewProvider *ProviderConfig // nil for Removed
-}
-
 // NNTPPoolName returns the name nntppool v4 uses to identify this provider.
 // Format: "host:port" or "host:port+username" when username is set.
 func (p *ProviderConfig) NNTPPoolName() string {
@@ -1067,15 +1048,8 @@ func (p *ProviderConfig) ToNNTPProvider() nntppool.Provider {
 		}
 	}
 
-	inflight := p.InflightRequests
-	if inflight <= 0 {
-		inflight = 10
-	}
-
-	statInflight := p.StatInflightRequests
-	if statInflight <= 0 {
-		statInflight = 100
-	}
+	inflight := effectivePositive(p.InflightRequests, 10)
+	statInflight := effectivePositive(p.StatInflightRequests, 100)
 
 	return nntppool.Provider{
 		ID:                p.ID,
@@ -1096,65 +1070,9 @@ func (p *ProviderConfig) ToNNTPProvider() nntppool.Provider {
 	}
 }
 
-// ProvidersDiff computes the set of provider changes between this config and another.
-// Returns nil if providers are identical (same set and same field values).
-func (c *Config) ProvidersDiff(other *Config) []ProviderChange {
-	oldMap := make(map[string]ProviderConfig, len(c.Providers))
-	for _, p := range c.Providers {
-		oldMap[p.ID] = p
-	}
-
-	newMap := make(map[string]ProviderConfig, len(other.Providers))
-	for _, p := range other.Providers {
-		newMap[p.ID] = p
-	}
-
-	var changes []ProviderChange
-
-	// Detect removed and modified providers
-	for id, oldP := range oldMap {
-		newP, exists := newMap[id]
-		if !exists {
-			oldCopy := oldP
-			changes = append(changes, ProviderChange{
-				Type:        ProviderRemoved,
-				ProviderID:  id,
-				OldProvider: &oldCopy,
-			})
-			continue
-		}
-		if !providersFieldsEqual(oldP, newP) {
-			oldCopy := oldP
-			newCopy := newP
-			changes = append(changes, ProviderChange{
-				Type:        ProviderModified,
-				ProviderID:  id,
-				OldProvider: &oldCopy,
-				NewProvider: &newCopy,
-			})
-		}
-	}
-
-	// Detect added providers
-	for id, newP := range newMap {
-		if _, exists := oldMap[id]; !exists {
-			newCopy := newP
-			changes = append(changes, ProviderChange{
-				Type:        ProviderAdded,
-				ProviderID:  id,
-				NewProvider: &newCopy,
-			})
-		}
-	}
-
-	if len(changes) == 0 {
-		return nil
-	}
-	return changes
-}
-
-// providersFieldsEqual returns true if two ProviderConfig values are identical
-// in all fields that affect pool behaviour.
+// providersFieldsEqual compares fields that are actually projected into an
+// enabled nntppool.Provider. Display and observational fields do not rebuild a
+// transport generation.
 func providersFieldsEqual(a, b ProviderConfig) bool {
 	return a.Host == b.Host &&
 		a.Port == b.Port &&
@@ -1162,94 +1080,54 @@ func providersFieldsEqual(a, b ProviderConfig) bool {
 		a.SkipPing == b.SkipPing &&
 		a.Password == b.Password &&
 		a.MaxConnections == b.MaxConnections &&
-		a.InflightRequests == b.InflightRequests &&
-		a.StatInflightRequests == b.StatInflightRequests &&
+		effectivePositive(a.InflightRequests, 10) == effectivePositive(b.InflightRequests, 10) &&
+		effectivePositive(a.StatInflightRequests, 100) == effectivePositive(b.StatInflightRequests, 100) &&
 		a.TLS == b.TLS &&
-		a.InsecureTLS == b.InsecureTLS &&
-		a.ProxyURL == b.ProxyURL &&
+		(!a.TLS || a.InsecureTLS == b.InsecureTLS) &&
 		a.KeepaliveIntervalSeconds == b.KeepaliveIntervalSeconds &&
 		a.KeepaliveCommand == b.KeepaliveCommand &&
 		a.UserAgent == b.UserAgent &&
 		a.QuotaBytes == b.QuotaBytes &&
 		a.QuotaPeriodHours == b.QuotaPeriodHours &&
-		boolPtrEqual(a.Enabled, b.Enabled) &&
-		boolPtrEqual(a.IsBackupProvider, b.IsBackupProvider)
+		boolValue(a.IsBackupProvider) == boolValue(b.IsBackupProvider)
 }
 
-// boolPtrEqual safely compares two *bool values.
-func boolPtrEqual(a, b *bool) bool {
-	if a == nil && b == nil {
-		return true
+func effectivePositive(value, fallback int) int {
+	if value <= 0 {
+		return fallback
 	}
-	if a == nil || b == nil {
-		return false
-	}
-	return *a == *b
+	return value
 }
 
-// ProvidersOrderChanged returns true if the provider order differs between
-// this config and another, even if the set of providers is unchanged.
-func (c *Config) ProvidersOrderChanged(other *Config) bool {
-	if len(c.Providers) != len(other.Providers) {
-		return false // different lengths are handled by ProvidersDiff
-	}
-	for i := range c.Providers {
-		if c.Providers[i].ID != other.Providers[i].ID {
-			return true
-		}
-	}
-	return false
+func boolValue(value *bool) bool {
+	return value != nil && *value
 }
 
-// ProvidersEqual compares the providers in this config with another config for equality
+// ProvidersEqual reports whether the ordered enabled transport projection is
+// unchanged. Disabled-only edits and display/telemetry changes retain the live
+// physical generation.
 func (c *Config) ProvidersEqual(other *Config) bool {
-	if len(c.Providers) != len(other.Providers) {
-		return false
+	if c == nil || other == nil {
+		return c == other
 	}
-
-	// Create maps for comparison (using ID as key for proper matching)
-	oldMap := make(map[string]ProviderConfig)
-	newMap := make(map[string]ProviderConfig)
-
-	for _, provider := range c.Providers {
-		oldMap[provider.ID] = provider
-	}
-
-	for _, provider := range other.Providers {
-		newMap[provider.ID] = provider
-	}
-
-	// Check if all old providers exist in new config and are identical
-	for id, oldProvider := range oldMap {
-		newProvider, exists := newMap[id]
-		if !exists {
-			return false // Provider removed
+	for oldIndex, newIndex := 0, 0; ; oldIndex, newIndex = oldIndex+1, newIndex+1 {
+		for oldIndex < len(c.Providers) && !boolValue(c.Providers[oldIndex].Enabled) {
+			oldIndex++
 		}
-
-		// Compare all fields
-		if oldProvider.ID != newProvider.ID ||
-			oldProvider.Host != newProvider.Host ||
-			oldProvider.Port != newProvider.Port ||
-			oldProvider.Username != newProvider.Username ||
-			oldProvider.Password != newProvider.Password ||
-			oldProvider.MaxConnections != newProvider.MaxConnections ||
-			oldProvider.TLS != newProvider.TLS ||
-			oldProvider.InsecureTLS != newProvider.InsecureTLS ||
-			oldProvider.ProxyURL != newProvider.ProxyURL ||
-			*oldProvider.Enabled != *newProvider.Enabled ||
-			*oldProvider.IsBackupProvider != *newProvider.IsBackupProvider {
-			return false // Provider modified
+		for newIndex < len(other.Providers) && !boolValue(other.Providers[newIndex].Enabled) {
+			newIndex++
+		}
+		oldDone := oldIndex == len(c.Providers)
+		newDone := newIndex == len(other.Providers)
+		if oldDone || newDone {
+			return oldDone && newDone
+		}
+		oldProvider := c.Providers[oldIndex]
+		newProvider := other.Providers[newIndex]
+		if oldProvider.ID != newProvider.ID || !providersFieldsEqual(oldProvider, newProvider) {
+			return false
 		}
 	}
-
-	// Check if any new providers were added
-	for id := range newMap {
-		if _, exists := oldMap[id]; !exists {
-			return false // Provider added
-		}
-	}
-
-	return true // All providers are identical
 }
 
 // ToNNTPProviders converts ProviderConfig slice to nntppool.Provider slice (enabled only)
@@ -1269,22 +1147,50 @@ type ChangeCallback func(oldConfig, newConfig *Config)
 // ConfigGetter represents a function that returns the current configuration
 type ConfigGetter func() *Config
 
+// ConfigSnapshot is an immutable point-in-time manager view.
+type ConfigSnapshot struct {
+	Revision uint64
+	Config   *Config
+}
+
+// ErrConfigConflict indicates that a compare-and-swap revision is stale.
+var ErrConfigConflict = errors.New("configuration revision conflict")
+
+// PreparedChange stages a runtime change before persistence. Commit runs after
+// persistence while readers still observe the old config; Abort rolls back a
+// staged change when preparation or persistence fails.
+type PreparedChange struct {
+	Commit func()
+	Abort  func()
+}
+
+// PrecommitFunc prepares dependent runtime state for a configuration change.
+type PrecommitFunc func(context.Context, *Config, *Config) (PreparedChange, error)
+
 // Manager manages configuration state and persistence
 type Manager struct {
-	current           *Config
-	configFile        string
-	mutex             sync.RWMutex
-	callbacks         []ChangeCallback
-	needsLibrarySync  bool
-	previousMountPath string
-	librarySyncMutex  sync.RWMutex
+	current                *Config
+	revision               uint64
+	configFile             string
+	mutex                  sync.RWMutex
+	transactionMutex       sync.Mutex
+	callbacks              []ChangeCallback
+	precommit              PrecommitFunc
+	providerIdentitySource ProviderIdentitySource
+	persist                func(*Config, string) error
+	newProviderID          func() string
+	needsLibrarySync       bool
+	previousMountPath      string
+	librarySyncMutex       sync.RWMutex
 }
 
 // NewManager creates a new configuration manager
 func NewManager(config *Config, configFile string) *Manager {
 	return &Manager{
-		current:    config,
-		configFile: configFile,
+		current:       config.DeepCopy(),
+		revision:      1,
+		configFile:    configFile,
+		newProviderID: uuid.NewString,
 	}
 }
 
@@ -1292,7 +1198,7 @@ func NewManager(config *Config, configFile string) *Manager {
 func (m *Manager) GetConfig() *Config {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-	return m.current
+	return m.current.DeepCopy()
 }
 
 // GetConfigGetter returns a function that provides the current configuration
@@ -1300,33 +1206,125 @@ func (m *Manager) GetConfigGetter() ConfigGetter {
 	return m.GetConfig
 }
 
-// UpdateConfig updates the current configuration (thread-safe)
-func (m *Manager) UpdateConfig(config *Config) error {
-	m.mutex.Lock()
-	// Take a deep copy of the old config so callbacks get an immutable snapshot
-	var oldConfig *Config
-	if m.current != nil {
-		oldConfig = m.current.DeepCopy()
+// Snapshot returns an isolated revisioned manager view.
+func (m *Manager) Snapshot() (ConfigSnapshot, error) {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	if m.current == nil {
+		return ConfigSnapshot{}, fmt.Errorf("no configuration loaded")
+	}
+	return ConfigSnapshot{Revision: m.revision, Config: m.current.DeepCopy()}, nil
+}
+
+// CompareAndSwap validates, prepares, persists, commits, and publishes one
+// serialized configuration revision.
+func (m *Manager) CompareAndSwap(ctx context.Context, expectedRevision uint64, candidate *Config) (ConfigSnapshot, error) {
+	m.transactionMutex.Lock()
+	defer m.transactionMutex.Unlock()
+	return m.compareAndSwap(ctx, expectedRevision, candidate)
+}
+
+func (m *Manager) compareAndSwap(ctx context.Context, expectedRevision uint64, candidate *Config) (ConfigSnapshot, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mutex.RLock()
+	actualRevision := m.revision
+	oldConfig := m.current.DeepCopy()
+	precommit := m.precommit
+	identitySource := m.providerIdentitySource
+	persist := m.persist
+	newProviderID := m.newProviderID
+	configFile := m.configFile
+	m.mutex.RUnlock()
+
+	currentSnapshot := func() ConfigSnapshot {
+		return ConfigSnapshot{Revision: actualRevision, Config: oldConfig.DeepCopy()}
+	}
+	if expectedRevision != actualRevision {
+		return currentSnapshot(), fmt.Errorf("%w: expected %d, actual %d", ErrConfigConflict, expectedRevision, actualRevision)
+	}
+	if candidate == nil {
+		return currentSnapshot(), fmt.Errorf("configuration candidate is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return currentSnapshot(), err
+	}
+	working := candidate.DeepCopy()
+	if newProviderID == nil {
+		newProviderID = uuid.NewString
+	}
+	if err := resolveProviderIDs(ctx, working, identitySource, newProviderID); err != nil {
+		return currentSnapshot(), err
+	}
+	if err := validateConfigUpdate(oldConfig, working); err != nil {
+		return currentSnapshot(), err
+	}
+	if err := ctx.Err(); err != nil {
+		return currentSnapshot(), err
 	}
 
-	// Detect mount_path changes
-	if oldConfig != nil && oldConfig.MountPath != config.MountPath {
+	prepared := PreparedChange{}
+	if precommit != nil {
+		var err error
+		prepared, err = precommit(ctx, oldConfig.DeepCopy(), working.DeepCopy())
+		if err != nil {
+			if prepared.Abort != nil {
+				prepared.Abort()
+			}
+			return currentSnapshot(), err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		if prepared.Abort != nil {
+			prepared.Abort()
+		}
+		return currentSnapshot(), err
+	}
+	if persist != nil || configFile != "" {
+		if persist == nil {
+			persist = SaveToFile
+		}
+		if err := persist(working.DeepCopy(), configFile); err != nil {
+			if prepared.Abort != nil {
+				prepared.Abort()
+			}
+			return currentSnapshot(), err
+		}
+	}
+	if prepared.Commit != nil {
+		prepared.Commit()
+	}
+
+	m.mutex.Lock()
+	if oldConfig != nil && oldConfig.MountPath != working.MountPath {
 		m.librarySyncMutex.Lock()
 		m.needsLibrarySync = true
 		m.previousMountPath = oldConfig.MountPath
 		m.librarySyncMutex.Unlock()
 	}
-
-	m.current = config
-	callbacks := make([]ChangeCallback, len(m.callbacks))
-	copy(callbacks, m.callbacks)
+	m.current = working
+	m.revision++
+	callbacks := append([]ChangeCallback(nil), m.callbacks...)
+	result := ConfigSnapshot{Revision: m.revision, Config: working.DeepCopy()}
 	m.mutex.Unlock()
 
-	// Notify callbacks after releasing the lock
 	for _, callback := range callbacks {
-		callback(oldConfig, config)
+		callback(oldConfig.DeepCopy(), working.DeepCopy())
 	}
-	return nil
+	return result, nil
+}
+
+// UpdateConfig retains the compatibility API while using the same serialized
+// transaction as CompareAndSwap.
+func (m *Manager) UpdateConfig(config *Config) error {
+	m.transactionMutex.Lock()
+	defer m.transactionMutex.Unlock()
+	m.mutex.RLock()
+	revision := m.revision
+	m.mutex.RUnlock()
+	_, err := m.compareAndSwap(context.Background(), revision, config)
+	return err
 }
 
 // OnConfigChange registers a callback to be called when configuration changes
@@ -1336,17 +1334,35 @@ func (m *Manager) OnConfigChange(callback ChangeCallback) {
 	m.callbacks = append(m.callbacks, callback)
 }
 
+// SetPrecommit installs the single runtime preparation hook.
+func (m *Manager) SetPrecommit(precommit PrecommitFunc) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.precommit = precommit
+}
+
+// SetProviderIdentitySource installs the retained provider identity source.
+func (m *Manager) SetProviderIdentitySource(source ProviderIdentitySource) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.providerIdentitySource = source
+}
+
 // ValidateConfigUpdate validates configuration updates with additional restrictions
 func (m *Manager) ValidateConfigUpdate(newConfig *Config) error {
-	// First run standard validation
+	m.mutex.RLock()
+	currentConfig := m.current.DeepCopy()
+	m.mutex.RUnlock()
+	if newConfig == nil {
+		return fmt.Errorf("configuration candidate is required")
+	}
+	return validateConfigUpdate(currentConfig, newConfig.DeepCopy())
+}
+
+func validateConfigUpdate(currentConfig, newConfig *Config) error {
 	if err := newConfig.Validate(); err != nil {
 		return err
 	}
-
-	// Get current config for comparison
-	m.mutex.RLock()
-	currentConfig := m.current
-	m.mutex.RUnlock()
 
 	if currentConfig != nil {
 		// Protect WebDAV port from API changes
@@ -1363,33 +1379,34 @@ func (m *Manager) ValidateConfigUpdate(newConfig *Config) error {
 		if newConfig.Metadata.RootPath != currentConfig.Metadata.RootPath {
 			return fmt.Errorf("metadata root_path cannot be changed via API - requires server restart")
 		}
-
 	}
-
 	return nil
 }
 
 // ValidateConfig validates the configuration using existing validation logic
 func (m *Manager) ValidateConfig(config *Config) error {
-	return config.Validate()
+	if config == nil {
+		return fmt.Errorf("configuration candidate is required")
+	}
+	return config.DeepCopy().Validate()
 }
 
 // ReloadConfig reloads configuration from file
 func (m *Manager) ReloadConfig() error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+	m.transactionMutex.Lock()
+	defer m.transactionMutex.Unlock()
 
-	// Set the config file for viper
-	viper.SetConfigFile(m.configFile)
+	v := viper.New()
+	v.SetConfigFile(m.configFile)
 
 	// Read the configuration file
-	if err := viper.ReadInConfig(); err != nil {
+	if err := v.ReadInConfig(); err != nil {
 		return fmt.Errorf("error reading config file %s: %w", m.configFile, err)
 	}
 
 	// Create default config and unmarshal into it
 	config := DefaultConfig()
-	if err := viper.Unmarshal(config); err != nil {
+	if err := v.Unmarshal(config); err != nil {
 		return fmt.Errorf("error unmarshaling config: %w", err)
 	}
 
@@ -1415,26 +1432,31 @@ func (m *Manager) ReloadConfig() error {
 	// Migrate: fold legacy stuck/allowlist cleanup config into the unified rules.
 	migrateArrsCleanup(config)
 
-	// Validate configuration
-	if err := config.Validate(); err != nil {
-		return fmt.Errorf("config validation failed: %w", err)
-	}
-
-	m.current = config
-	return nil
+	m.mutex.RLock()
+	revision := m.revision
+	m.mutex.RUnlock()
+	_, err := m.compareAndSwap(context.Background(), revision, config)
+	return err
 }
 
 // SaveConfig saves the current configuration to file
 func (m *Manager) SaveConfig() error {
+	m.transactionMutex.Lock()
+	defer m.transactionMutex.Unlock()
 	m.mutex.RLock()
-	config := m.current
+	config := m.current.DeepCopy()
+	persist := m.persist
+	configFile := m.configFile
 	m.mutex.RUnlock()
 
 	if config == nil {
 		return fmt.Errorf("no configuration to save")
 	}
 
-	return SaveToFile(config, m.configFile)
+	if persist == nil {
+		persist = SaveToFile
+	}
+	return persist(config, configFile)
 }
 
 // NeedsLibrarySync returns whether a library sync is needed due to configuration changes
@@ -1785,6 +1807,16 @@ func SaveToFile(config *Config, filename string) error {
 	if filename == "" {
 		return fmt.Errorf("no config file path provided")
 	}
+	if config == nil {
+		return fmt.Errorf("no configuration to save")
+	}
+
+	// Marshal before touching the destination so serialization failures leave
+	// the existing file unchanged.
+	data, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
 
 	// Ensure the directory exists
 	dir := filepath.Dir(filename)
@@ -1792,15 +1824,53 @@ func SaveToFile(config *Config, filename string) error {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
-	// Marshal config to YAML
-	data, err := yaml.Marshal(config)
+	// Write and sync a temporary file in the destination directory, then replace
+	// the destination with one atomic rename. Syncing the directory makes the
+	// rename durable across a crash.
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(filename)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
+		return fmt.Errorf("failed to create temporary config file: %w", err)
 	}
+	tempName := temp.Name()
+	tempClosed := false
+	defer func() {
+		if !tempClosed {
+			_ = temp.Close()
+		}
+		_ = os.Remove(tempName)
+	}()
 
-	// Write to file
-	if err := os.WriteFile(filename, data, 0644); err != nil {
-		return fmt.Errorf("failed to write config file: %w", err)
+	mode := os.FileMode(0644)
+	if info, statErr := os.Stat(filename); statErr == nil {
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(statErr) {
+		return fmt.Errorf("failed to inspect existing config file: %w", statErr)
+	}
+	if err := temp.Chmod(mode); err != nil {
+		return fmt.Errorf("failed to set temporary config permissions: %w", err)
+	}
+	if _, err := temp.Write(data); err != nil {
+		return fmt.Errorf("failed to write temporary config file: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("failed to sync temporary config file: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		tempClosed = true
+		return fmt.Errorf("failed to close temporary config file: %w", err)
+	}
+	tempClosed = true
+
+	directory, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("failed to open config directory for sync: %w", err)
+	}
+	defer directory.Close()
+	if err := os.Rename(tempName, filename); err != nil {
+		return fmt.Errorf("failed to replace config file: %w", err)
+	}
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("failed to sync config directory: %w", err)
 	}
 
 	return nil

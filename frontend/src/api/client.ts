@@ -809,7 +809,7 @@ class APIClient {
 
 	async testProviderSpeed(id: string) {
 		return this.request<{ speed_mbps: number; duration_seconds: number }>(
-			`/providers/${id}/speedtest`,
+			`/providers/${encodeURIComponent(id)}/speedtest`,
 			{
 				method: "POST",
 			},
@@ -817,9 +817,12 @@ class APIClient {
 	}
 
 	async tuneProviderPipeline(id: string) {
-		return this.request<PipelineTuneResponse>(`/providers/${id}/tune-pipeline`, {
-			method: "POST",
-		});
+		return this.request<PipelineTuneResponse>(
+			`/providers/${encodeURIComponent(id)}/tune-pipeline`,
+			{
+				method: "POST",
+			},
+		);
 	}
 
 	async createProvider(data: ProviderCreateRequest) {
@@ -830,20 +833,20 @@ class APIClient {
 	}
 
 	async updateProvider(id: string, data: Partial<ProviderUpdateRequest>) {
-		return this.request<ProviderConfig>(`/providers/${id}`, {
+		return this.request<ProviderConfig>(`/providers/${encodeURIComponent(id)}`, {
 			method: "PUT",
 			body: JSON.stringify(data),
 		});
 	}
 
 	async deleteProvider(id: string) {
-		return this.request<{ message: string }>(`/providers/${id}`, {
+		return this.request<{ message: string }>(`/providers/${encodeURIComponent(id)}`, {
 			method: "DELETE",
 		});
 	}
 
 	async resetProviderQuota(id: string) {
-		return this.request<{ message: string }>(`/providers/${id}/reset-quota`, {
+		return this.request<{ message: string }>(`/providers/${encodeURIComponent(id)}/reset-quota`, {
 			method: "POST",
 		});
 	}

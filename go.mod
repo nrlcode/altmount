@@ -19,7 +19,7 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jackc/pgx/v5 v5.8.0
-	github.com/javi11/nntppool/v4 v4.13.1-0.20260714053636-49743ecb899b
+	github.com/javi11/nntppool/v4 v4.13.1-0.20260718155437-e820af2ca470
 	github.com/javi11/nxg v0.1.0
 	github.com/javi11/nzbparser v0.5.4
 	github.com/javi11/rardecode/v2 v2.1.2-0.20260610075131-4664d7a7325a
@@ -49,7 +49,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-replace github.com/javi11/nntppool/v4 => github.com/nrlcode/nntppool/v4 v4.13.1-0.20260714053636-49743ecb899b
+replace github.com/javi11/nntppool/v4 => github.com/nrlcode/nntppool/v4 v4.13.1-0.20260718155437-e820af2ca470
 
 require (
 	codeberg.org/polyfloyd/go-errorlint v1.9.0 // indirect
