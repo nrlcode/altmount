@@ -38,6 +38,7 @@ type facoreGeneration struct {
 	closeCalls  atomic.Int32
 	statCalls   atomic.Int32
 	restoreCall atomic.Int32
+	resetCalls  atomic.Int32
 	speedEnter  chan struct{}
 }
 
@@ -132,7 +133,10 @@ func (g *facoreGeneration) Close() error {
 	return nil
 }
 
-func (g *facoreGeneration) ResetProviderQuota(string) error { return nil }
+func (g *facoreGeneration) ResetProviderQuota(string) error {
+	g.resetCalls.Add(1)
+	return nil
+}
 
 func facoreManager(t *testing.T, repo StatsRepository, generations ...*facoreGeneration) *manager {
 	t.Helper()
@@ -454,4 +458,19 @@ func TestFACORECHG003ClearPoolAfterManagerContextCancellation(t *testing.T) {
 	require.NoError(t, m.ClearPool())
 	require.False(t, m.HasPool())
 	require.Equal(t, int32(1), old.closeCalls.Load())
+}
+
+func TestFACORECHG003ResetProviderQuotaRejectsOperationalAlias(t *testing.T) {
+	const providerID = "stable-account-id"
+	const alias = "news.invalid:563+account"
+	generation := newFACOREGeneration("generation", nntppool.ProviderStats{
+		Name: alias, ProviderID: providerID, QuotaBytes: 100,
+	})
+	m := facoreManager(t, nil, generation)
+	require.NoError(t, m.SetProviders(facoreProviders(providerID)))
+
+	require.Error(t, m.ResetProviderQuota(context.Background(), alias))
+	require.Zero(t, generation.resetCalls.Load(), "alias reset reached the core quota authority")
+	require.NoError(t, m.ResetProviderQuota(context.Background(), providerID))
+	require.Equal(t, int32(1), generation.resetCalls.Load())
 }
