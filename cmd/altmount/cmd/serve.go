@@ -16,7 +16,6 @@ import (
 	"github.com/javi11/altmount/frontend"
 	"github.com/javi11/altmount/internal/api"
 	"github.com/javi11/altmount/internal/arrs"
-	"github.com/javi11/altmount/internal/stremio"
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/health"
 	"github.com/javi11/altmount/internal/metadata"
@@ -25,6 +24,7 @@ import (
 	"github.com/javi11/altmount/internal/progress"
 	"github.com/javi11/altmount/internal/rclone"
 	"github.com/javi11/altmount/internal/slogutil"
+	"github.com/javi11/altmount/internal/stremio"
 	"github.com/javi11/altmount/internal/webdav"
 	"github.com/spf13/cobra"
 )
@@ -65,8 +65,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	configManager := config.NewManager(cfg, configFile)
-
 	// 3. Initialize core services
 	db, err := initializeDatabase(ctx, cfg)
 	if err != nil {
@@ -83,11 +81,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	repos := setupRepositories(ctx, db)
 	poolManager := pool.NewManager(ctx, repos.MainRepo)
+	configManager := config.NewManager(cfg, configFile)
+	configManager.SetProviderIdentitySource(repos.ProviderIdentityRepo)
 
-	metadataService, metadataReader := initializeMetadata(cfg)
-
-	// 4. Setup network services
-	if err := setupNNTPPool(ctx, cfg, poolManager); err != nil {
+	// Commit the initial provider configuration through the same authority used
+	// by runtime writes before any provider-dependent service is constructed.
+	cfg, err = setupNNTPPool(ctx, configManager, poolManager)
+	if err != nil {
 		return err
 	}
 	defer func() {
@@ -97,6 +97,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	metadataService, metadataReader := initializeMetadata(cfg)
+
+	// 4. Setup network services
 	mountService := rclone.NewMountService(configManager)
 
 	var rcloneRCClient = setupRCloneClient(ctx, cfg, configManager)
@@ -168,7 +171,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	setupSPARoutes(app)
 
 	// 7. Register config change handlers
-	pool.RegisterConfigHandlers(ctx, configManager, poolManager)
 	webdav.RegisterConfigHandlers(ctx, configManager, webdavHandler)
 	api.RegisterLogLevelHandler(ctx, configManager, debugMode, dynamicLeveler)
 	apiServer.RegisterFuseConfigChangeHandler(configManager)

@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"testing"
@@ -24,9 +25,13 @@ func (m *mockConfigManager) GetConfigGetter() config.ConfigGetter {
 	return m.GetConfig
 }
 
-func (m *mockConfigManager) UpdateConfig(cfg *config.Config) error {
-	m.cfg = cfg
-	return nil
+func (m *mockConfigManager) Snapshot() (config.ConfigSnapshot, error) {
+	return config.ConfigSnapshot{Config: m.cfg.DeepCopy(), Revision: 1}, nil
+}
+
+func (m *mockConfigManager) CompareAndSwap(_ context.Context, _ uint64, cfg *config.Config) (config.ConfigSnapshot, error) {
+	m.cfg = cfg.DeepCopy()
+	return config.ConfigSnapshot{Config: m.cfg.DeepCopy(), Revision: 2}, nil
 }
 
 func (m *mockConfigManager) ReloadConfig() error {
@@ -42,10 +47,6 @@ func (m *mockConfigManager) ValidateConfigUpdate(cfg *config.Config) error {
 }
 
 func (m *mockConfigManager) OnConfigChange(callback config.ChangeCallback) {
-}
-
-func (m *mockConfigManager) SaveConfig() error {
-	return nil
 }
 
 func (m *mockConfigManager) NeedsLibrarySync() bool {
@@ -245,4 +246,3 @@ func TestHandleArrsWebhook_WithInstanceName(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, true, result["success"])
 }
-

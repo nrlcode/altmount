@@ -2,9 +2,7 @@ package database
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -12,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	appconfig "github.com/javi11/altmount/internal/config"
 )
 
 var (
@@ -165,8 +164,7 @@ func (r *HealthStateRepository) ListFileRevisions(ctx context.Context, filePath 
 func normalizeProviderSpec(spec ProviderSpec) (ProviderSpec, string, error) {
 	spec.StableID = strings.TrimSpace(spec.StableID)
 	spec.DisplayName = strings.TrimSpace(spec.DisplayName)
-	spec.Endpoint = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(spec.Endpoint)), ".")
-	spec.Account = strings.TrimSpace(spec.Account)
+	spec.Endpoint, spec.Account = appconfig.NormalizeProviderIdentity(spec.Endpoint, spec.Account)
 	if spec.DisplayName == "" || spec.Endpoint == "" {
 		return ProviderSpec{}, "", fmt.Errorf("provider display name and endpoint are required")
 	}
@@ -179,9 +177,11 @@ func normalizeProviderSpec(spec ProviderSpec) (ProviderSpec, string, error) {
 	if spec.Order < 0 {
 		return ProviderSpec{}, "", fmt.Errorf("provider order must be non-negative")
 	}
-	identity := sha256.New()
-	fmt.Fprintf(identity, "%d:%s|%d|%d:%s", len(spec.Endpoint), spec.Endpoint, spec.Port, len(spec.Account), spec.Account)
-	return spec, "sha256:" + hex.EncodeToString(identity.Sum(nil)), nil
+	identity, err := appconfig.ProviderIdentityFingerprint(spec.Endpoint, spec.Port, spec.Account)
+	if err != nil {
+		return ProviderSpec{}, "", err
+	}
+	return spec, identity, nil
 }
 
 func (r *HealthStateRepository) ReconcileProviders(ctx context.Context, specs []ProviderSpec) ([]HealthProvider, error) {

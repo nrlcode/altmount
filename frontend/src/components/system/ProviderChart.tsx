@@ -32,14 +32,16 @@ export function ProviderChart() {
 
 	const { data: response, isLoading } = useProviderHistoricalStats(days, interval);
 
-	const { chartData, providers, totalUsage } = useMemo(() => {
+	const { chartData, providers, providerLabels, totalUsage } = useMemo(() => {
 		const groupedByTime: Record<string, ChartDatum> = {};
 		const pTotals: Record<string, number> = {};
+		const labels: Record<string, string> = {};
 		let total = 0;
 
 		if (poolData?.providers) {
 			poolData.providers.forEach((p: ProviderStatus) => {
-				pTotals[p.host] = 0;
+				pTotals[p.id] = 0;
+				labels[p.id] = p.name || p.host || p.id;
 			});
 		}
 
@@ -57,18 +59,15 @@ export function ProviderChart() {
 					timeLabel = dateObj.toLocaleString(undefined, { month: "short", year: "2-digit" });
 				}
 
-				const provider = poolData?.providers?.find(
-					(p: ProviderStatus) => p.id === stat.provider_id || stat.provider_id.startsWith(p.host),
-				);
-				const normalizedID = provider ? provider.host : stat.provider_id.split(":")[0];
+				const providerID = stat.provider_id;
 
 				if (!groupedByTime[timeKey]) groupedByTime[timeKey] = { name: timeLabel };
 
-				const currentVal = groupedByTime[timeKey][normalizedID];
-				groupedByTime[timeKey][normalizedID] =
+				const currentVal = groupedByTime[timeKey][providerID];
+				groupedByTime[timeKey][providerID] =
 					(typeof currentVal === "number" ? currentVal : 0) + stat.bytes_downloaded;
 
-				pTotals[normalizedID] = (pTotals[normalizedID] || 0) + stat.bytes_downloaded;
+				pTotals[providerID] = (pTotals[providerID] || 0) + stat.bytes_downloaded;
 				total += stat.bytes_downloaded;
 			}
 		}
@@ -78,6 +77,7 @@ export function ProviderChart() {
 		return {
 			chartData: Object.values(groupedByTime),
 			providers: sortedProviders,
+			providerLabels: labels,
 			totalUsage: total,
 		};
 	}, [response, interval, poolData]);
@@ -85,7 +85,7 @@ export function ProviderChart() {
 	const colorMap = useMemo(
 		() =>
 			buildProviderColorMap([
-				...(poolData?.providers ?? []).map((p: ProviderStatus) => p.host),
+				...(poolData?.providers ?? []).map((p: ProviderStatus) => p.id),
 				...providers,
 			]),
 		[poolData, providers],
@@ -113,6 +113,7 @@ export function ProviderChart() {
 			chartData={chartData}
 			providers={providers}
 			colorMap={colorMap}
+			providerLabels={providerLabels}
 			gradientPrefix="color"
 			formatValue={formatDecimalBytes}
 			tooltipTotalClassName="text-info"

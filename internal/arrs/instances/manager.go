@@ -14,7 +14,7 @@ import (
 	"golift.io/starr/radarr"
 	"golift.io/starr/readarr"
 	"golift.io/starr/sonarr"
-	)
+)
 
 type Manager struct {
 	configGetter  config.ConfigGetter
@@ -30,7 +30,10 @@ func NewManager(configGetter config.ConfigGetter, configManager model.ConfigMana
 
 // GetAllInstances returns all arrs instances from current configuration
 func (m *Manager) GetAllInstances() []*model.ConfigInstance {
-	cfg := m.configGetter()
+	return instancesFromConfig(m.configGetter())
+}
+
+func instancesFromConfig(cfg *config.Config) []*model.ConfigInstance {
 	instances := make([]*model.ConfigInstance, 0)
 
 	// Convert Radarr instances
@@ -167,35 +170,30 @@ func (m *Manager) RegisterInstance(ctx context.Context, arrURL, apiKey string) (
 		return false, fmt.Errorf("failed to detect ARR type: %w", err)
 	}
 
-	// Determine category based on ARR type
-	var category string
-	
-	// Check if instance already exists in config to respect pre-configured category
-	existingInstances := m.GetAllInstances()
-	found := false
-	for _, inst := range existingInstances {
-		if normalizeURL(inst.URL) == normalizeURL(arrURL) {
-			category = inst.Category
-			found = true
-			break
-		}
+	base, err := m.configManager.Snapshot()
+	if err != nil {
+		return false, fmt.Errorf("snapshot configuration: %w", err)
+	}
+	if instanceExistsByURLInConfig(base.Config, arrURL) {
+		slog.DebugContext(ctx, "ARR instance was registered concurrently, skipping registration", "url", arrURL)
+		return false, nil
 	}
 
-	if !found {
-		switch arrType {
-		case "radarr":
-			category = "movies"
-		case "sonarr":
-			category = "tv"
-		case "lidarr":
-			category = "music"
-		case "readarr":
-			category = "books"
-		case "whisparr":
-			category = "movies"
-		default:
-			return false, fmt.Errorf("unsupported ARR type: %s", arrType)
-		}
+	// Determine category based on ARR type.
+	var category string
+	switch arrType {
+	case "radarr":
+		category = "movies"
+	case "sonarr":
+		category = "tv"
+	case "lidarr":
+		category = "music"
+	case "readarr":
+		category = "books"
+	case "whisparr":
+		category = "movies"
+	default:
+		return false, fmt.Errorf("unsupported ARR type: %s", arrType)
 	}
 
 	// Generate instance name
@@ -205,7 +203,7 @@ func (m *Manager) RegisterInstance(ctx context.Context, arrURL, apiKey string) (
 	}
 
 	// If default category is already used by another instance, generate a unique one
-	if m.categoryUsedByOtherInstance(arrType, category) {
+	if categoryUsedByOtherInstance(base.Config, arrType, category) {
 		category = fmt.Sprintf("%s-%s", category, instanceName)
 	}
 
@@ -215,9 +213,7 @@ func (m *Manager) RegisterInstance(ctx context.Context, arrURL, apiKey string) (
 		"url", arrURL,
 		"category", category)
 
-	// Get current config and make a deep copy
-	currentConfig := m.configManager.GetConfig()
-	newConfig := currentConfig.DeepCopy()
+	newConfig := base.Config
 
 	// Create new instance config
 	enabled := true
@@ -248,13 +244,8 @@ func (m *Manager) RegisterInstance(ctx context.Context, arrURL, apiKey string) (
 	// Create category for this ARR type
 	m.ensureCategoryExistsInConfig(ctx, newConfig, category)
 
-	// Update and save configuration
-	if err := m.configManager.UpdateConfig(newConfig); err != nil {
-		return false, fmt.Errorf("failed to update configuration: %w", err)
-	}
-
-	if err := m.configManager.SaveConfig(); err != nil {
-		return false, fmt.Errorf("failed to save configuration: %w", err)
+	if _, err := m.configManager.CompareAndSwap(ctx, base.Revision, newConfig); err != nil {
+		return false, fmt.Errorf("commit configuration: %w", err)
 	}
 
 	slog.InfoContext(ctx, "Successfully registered ARR instance",
@@ -378,8 +369,12 @@ func (m *Manager) generateInstanceName(rawURL string) (string, error) {
 
 // instanceExistsByURL checks if an instance with the given URL already exists
 func (m *Manager) instanceExistsByURL(checkURL string) bool {
+	return instanceExistsByURLInConfig(m.configGetter(), checkURL)
+}
+
+func instanceExistsByURLInConfig(cfg *config.Config, checkURL string) bool {
 	normalizedCheck := normalizeURL(checkURL)
-	instances := m.GetAllInstances()
+	instances := instancesFromConfig(cfg)
 
 	for _, instance := range instances {
 		normalizedInstance := normalizeURL(instance.URL)
@@ -396,9 +391,8 @@ func normalizeURL(rawURL string) string {
 }
 
 // categoryUsedByOtherInstance checks if a category is already used by another instance of the same type
-func (m *Manager) categoryUsedByOtherInstance(arrType, category string) bool {
+func categoryUsedByOtherInstance(cfg *config.Config, arrType, category string) bool {
 	var instances []config.ArrsInstanceConfig
-	cfg := m.configManager.GetConfig()
 
 	switch arrType {
 	case "radarr":
@@ -411,8 +405,6 @@ func (m *Manager) categoryUsedByOtherInstance(arrType, category string) bool {
 		instances = cfg.Arrs.ReadarrInstances
 	case "whisparr":
 		instances = cfg.Arrs.WhisparrInstances
-	case "sportarr":
-		instances = cfg.Arrs.SportarrInstances
 	}
 
 	for _, instance := range instances {
@@ -429,8 +421,6 @@ func (m *Manager) categoryUsedByOtherInstance(arrType, category string) bool {
 				instanceCat = "books"
 			case "whisparr":
 				instanceCat = "movies"
-			case "sportarr":
-				instanceCat = "sports"
 			}
 		}
 

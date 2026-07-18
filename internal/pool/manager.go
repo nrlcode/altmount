@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/nntppool/v4"
 )
 
@@ -47,20 +47,9 @@ type Manager interface {
 	// IncArticlesPosted increments the count of articles successfully posted
 	IncArticlesPosted()
 
-	// AddProvider adds a single provider to the running pool.
-	// If no pool exists, a new one is created with this provider.
-	AddProvider(provider nntppool.Provider) error
-
-	// RemoveProvider removes a provider by its nntppool name (host:port or host:port+username).
-	// If the last provider is removed, the pool is closed.
-	RemoveProvider(name string) error
-
 	// ResetProviderQuota resets the download quota counter for a provider,
 	// clearing its consumed-bytes counter and exceeded flag in-place.
-	ResetProviderQuota(ctx context.Context, poolName string) error
-
-	// SetProviderIDs sets a mapping between pool names and configuration IDs.
-	SetProviderIDs(mapping map[string]string)
+	ResetProviderQuota(ctx context.Context, providerID string) error
 
 	// AcquireImportSlot blocks until an admission slot is available for an
 	// NZB import to start, or ctx is cancelled. The returned release function
@@ -112,76 +101,77 @@ type StatsRepository interface {
 // manager implements the Manager interface
 type manager struct {
 	mu               sync.RWMutex
-	pool             *nntppool.Client
+	transitionMu     sync.Mutex
+	facade           *leasedClient
 	metricsTracker   *MetricsTracker
-	providerIDMap    map[string]string
 	repo             StatsRepository
 	ctx              context.Context
 	logger           *slog.Logger
 	quotaWatchCancel context.CancelFunc
 	admission        *ImportAdmission
 	budget           *ImportBudget
+	newClient        func(context.Context, []nntppool.Provider) (generationClient, error)
+	handoverTimeout  time.Duration
 }
+
+const defaultHandoverTimeout = 30 * time.Second
 
 // NewManager creates a new pool manager
 func NewManager(ctx context.Context, repo StatsRepository) Manager {
 	return &manager{
-		ctx:       ctx,
-		repo:      repo,
-		logger:    slog.Default().With("component", "pool"),
-		admission: NewImportAdmission(),
-		budget:    NewImportBudget(),
+		ctx:             ctx,
+		repo:            repo,
+		logger:          slog.Default().With("component", "pool"),
+		facade:          &leasedClient{},
+		admission:       NewImportAdmission(),
+		budget:          NewImportBudget(),
+		newClient:       newGenerationClient,
+		handoverTimeout: defaultHandoverTimeout,
 	}
 }
 
-// providerPoolName returns the lookup key nntppool uses for a provider.
-func providerPoolName(p nntppool.Provider) string {
-	name := p.Host
-	if p.Auth.Username != "" {
-		name += "+" + p.Auth.Username
-	}
-	return name
+func newGenerationClient(ctx context.Context, providers []nntppool.Provider) (generationClient, error) {
+	return nntppool.NewClient(
+		ctx,
+		providers,
+		nntppool.WithDispatchStrategy(nntppool.DispatchFIFO),
+		nntppool.WithStatProbe(false),
+		nntppool.WithProviderCircuitBreaker(true),
+	)
 }
 
 // injectQuotaState loads persisted quota counters from the database and sets
 // QuotaUsed / QuotaResetAt on each provider so nntppool can resume quota
 // tracking across restarts.
-func (m *manager) injectQuotaState(providers []nntppool.Provider) {
+func (m *manager) injectQuotaState(ctx context.Context, providers []nntppool.Provider) {
 	if m.repo == nil {
 		return
 	}
 
-	stats, err := m.repo.GetSystemStats(m.ctx)
+	stats, err := m.repo.GetSystemStats(ctx)
 	if err != nil {
-		m.logger.ErrorContext(m.ctx, "Failed to load quota state from database", "error", err)
+		m.logger.ErrorContext(ctx, "Failed to load quota state from database", "error", err)
 		return
 	}
 
-	// Build lookup maps from prefixed keys
-	quotaUsed := make(map[string]int64)
-	quotaResetAt := make(map[string]int64)
-	for k, v := range stats {
-		if after, ok := strings.CutPrefix(k, "quota_used:"); ok {
-			quotaUsed[after] = v
-		} else if after, ok := strings.CutPrefix(k, "quota_reset_at:"); ok {
-			quotaResetAt[after] = v
-		}
-	}
-
+	now := time.Now()
 	for i := range providers {
-		name := providerPoolName(providers[i])
+		providerID := providers[i].ID
+		if providerID == "" {
+			continue
+		}
 
 		hasResetTime := false
 		var resetTime time.Time
-		if resetNano, ok := quotaResetAt[name]; ok && resetNano > 0 {
+		if resetNano := stats["quota_reset_at:"+providerID]; resetNano > 0 {
 			resetTime = time.Unix(0, resetNano)
 			hasResetTime = true
 		}
 
 		if hasResetTime {
-			if resetTime.After(time.Now()) {
+			if resetTime.After(now) {
 				// The quota period is still active: restore the used bytes and the reset time
-				if used, ok := quotaUsed[name]; ok && used > 0 {
+				if used := stats["quota_used:"+providerID]; used > 0 {
 					providers[i].QuotaUsed = used
 				}
 				providers[i].QuotaResetAt = resetTime
@@ -192,7 +182,7 @@ func (m *manager) injectQuotaState(providers []nntppool.Provider) {
 			}
 		} else {
 			// No persisted reset time: restore whatever usage we have (fallback)
-			if used, ok := quotaUsed[name]; ok && used > 0 {
+			if used := stats["quota_used:"+providerID]; used > 0 {
 				providers[i].QuotaUsed = used
 			}
 		}
@@ -200,107 +190,185 @@ func (m *manager) injectQuotaState(providers []nntppool.Provider) {
 }
 
 // GetPool returns the current connection pool or error if not available.
-// The concrete return type is *nntppool.Client which satisfies NntpClient.
+// Every successful call returns the same manager-owned facade.
 func (m *manager) GetPool() (NntpClient, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if m.pool == nil {
+	if !m.facade.hasGeneration() {
 		return nil, fmt.Errorf("NNTP connection pool not available - no providers configured")
 	}
-
-	return m.pool, nil
+	return m.facade, nil
 }
 
-// SetProviders creates/recreates the pool with new providers
+// SetProviders retains the compatibility API by preparing and immediately
+// committing the same transaction used by configuration persistence.
 func (m *manager) SetProviders(providers []nntppool.Provider) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// An empty provider list is an explicit clear operation. Tear down every
-	// lifecycle companion even if a prior partial state left no pool pointer.
-	if len(providers) == 0 {
-		m.stopQuotaWatcher()
-		if m.metricsTracker != nil {
-			m.metricsTracker.Stop()
-			m.metricsTracker = nil
-		}
-		if m.pool != nil {
-			m.logger.InfoContext(m.ctx, "Shutting down existing NNTP connection pool")
-			m.pool.Close()
-			m.pool = nil
-		}
-		m.logger.InfoContext(m.ctx, "No NNTP providers configured - pool cleared")
-		return nil
-	}
-
-	// Restore quota state from DB before creating the pool
-	m.injectQuotaState(providers)
-
-	// Construct and validate the replacement before touching the working pool.
-	// nntppool can reject duplicate identities or an invalid primary/backup
-	// shape; those configuration errors must leave the existing transport live.
-	m.logger.InfoContext(m.ctx, "Creating NNTP connection pool", "provider_count", len(providers))
-	replacement, err := nntppool.NewClient(
-		m.ctx,
-		providers,
-		nntppool.WithDispatchStrategy(nntppool.DispatchFIFO),
-		nntppool.WithStatProbe(false),
-		nntppool.WithProviderCircuitBreaker(true),
-	)
+	prepared, err := m.PrepareProviders(m.ctx, providers)
 	if err != nil {
-		return fmt.Errorf("failed to create NNTP connection pool: %w", err)
+		return err
 	}
-
-	replacementMetrics := NewMetricsTracker(replacement, m.repo)
-	if m.providerIDMap != nil {
-		replacementMetrics.SetProviderIDs(m.providerIDMap)
+	if prepared.Commit != nil {
+		prepared.Commit()
 	}
-
-	// Replacement construction succeeded. Transfer ownership, then retire the
-	// previous pool and tracker exactly once.
-	if m.metricsTracker != nil {
-		m.metricsTracker.Stop()
-	}
-	if m.pool != nil {
-		m.logger.InfoContext(m.ctx, "Shutting down existing NNTP connection pool")
-		m.pool.Close()
-	}
-	m.pool = replacement
-	m.metricsTracker = replacementMetrics
-	m.metricsTracker.Start(m.ctx)
-
-	m.startQuotaWatcher()
-
-	m.logger.InfoContext(m.ctx, "NNTP connection pool created successfully")
 	return nil
+}
+
+// PrepareProviders builds an unpublished generation and stages an atomic
+// handover. The returned Commit or Abort must be invoked exactly once by the
+// caller; both are idempotent to protect compatibility callers.
+func (m *manager) PrepareProviders(ctx context.Context, providers []nntppool.Provider) (config.PreparedChange, error) {
+	m.transitionMu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			m.transitionMu.Unlock()
+		}
+	}()
+
+	var candidate generationClient
+	if len(providers) > 0 {
+		candidateProviders := append([]nntppool.Provider(nil), providers...)
+		m.injectQuotaState(ctx, candidateProviders)
+		m.logger.InfoContext(ctx, "Creating NNTP connection pool", "provider_count", len(candidateProviders))
+		var err error
+		candidate, err = m.newClient(m.ctx, candidateProviders)
+		if err != nil {
+			return config.PreparedChange{}, fmt.Errorf("failed to create NNTP connection pool: %w", err)
+		}
+	}
+
+	old := m.facade.currentGeneration()
+	var oldStats nntppool.ClientStats
+	if old != nil {
+		var drained <-chan struct{}
+		old, drained = m.facade.pause()
+		timeout := m.handoverTimeout
+		if timeout <= 0 {
+			timeout = defaultHandoverTimeout
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, timeout)
+		select {
+		case <-drained:
+			cancel()
+		case <-waitCtx.Done():
+			waitErr := waitCtx.Err()
+			cancel()
+			m.facade.publish(old)
+			if candidate != nil {
+				_ = candidate.Close()
+			}
+			return config.PreparedChange{}, fmt.Errorf("waiting for NNTP handover leases: %w", waitErr)
+		}
+
+		oldStats = old.Stats()
+		if candidate != nil {
+			states := retainedQuotaStates(oldStats, candidate.Stats())
+			if err := candidate.RestoreProviderQuotas(states); err != nil {
+				m.facade.publish(old)
+				_ = candidate.Close()
+				return config.PreparedChange{}, fmt.Errorf("restore provider quota handover: %w", err)
+			}
+		}
+	}
+
+	var once sync.Once
+	finish := func(commit bool) {
+		once.Do(func() {
+			defer m.transitionMu.Unlock()
+			if !commit {
+				if old != nil {
+					m.facade.publish(old)
+				}
+				if candidate != nil {
+					_ = candidate.Close()
+				}
+				return
+			}
+			m.commitGeneration(old, candidate, oldStats)
+		})
+	}
+	locked = false
+	return config.PreparedChange{
+		Commit: func() { finish(true) },
+		Abort:  func() { finish(false) },
+	}, nil
+}
+
+func retainedQuotaStates(oldStats, candidateStats nntppool.ClientStats) map[string]nntppool.ProviderQuotaState {
+	retained := make(map[string]struct{}, len(candidateStats.Providers))
+	for _, provider := range candidateStats.Providers {
+		providerID := providerStatsID(provider)
+		if providerID != "" && provider.QuotaBytes > 0 {
+			retained[providerID] = struct{}{}
+		}
+	}
+	states := make(map[string]nntppool.ProviderQuotaState)
+	for _, provider := range oldStats.Providers {
+		providerID := providerStatsID(provider)
+		if providerID == "" || provider.QuotaBytes == 0 {
+			continue
+		}
+		if _, ok := retained[providerID]; !ok {
+			continue
+		}
+		states[providerID] = nntppool.ProviderQuotaState{Used: provider.QuotaUsed, ResetAt: provider.QuotaResetAt}
+	}
+	return states
+}
+
+func (m *manager) commitGeneration(old, candidate generationClient, oldStats nntppool.ClientStats) {
+	m.mu.RLock()
+	tracker := m.metricsTracker
+	m.mu.RUnlock()
+
+	if old != nil && tracker != nil {
+		tracker.FoldGeneration(context.Background(), oldStats)
+	}
+	if candidate == nil {
+		m.mu.Lock()
+		m.stopQuotaWatcher()
+		m.mu.Unlock()
+	}
+	if tracker == nil && candidate != nil {
+		tracker = NewMetricsTracker(candidate, m.repo)
+		m.mu.Lock()
+		m.metricsTracker = tracker
+		m.mu.Unlock()
+		tracker.Start(m.ctx)
+	} else if tracker != nil {
+		tracker.SetClient(candidate)
+	}
+
+	m.facade.publish(candidate)
+	if old != nil {
+		m.logger.InfoContext(m.ctx, "Shutting down existing NNTP connection pool")
+		if err := old.Close(); err != nil {
+			m.logger.ErrorContext(m.ctx, "Failed to close retired NNTP connection pool", "error", err)
+		}
+	}
+	if candidate != nil {
+		m.mu.Lock()
+		m.startQuotaWatcher()
+		m.mu.Unlock()
+		m.logger.InfoContext(m.ctx, "NNTP connection pool created successfully")
+	} else {
+		m.logger.InfoContext(m.ctx, "No NNTP providers configured - pool cleared")
+	}
 }
 
 // ClearPool shuts down and removes the current pool
 func (m *manager) ClearPool() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.stopQuotaWatcher()
-	if m.metricsTracker != nil {
-		m.metricsTracker.Stop()
-		m.metricsTracker = nil
+	prepared, err := m.PrepareProviders(context.Background(), nil)
+	if err != nil {
+		return err
 	}
-	if m.pool != nil {
-		m.logger.InfoContext(m.ctx, "Clearing NNTP connection pool")
-		m.pool.Close()
-		m.pool = nil
+	if prepared.Commit != nil {
+		prepared.Commit()
 	}
-
 	return nil
 }
 
 // HasPool returns true if a pool is currently available
 func (m *manager) HasPool() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	return m.pool != nil
+	return m.facade.hasGeneration()
 }
 
 // GetMetrics returns the current pool metrics with calculated speeds
@@ -308,7 +376,7 @@ func (m *manager) GetMetrics() (MetricsSnapshot, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if m.pool == nil {
+	if !m.facade.hasGeneration() {
 		return MetricsSnapshot{}, fmt.Errorf("NNTP connection pool not available")
 	}
 
@@ -335,6 +403,9 @@ func (m *manager) ResetMetrics(ctx context.Context, resetPeak bool, resetTotals 
 			resetMap := make(map[string]int64)
 			for k := range currentStats {
 				if resetTotals {
+					if _, providerScoped := persistedProviderKeyID(k); providerScoped {
+						continue
+					}
 					resetMap[k] = 0
 				}
 			}
@@ -401,96 +472,19 @@ func (m *manager) IncArticlesPosted() {
 	}
 }
 
-// AddProvider adds a single provider to the running pool.
-// If no pool exists yet, a new one is created with this single provider.
-func (m *manager) AddProvider(provider nntppool.Provider) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Restore quota state from DB
-	providers := []nntppool.Provider{provider}
-	m.injectQuotaState(providers)
-	provider = providers[0]
-
-	if m.pool == nil {
-		// No pool yet — create one with this single provider
-		m.logger.InfoContext(m.ctx, "Creating NNTP connection pool for first provider", "provider", provider.Host)
-		pool, err := nntppool.NewClient(
-			m.ctx,
-			[]nntppool.Provider{provider},
-			nntppool.WithDispatchStrategy(nntppool.DispatchFIFO),
-			nntppool.WithStatProbe(false),
-			nntppool.WithProviderCircuitBreaker(true),
-		)
-		if err != nil {
-			return fmt.Errorf("failed to create NNTP connection pool: %w", err)
-		}
-		m.pool = pool
-		m.metricsTracker = NewMetricsTracker(pool, m.repo)
-		if m.providerIDMap != nil {
-			m.metricsTracker.SetProviderIDs(m.providerIDMap)
-		}
-		m.metricsTracker.Start(m.ctx)
-	} else {
-		m.logger.InfoContext(m.ctx, "Adding provider to NNTP connection pool", "provider", provider.Host)
-		if err := m.pool.AddProvider(provider); err != nil {
-			return err
-		}
-	}
-
-	m.startQuotaWatcher()
-	return nil
-}
-
-// RemoveProvider removes a provider by name from the running pool.
-// If the last provider is removed, the pool and metrics tracker are shut down.
-func (m *manager) RemoveProvider(name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.pool == nil {
-		return fmt.Errorf("NNTP connection pool not available - cannot remove provider")
-	}
-
-	m.logger.InfoContext(m.ctx, "Removing provider from NNTP connection pool", "provider", name)
-	if err := m.pool.RemoveProvider(name); err != nil {
-		return err
-	}
-
-	// If no providers remain, tear down the pool entirely
-	if m.pool.NumProviders() == 0 {
-		m.logger.InfoContext(m.ctx, "Last provider removed - shutting down NNTP connection pool")
-		m.stopQuotaWatcher()
-		if m.metricsTracker != nil {
-			m.metricsTracker.Stop()
-			m.metricsTracker = nil
-		}
-		m.pool.Close()
-		m.pool = nil
-	}
-
-	return nil
-}
-
-// resetProviderQuotaLocked performs the quota reset with m.mu already held.
-func (m *manager) resetProviderQuotaLocked(ctx context.Context, poolName string) error {
-	if m.pool == nil {
-		return fmt.Errorf("NNTP connection pool not available")
-	}
-
-	m.logger.InfoContext(ctx, "Resetting provider quota", "provider", poolName)
-
-	if err := m.pool.ResetProviderQuota(poolName); err != nil {
+func (m *manager) resetProviderQuota(ctx context.Context, generation generationClient, providerID string) error {
+	m.logger.InfoContext(ctx, "Resetting provider quota", "provider", providerID)
+	if err := generation.ResetProviderQuota(providerID); err != nil {
 		return fmt.Errorf("failed to reset provider quota: %w", err)
 	}
 
 	if m.repo != nil {
 		stats := map[string]int64{
-			"quota_used:" + poolName:     0,
-			"quota_reset_at:" + poolName: 0,
+			"quota_used:" + providerID:     0,
+			"quota_reset_at:" + providerID: 0,
 		}
 		if err := m.repo.BatchUpdateSystemStats(ctx, stats); err != nil {
-			m.logger.ErrorContext(ctx, "Failed to clear persisted quota state", "err", err, "provider", poolName)
+			m.logger.ErrorContext(ctx, "Failed to clear persisted quota state", "err", err, "provider", providerID)
 		}
 	}
 
@@ -499,11 +493,25 @@ func (m *manager) resetProviderQuotaLocked(ctx context.Context, poolName string)
 
 // ResetProviderQuota resets the download quota counter for a provider,
 // clearing its consumed-bytes counter and exceeded flag in-place.
-func (m *manager) ResetProviderQuota(ctx context.Context, poolName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *manager) ResetProviderQuota(ctx context.Context, providerID string) error {
+	generation, release, err := m.facade.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 
-	return m.resetProviderQuotaLocked(ctx, poolName)
+	found := false
+	for _, provider := range generation.Stats().Providers {
+		if providerID != "" && provider.ProviderID == providerID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("provider ID %q is not present in the current generation", providerID)
+	}
+
+	return m.resetProviderQuota(ctx, generation, providerID)
 }
 
 // AcquireImportSlot blocks until an import admission slot is available or ctx
@@ -547,17 +555,6 @@ func (m *manager) NotifyStreamChange() {
 	m.budget.NotifyStreamChange()
 }
 
-// SetProviderIDs sets a mapping between pool names and configuration IDs
-func (m *manager) SetProviderIDs(mapping map[string]string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.providerIDMap = mapping
-	if m.metricsTracker != nil {
-		m.metricsTracker.SetProviderIDs(mapping)
-	}
-}
-
 // startQuotaWatcher starts the background quota watcher if not already running.
 // Must be called with m.mu held.
 func (m *manager) startQuotaWatcher() {
@@ -597,15 +594,14 @@ func (m *manager) quotaWatchLoop(ctx context.Context) {
 // but whose quota counter was never cleared (because no new request arrived to
 // trigger nntppool's on-demand reset path).
 func (m *manager) checkAndResetExpiredQuotas(ctx context.Context) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.pool == nil {
+	generation, release, err := m.facade.acquire(ctx)
+	if err != nil {
 		return
 	}
+	defer release()
 
 	now := time.Now()
-	for _, ps := range m.pool.Stats().Providers {
+	for _, ps := range generation.Stats().Providers {
 		// Skip providers with no quota configured or no tracked usage to reset.
 		// Without the QuotaUsed guard, providers that simply have a quota period
 		// configured but have never downloaded anything would trigger a spurious
@@ -617,11 +613,15 @@ func (m *manager) checkAndResetExpiredQuotas(ctx context.Context) {
 			continue
 		}
 
+		providerID := providerStatsID(ps)
+		if providerID == "" {
+			continue
+		}
 		m.logger.InfoContext(ctx, "Auto-resetting expired provider quota",
-			"provider", ps.Name, "reset_at", ps.QuotaResetAt)
-		if err := m.resetProviderQuotaLocked(ctx, ps.Name); err != nil {
+			"provider", providerID, "reset_at", ps.QuotaResetAt)
+		if err := m.resetProviderQuota(ctx, generation, providerID); err != nil {
 			m.logger.ErrorContext(ctx, "Failed to auto-reset provider quota",
-				"provider", ps.Name, "error", err)
+				"provider", providerID, "error", err)
 		}
 	}
 }

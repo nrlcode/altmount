@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/javi11/altmount/internal/config"
@@ -24,8 +25,6 @@ type ConfigInstance struct {
 
 // ConfigManager interface defines methods needed for configuration management
 type ConfigManager interface {
-	GetConfig() *config.Config
-	GetConfigGetter() config.ConfigGetter
-	UpdateConfig(config *config.Config) error
-	SaveConfig() error
+	Snapshot() (config.ConfigSnapshot, error)
+	CompareAndSwap(context.Context, uint64, *config.Config) (config.ConfigSnapshot, error)
 }

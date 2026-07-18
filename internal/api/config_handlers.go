@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,15 +22,39 @@ import (
 type ConfigManager interface {
 	GetConfig() *config.Config
 	GetConfigGetter() config.ConfigGetter
-	UpdateConfig(config *config.Config) error
+	Snapshot() (config.ConfigSnapshot, error)
+	CompareAndSwap(context.Context, uint64, *config.Config) (config.ConfigSnapshot, error)
 	ValidateConfig(config *config.Config) error
 	ValidateConfigUpdate(config *config.Config) error
 	OnConfigChange(callback config.ChangeCallback)
 	ReloadConfig() error
-	SaveConfig() error
 	NeedsLibrarySync() bool
 	GetPreviousMountPath() string
 	ClearLibrarySyncFlag()
+}
+
+func respondConfigWriteError(c *fiber.Ctx, message string, err error) error {
+	if errors.Is(err, config.ErrConfigConflict) {
+		return RespondConflict(c, "Configuration changed while the request was in progress", err.Error())
+	}
+	return RespondInternalError(c, message, err.Error())
+}
+
+func providerAPIResponse(p config.ProviderConfig) ProviderAPIResponse {
+	return ProviderAPIResponse{
+		ID: p.ID, Name: p.Name, Host: p.Host, Port: p.Port, Username: p.Username,
+		MaxConnections: p.MaxConnections, TLS: p.TLS, InsecureTLS: p.InsecureTLS,
+		ProxyURL: p.ProxyURL, PasswordSet: p.Password != "",
+		Enabled:          p.Enabled != nil && *p.Enabled,
+		IsBackupProvider: p.IsBackupProvider != nil && *p.IsBackupProvider,
+		InflightRequests: p.InflightRequests, StatInflightRequests: p.StatInflightRequests,
+		LastRTTMs: p.LastRTTMs, LastSpeedTestMbps: p.LastSpeedTestMbps,
+		LastSpeedTestTime: p.LastSpeedTestTime, SkipPing: p.SkipPing,
+		KeepaliveIntervalSeconds: p.KeepaliveIntervalSeconds,
+		KeepaliveCommand:         p.KeepaliveCommand, UserAgent: p.UserAgent,
+		QuotaBytes: p.QuotaBytes, QuotaPeriodHours: p.QuotaPeriodHours,
+		AccountExpirationDate: p.AccountExpirationDate,
+	}
 }
 
 // parseLogLevel converts string log level to slog.Level
@@ -122,8 +147,11 @@ func (s *Server) handleUpdateConfig(c *fiber.Ctx) error {
 	}
 
 	// Get current config to use as base for defaults/missing fields
-	currentConfig := s.configManager.GetConfig()
-	newConfig := currentConfig.DeepCopy()
+	snapshot, err := s.configManager.Snapshot()
+	if err != nil {
+		return RespondInternalError(c, "Configuration not available", err.Error())
+	}
+	newConfig := snapshot.Config
 
 	// Decode directly into config structure
 	if err := c.BodyParser(newConfig); err != nil {
@@ -138,19 +166,15 @@ func (s *Server) handleUpdateConfig(c *fiber.Ctx) error {
 	}
 
 	// Update the configuration
-	if err := s.configManager.UpdateConfig(newConfig); err != nil {
-		return RespondInternalError(c, "Failed to update configuration", err.Error())
+	committed, err := s.configManager.CompareAndSwap(c.Context(), snapshot.Revision, newConfig)
+	if err != nil {
+		return respondConfigWriteError(c, "Failed to update configuration", err)
 	}
 
 	// Ensure SABnzbd category directories exist
-	if err := s.ensureSABnzbdCategoryDirectories(newConfig); err != nil {
+	if err := s.ensureSABnzbdCategoryDirectories(committed.Config); err != nil {
 		// Log the error but don't fail the update
 		slog.WarnContext(c.Context(), "Failed to create SABnzbd category directories", "error", err)
-	}
-
-	// Save to file
-	if err := s.configManager.SaveConfig(); err != nil {
-		return RespondInternalError(c, "Failed to save configuration", err.Error())
 	}
 
 	// Try to start RC server if RClone is enabled but RC is not running
@@ -159,7 +183,7 @@ func (s *Server) handleUpdateConfig(c *fiber.Ctx) error {
 	// Get API key for response
 	apiKey := s.getAPIKeyForConfig(c)
 
-	response := ToConfigAPIResponse(newConfig, apiKey)
+	response := ToConfigAPIResponse(committed.Config, apiKey)
 	return RespondSuccess(c, response)
 }
 
@@ -188,16 +212,17 @@ func (s *Server) handlePatchConfigSection(c *fiber.Ctx) error {
 	}
 
 	// Get current config to merge with updates
-	currentConfig := s.configManager.GetConfig()
-	if currentConfig == nil {
+	snapshot, err := s.configManager.Snapshot()
+	if err != nil || snapshot.Config == nil {
 		return RespondInternalError(c, "Configuration not available", "CONFIG_NOT_FOUND")
 	}
+	currentConfig := snapshot.Config
 
 	// Create a copy to apply updates to
 	newConfig := currentConfig.DeepCopy()
 
 	// Decode into the specific section based on the URL parameter
-	var err error
+	err = nil
 	switch section {
 	case "providers":
 		err = c.BodyParser(newConfig)
@@ -245,21 +270,17 @@ func (s *Server) handlePatchConfigSection(c *fiber.Ctx) error {
 	}
 
 	// Update the configuration
-	if err := s.configManager.UpdateConfig(newConfig); err != nil {
-		return RespondInternalError(c, "Failed to update configuration", err.Error())
+	committed, err := s.configManager.CompareAndSwap(c.Context(), snapshot.Revision, newConfig)
+	if err != nil {
+		return respondConfigWriteError(c, "Failed to update configuration", err)
 	}
 
 	// Ensure SABnzbd category directories exist if SABnzbd section was updated
 	if section == "sabnzbd" || section == "" {
-		if err := s.ensureSABnzbdCategoryDirectories(newConfig); err != nil {
+		if err := s.ensureSABnzbdCategoryDirectories(committed.Config); err != nil {
 			// Log the error but don't fail the update
 			slog.WarnContext(c.Context(), "Failed to create SABnzbd category directories", "error", err)
 		}
-	}
-
-	// Save to file
-	if err := s.configManager.SaveConfig(); err != nil {
-		return RespondInternalError(c, "Failed to save configuration", err.Error())
 	}
 
 	// Try to start RC server if RClone/mount section was updated or full config update
@@ -270,7 +291,7 @@ func (s *Server) handlePatchConfigSection(c *fiber.Ctx) error {
 	// Get API key for response
 	apiKey := s.getAPIKeyForConfig(c)
 
-	response := ToConfigAPIResponse(newConfig, apiKey)
+	response := ToConfigAPIResponse(committed.Config, apiKey)
 	return RespondSuccess(c, response)
 }
 
@@ -426,8 +447,11 @@ func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 	// If test is successful and we have a provider ID, update the config with RTT
 	rtt := result.RTT.Milliseconds()
 	if testReq.ProviderID != "" {
-		currentConfig := s.configManager.GetConfig()
-		newConfig := currentConfig.DeepCopy()
+		snapshot, err := s.configManager.Snapshot()
+		if err != nil {
+			return RespondInternalError(c, "Configuration not available", err.Error())
+		}
+		newConfig := snapshot.Config
 		updated := false
 		for i, p := range newConfig.Providers {
 			if p.ID == testReq.ProviderID {
@@ -441,10 +465,8 @@ func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 		}
 
 		if updated {
-			if err := s.configManager.UpdateConfig(newConfig); err == nil {
-				if err := s.configManager.SaveConfig(); err != nil {
-					slog.WarnContext(c.Context(), "Failed to save config after updating RTT", "error", err)
-				}
+			if _, err := s.configManager.CompareAndSwap(c.Context(), snapshot.Revision, newConfig); err != nil {
+				return respondConfigWriteError(c, "Failed to save provider latency", err)
 			}
 		}
 	}
@@ -467,35 +489,17 @@ func (s *Server) handleTestProvider(c *fiber.Ctx) error {
 //	@Failure		400		{object}	APIResponse
 //	@Security		BearerAuth
 //	@Router			/providers [post]
-func nextProviderID(providers []config.ProviderConfig) string {
-	used := make(map[string]struct{}, len(providers))
-	for _, provider := range providers {
-		if provider.ID != "" {
-			used[provider.ID] = struct{}{}
-		}
-	}
-
-	// Preserve the existing human-readable format while probing past holes
-	// that would otherwise collide after a provider deletion. PR4 owns the
-	// durable UUID registry; this is only the narrow pre-registry safeguard.
-	for suffix := len(providers) + 1; ; suffix++ {
-		candidate := fmt.Sprintf("provider_%d", suffix)
-		if _, exists := used[candidate]; !exists {
-			return candidate
-		}
-	}
-}
-
 func (s *Server) handleCreateProvider(c *fiber.Ctx) error {
 	if s.configManager == nil {
 		return RespondServiceUnavailable(c, "Configuration management not available", "CONFIG_UNAVAILABLE")
 	}
 
 	// Get current config
-	currentConfig := s.configManager.GetConfig()
-	if currentConfig == nil {
+	snapshot, err := s.configManager.Snapshot()
+	if err != nil || snapshot.Config == nil {
 		return RespondInternalError(c, "Configuration not available", "CONFIG_NOT_FOUND")
 	}
+	currentConfig := snapshot.Config
 
 	// Decode create request
 	var createReq struct {
@@ -539,12 +543,9 @@ func (s *Server) handleCreateProvider(c *fiber.Ctx) error {
 		createReq.MaxConnections = 1 // Default
 	}
 
-	// Generate a collision-free stable ID for the current pre-registry format.
-	newID := nextProviderID(currentConfig.Providers)
-
 	// Create new provider
 	newProvider := config.ProviderConfig{
-		ID:                       newID,
+		ID:                       "",
 		Name:                     createReq.Name,
 		Host:                     createReq.Host,
 		Port:                     createReq.Port,
@@ -576,44 +577,13 @@ func (s *Server) handleCreateProvider(c *fiber.Ctx) error {
 		return RespondValidationError(c, "Configuration validation failed", err.Error())
 	}
 
-	// Refresh from normalized config (Validate may have applied defaults)
-	newProvider = newConfig.Providers[len(newConfig.Providers)-1]
-
-	if err := s.configManager.UpdateConfig(newConfig); err != nil {
-		return RespondInternalError(c, "Failed to update configuration", err.Error())
+	committed, err := s.configManager.CompareAndSwap(c.Context(), snapshot.Revision, newConfig)
+	if err != nil {
+		return respondConfigWriteError(c, "Failed to update configuration", err)
 	}
+	newProvider = committed.Config.Providers[len(committed.Config.Providers)-1]
 
-	if err := s.configManager.SaveConfig(); err != nil {
-		return RespondInternalError(c, "Failed to save configuration", err.Error())
-	}
-
-	// Return sanitized provider
-	response := ProviderAPIResponse{
-		ID:                       newProvider.ID,
-		Name:                     newProvider.Name,
-		Host:                     newProvider.Host,
-		Port:                     newProvider.Port,
-		Username:                 newProvider.Username,
-		MaxConnections:           newProvider.MaxConnections,
-		TLS:                      newProvider.TLS,
-		InsecureTLS:              newProvider.InsecureTLS,
-		ProxyURL:                 newProvider.ProxyURL,
-		PasswordSet:              newProvider.Password != "",
-		Enabled:                  newProvider.Enabled != nil && *newProvider.Enabled,
-		IsBackupProvider:         newProvider.IsBackupProvider != nil && *newProvider.IsBackupProvider,
-		InflightRequests:         newProvider.InflightRequests,
-		StatInflightRequests:     newProvider.StatInflightRequests,
-		LastRTTMs:                newProvider.LastRTTMs,
-		SkipPing:                 newProvider.SkipPing,
-		KeepaliveIntervalSeconds: newProvider.KeepaliveIntervalSeconds,
-		KeepaliveCommand:         newProvider.KeepaliveCommand,
-		UserAgent:                newProvider.UserAgent,
-		QuotaBytes:               newProvider.QuotaBytes,
-		QuotaPeriodHours:         newProvider.QuotaPeriodHours,
-		AccountExpirationDate:    newProvider.AccountExpirationDate,
-	}
-
-	return RespondSuccess(c, response)
+	return RespondSuccess(c, providerAPIResponse(newProvider))
 }
 
 // handleUpdateProvider updates an existing NNTP provider
@@ -642,10 +612,11 @@ func (s *Server) handleUpdateProvider(c *fiber.Ctx) error {
 	}
 
 	// Get current config
-	currentConfig := s.configManager.GetConfig()
-	if currentConfig == nil {
+	snapshot, err := s.configManager.Snapshot()
+	if err != nil || snapshot.Config == nil {
 		return RespondInternalError(c, "Configuration not available", "CONFIG_NOT_FOUND")
 	}
+	currentConfig := snapshot.Config
 
 	// Find provider
 	providerIndex := -1
@@ -776,44 +747,13 @@ func (s *Server) handleUpdateProvider(c *fiber.Ctx) error {
 		return RespondValidationError(c, "Configuration validation failed", err.Error())
 	}
 
-	// Refresh from normalized config (Validate may have applied defaults)
-	provider = newConfig.Providers[providerIndex]
-
-	if err := s.configManager.UpdateConfig(newConfig); err != nil {
-		return RespondInternalError(c, "Failed to update configuration", err.Error())
+	committed, err := s.configManager.CompareAndSwap(c.Context(), snapshot.Revision, newConfig)
+	if err != nil {
+		return respondConfigWriteError(c, "Failed to update configuration", err)
 	}
+	provider = committed.Config.Providers[providerIndex]
 
-	if err := s.configManager.SaveConfig(); err != nil {
-		return RespondInternalError(c, "Failed to save configuration", err.Error())
-	}
-
-	// Return sanitized provider
-	response := ProviderAPIResponse{
-		ID:                       provider.ID,
-		Name:                     provider.Name,
-		Host:                     provider.Host,
-		Port:                     provider.Port,
-		Username:                 provider.Username,
-		MaxConnections:           provider.MaxConnections,
-		TLS:                      provider.TLS,
-		InsecureTLS:              provider.InsecureTLS,
-		ProxyURL:                 provider.ProxyURL,
-		PasswordSet:              provider.Password != "",
-		Enabled:                  provider.Enabled != nil && *provider.Enabled,
-		IsBackupProvider:         provider.IsBackupProvider != nil && *provider.IsBackupProvider,
-		InflightRequests:         provider.InflightRequests,
-		StatInflightRequests:     provider.StatInflightRequests,
-		LastRTTMs:                provider.LastRTTMs,
-		SkipPing:                 provider.SkipPing,
-		KeepaliveIntervalSeconds: provider.KeepaliveIntervalSeconds,
-		KeepaliveCommand:         provider.KeepaliveCommand,
-		UserAgent:                provider.UserAgent,
-		QuotaBytes:               provider.QuotaBytes,
-		QuotaPeriodHours:         provider.QuotaPeriodHours,
-		AccountExpirationDate:    provider.AccountExpirationDate,
-	}
-
-	return RespondSuccess(c, response)
+	return RespondSuccess(c, providerAPIResponse(provider))
 }
 
 // handleResetProviderQuota resets the download quota counter for a provider.
@@ -861,9 +801,7 @@ func (s *Server) handleResetProviderQuota(c *fiber.Ctx) error {
 		return RespondBadRequest(c, "Provider has no quota configured", "NO_QUOTA")
 	}
 
-	poolName := provider.NNTPPoolName()
-
-	if err := s.poolManager.ResetProviderQuota(c.Context(), poolName); err != nil {
+	if err := s.poolManager.ResetProviderQuota(c.Context(), provider.ID); err != nil {
 		return RespondInternalError(c, "Failed to reset provider quota", err.Error())
 	}
 
@@ -893,10 +831,11 @@ func (s *Server) handleDeleteProvider(c *fiber.Ctx) error {
 	}
 
 	// Get current config
-	currentConfig := s.configManager.GetConfig()
-	if currentConfig == nil {
+	snapshot, err := s.configManager.Snapshot()
+	if err != nil || snapshot.Config == nil {
 		return RespondInternalError(c, "Configuration not available", "CONFIG_NOT_FOUND")
 	}
+	currentConfig := snapshot.Config
 
 	// Find provider
 	providerIndex := -1
@@ -921,12 +860,8 @@ func (s *Server) handleDeleteProvider(c *fiber.Ctx) error {
 		return RespondValidationError(c, "Configuration validation failed", err.Error())
 	}
 
-	if err := s.configManager.UpdateConfig(newConfig); err != nil {
-		return RespondInternalError(c, "Failed to update configuration", err.Error())
-	}
-
-	if err := s.configManager.SaveConfig(); err != nil {
-		return RespondInternalError(c, "Failed to save configuration", err.Error())
+	if _, err := s.configManager.CompareAndSwap(c.Context(), snapshot.Revision, newConfig); err != nil {
+		return respondConfigWriteError(c, "Failed to update configuration", err)
 	}
 
 	response := struct {
@@ -969,10 +904,11 @@ func (s *Server) handleReorderProviders(c *fiber.Ctx) error {
 	}
 
 	// Get current config
-	currentConfig := s.configManager.GetConfig()
-	if currentConfig == nil {
+	snapshot, err := s.configManager.Snapshot()
+	if err != nil || snapshot.Config == nil {
 		return RespondInternalError(c, "Configuration not available", "CONFIG_NOT_FOUND")
 	}
+	currentConfig := snapshot.Config
 
 	// Validate that all IDs exist and no duplicates
 	providerMap := make(map[string]config.ProviderConfig)
@@ -1003,35 +939,15 @@ func (s *Server) handleReorderProviders(c *fiber.Ctx) error {
 		return RespondValidationError(c, "Configuration validation failed", err.Error())
 	}
 
-	if err := s.configManager.UpdateConfig(newConfig); err != nil {
-		return RespondInternalError(c, "Failed to update configuration", err.Error())
-	}
-
-	if err := s.configManager.SaveConfig(); err != nil {
-		return RespondInternalError(c, "Failed to save configuration", err.Error())
+	committed, err := s.configManager.CompareAndSwap(c.Context(), snapshot.Revision, newConfig)
+	if err != nil {
+		return respondConfigWriteError(c, "Failed to update configuration", err)
 	}
 
 	// Return sanitized providers in new order
-	providers := make([]ProviderAPIResponse, len(newProviders))
-	for i, p := range newProviders {
-		providers[i] = ProviderAPIResponse{
-			ID:                    p.ID,
-			Name:                  p.Name,
-			Host:                  p.Host,
-			Port:                  p.Port,
-			Username:              p.Username,
-			MaxConnections:        p.MaxConnections,
-			TLS:                   p.TLS,
-			InsecureTLS:           p.InsecureTLS,
-			ProxyURL:              p.ProxyURL,
-			PasswordSet:           p.Password != "",
-			Enabled:               p.Enabled != nil && *p.Enabled,
-			IsBackupProvider:      p.IsBackupProvider != nil && *p.IsBackupProvider,
-			InflightRequests:      p.InflightRequests,
-			StatInflightRequests:  p.StatInflightRequests,
-			LastRTTMs:             p.LastRTTMs,
-			AccountExpirationDate: p.AccountExpirationDate,
-		}
+	providers := make([]ProviderAPIResponse, len(committed.Config.Providers))
+	for i, p := range committed.Config.Providers {
+		providers[i] = providerAPIResponse(p)
 	}
 
 	return RespondSuccess(c, providers)

@@ -504,8 +504,8 @@ github.com/nishanths/exhaustive v0.12.0 h1:vIY9sALmw6T/yxiASewa4TQcFsVYZQQRUQJhK
 github.com/nishanths/exhaustive v0.12.0/go.mod h1:mEZ95wPIZW+x8kC4TgC+9YCUgiST7ecevsVDTgc2obs=
 github.com/nishanths/predeclared v0.2.2 h1:V2EPdZPliZymNAn79T8RkNApBjMmVKh5XRpLm/w98Vk=
 github.com/nishanths/predeclared v0.2.2/go.mod h1:RROzoN6TnGQupbC+lqggsOlcgysk3LMK/HI84Mp280c=
-github.com/nrlcode/nntppool/v4 v4.13.1-0.20260714053636-49743ecb899b h1:u47h85ZC4Mj/tdSf5xVuvDYurBuf1P2Wtf/BtZ+CVAU=
-github.com/nrlcode/nntppool/v4 v4.13.1-0.20260714053636-49743ecb899b/go.mod h1:+UtisJLDFLXBSkW9R6uCRgdp3lS/+6pLAk7L+Wt6LMw=
+github.com/nrlcode/nntppool/v4 v4.13.1-0.20260718155437-e820af2ca470 h1:G5Oxtrwkvh8LwWvrXWiwsvMmNwdZ/m05bUDJAPjc5KM=
+github.com/nrlcode/nntppool/v4 v4.13.1-0.20260718155437-e820af2ca470/go.mod h1:+UtisJLDFLXBSkW9R6uCRgdp3lS/+6pLAk7L+Wt6LMw=
 github.com/nunnatsa/ginkgolinter v0.21.2 h1:khzWfm2/Br8ZemX8QM1pl72LwM+rMeW6VUbQ4rzh0Po=
 github.com/nunnatsa/ginkgolinter v0.21.2/go.mod h1:GItSI5fw7mCGLPmkvGYrr1kEetZe7B593jcyOpyabsY=
 github.com/nxadm/tail v1.4.4/go.mod h1:kenIhsEOeOJmVchQTgglprH7qJGnHDVpk1VPCcaMI8A=

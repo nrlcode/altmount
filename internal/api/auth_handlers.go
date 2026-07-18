@@ -356,29 +356,44 @@ func (s *Server) handleChangeOwnPassword(c *fiber.Ctx) error {
 //	@Security		BearerAuth
 //	@Router			/user/api-key/regenerate [post]
 func (s *Server) handleRegenerateAPIKey(c *fiber.Ctx) error {
+	if s.configManager == nil {
+		return RespondInternalError(c, "Configuration management not available", "")
+	}
+	if s.userRepo == nil {
+		return RespondInternalError(c, "User management not available", "")
+	}
+
+	// Snapshot before generating or persisting anything so a failed snapshot
+	// cannot leave the database with a key the request never returns.
+	snapshot, err := s.configManager.Snapshot()
+	if err != nil {
+		return RespondInternalError(c, "Configuration not available", err.Error())
+	}
+
 	// Try to get user from context (auth enabled case)
 	user := auth.GetUserFromContext(c)
+	bootstrap := false
 
 	// If no user in context, and authentication is disabled, let's create a default admin user
-	if user == nil && s.userRepo != nil {
-		cfg := s.configManager.GetConfig()
+	if user == nil {
 		loginRequired := true
-		if cfg.Auth.LoginRequired != nil {
-			loginRequired = *cfg.Auth.LoginRequired
+		if snapshot.Config.Auth.LoginRequired != nil {
+			loginRequired = *snapshot.Config.Auth.LoginRequired
 		}
 
 		if !loginRequired {
-			// Auto-bootstrap a default admin user when auth is disabled
-			user = &database.User{
-				UserID:   "admin",
-				Provider: "direct",
-				IsAdmin:  true,
-			}
-			err := s.userRepo.CreateUser(c.Context(), user)
+			user, err = s.userRepo.GetUserByID(c.Context(), "admin")
 			if err != nil {
-				return RespondInternalError(c, "Failed to bootstrap default admin user", err.Error())
+				return RespondInternalError(c, "Failed to resolve default admin user", err.Error())
 			}
-			slog.InfoContext(c.Context(), "Bootstrapped default admin user for API key generation")
+			if user == nil {
+				user = &database.User{
+					UserID:   "admin",
+					Provider: "direct",
+					IsAdmin:  true,
+				}
+				bootstrap = true
+			}
 		}
 	}
 
@@ -387,31 +402,40 @@ func (s *Server) handleRegenerateAPIKey(c *fiber.Ctx) error {
 		return RespondUnauthorized(c, "No user found to regenerate API key for. Please register first.", "")
 	}
 
-	// Regenerate API key
-	apiKey, err := s.userRepo.RegenerateAPIKey(c.Context(), user.UserID)
+	apiKey, err := s.userRepo.GenerateAPIKey()
 	if err != nil {
-		return RespondInternalError(c, "Failed to regenerate API key", err.Error())
+		return RespondInternalError(c, "Failed to generate API key", err.Error())
 	}
 
-	// If key_override is configured (has a value with 33 chars), update it with the new key
-	if s.configManager != nil {
-		cfg := s.configManager.GetConfig()
-		if cfg.API.KeyOverride != "" && len(cfg.API.KeyOverride) == 33 {
-			// Update the key_override in config to match the new key
-			newConfig := cfg.DeepCopy()
-			newConfig.API.KeyOverride = apiKey
-
-			if err := s.configManager.UpdateConfig(newConfig); err != nil {
-				slog.WarnContext(c.Context(), "Failed to update key_override in config", "error", err)
-				// Don't fail the request, just log the warning
-			} else {
-				if err := s.configManager.SaveConfig(); err != nil {
-					slog.WarnContext(c.Context(), "Failed to save config after updating key_override", "error", err)
-				} else {
-					slog.InfoContext(c.Context(), "Updated key_override in config with new API key")
-				}
-			}
+	// A valid override is authoritative. Commit it before mirroring the exact key
+	// into the database so a CAS failure has no persistent side effects.
+	overrideCommitted := false
+	if len(snapshot.Config.API.KeyOverride) == 32 {
+		newConfig := snapshot.Config.DeepCopy()
+		newConfig.API.KeyOverride = apiKey
+		if _, err := s.configManager.CompareAndSwap(c.Context(), snapshot.Revision, newConfig); err != nil {
+			return respondConfigWriteError(c, "Failed to update API key override", err)
 		}
+		overrideCommitted = true
+		slog.InfoContext(c.Context(), "Updated key_override in config with new API key")
+	}
+
+	if bootstrap {
+		user.APIKey = &apiKey
+		err = s.userRepo.CreateUser(c.Context(), user)
+		if err == nil {
+			slog.InfoContext(c.Context(), "Bootstrapped default admin user for API key generation")
+		}
+	} else {
+		err = s.userRepo.UpdateAPIKey(c.Context(), user.UserID, apiKey)
+	}
+	if err != nil {
+		if !overrideCommitted {
+			return RespondInternalError(c, "Failed to persist API key", err.Error())
+		}
+		// The override is already active and cannot safely be withheld. Database
+		// mirroring is best effort after that authority transition.
+		slog.ErrorContext(c.Context(), "Failed to mirror active API key to database", "user_id", user.UserID, "error", err)
 	}
 
 	response := fiber.Map{

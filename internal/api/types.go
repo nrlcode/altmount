@@ -230,32 +230,7 @@ func ToConfigAPIResponse(cfg *config.Config, apiKey string) *ConfigAPIResponse {
 	// Convert providers with password masking
 	providers := make([]ProviderAPIResponse, len(cfg.Providers))
 	for i, p := range cfg.Providers {
-		providers[i] = ProviderAPIResponse{
-			ID:                       p.ID,
-			Name:                     p.Name,
-			Host:                     p.Host,
-			Port:                     p.Port,
-			Username:                 p.Username,
-			MaxConnections:           p.MaxConnections,
-			TLS:                      p.TLS,
-			InsecureTLS:              p.InsecureTLS,
-			ProxyURL:                 p.ProxyURL,
-			PasswordSet:              p.Password != "",
-			Enabled:                  p.Enabled != nil && *p.Enabled,
-			IsBackupProvider:         p.IsBackupProvider != nil && *p.IsBackupProvider,
-			InflightRequests:         p.InflightRequests,
-			StatInflightRequests:     p.StatInflightRequests,
-			LastRTTMs:                p.LastRTTMs,
-			LastSpeedTestMbps:        p.LastSpeedTestMbps,
-			LastSpeedTestTime:        p.LastSpeedTestTime,
-			SkipPing:                 p.SkipPing,
-			KeepaliveIntervalSeconds: p.KeepaliveIntervalSeconds,
-			KeepaliveCommand:         p.KeepaliveCommand,
-			UserAgent:                p.UserAgent,
-			QuotaBytes:               p.QuotaBytes,
-			QuotaPeriodHours:         p.QuotaPeriodHours,
-			AccountExpirationDate:    p.AccountExpirationDate,
-		}
+		providers[i] = providerAPIResponse(p)
 	}
 
 	// Create RClone response with all configuration fields

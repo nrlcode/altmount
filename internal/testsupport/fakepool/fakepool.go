@@ -364,6 +364,16 @@ func (c *Client) Stats() nntppool.ClientStats {
 	return nntppool.ClientStats{}
 }
 
+// SpeedTest satisfies pool.NntpClient. The fake has no transport throughput
+// model, so it only participates in the standard gate/cancellation lifecycle.
+func (c *Client) SpeedTest(ctx context.Context, _ nntppool.SpeedTestOptions) (*nntppool.SpeedTestResult, error) {
+	defer c.enter()()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return &nntppool.SpeedTestResult{}, nil
+}
+
 func (c *Client) serveBody(ctx context.Context, messageID string, w io.Writer, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
 	b := c.behaviorFor(messageID)
 	if err := waitOrCancel(ctx, b.Latency); err != nil {

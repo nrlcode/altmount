@@ -50,11 +50,12 @@ func TestPR3ProviderValidationMatchesTransportConstruction(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "duplicate disabled pool identity is inert",
+			name: "disabled provider reserves its operational identity",
 			providers: []ProviderConfig{
 				{ID: "provider-1", Host: "same.invalid", Port: 119, Username: "account", MaxConnections: 1, Enabled: &enabled, IsBackupProvider: &primary},
 				{ID: "provider-2", Host: "same.invalid", Port: 119, Username: "account", MaxConnections: 1, Enabled: &disabled, IsBackupProvider: &primary},
 			},
+			wantErr: true,
 		},
 		{
 			name: "enabled backup-only set",

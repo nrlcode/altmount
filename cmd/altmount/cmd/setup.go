@@ -34,9 +34,10 @@ import (
 
 // repositorySet holds all database repositories
 type repositorySet struct {
-	MainRepo   *database.Repository
-	HealthRepo *database.HealthRepository
-	UserRepo   *database.UserRepository
+	MainRepo             *database.Repository
+	HealthRepo           *database.HealthRepository
+	ProviderIdentityRepo *database.HealthStateRepository
+	UserRepo             *database.UserRepository
 }
 
 // initializeDatabase creates and initializes the database
@@ -145,20 +146,25 @@ func initializeFilesystem(
 	return nzbfilesystem.NewNzbFilesystem(metadataRemoteFile)
 }
 
-// setupNNTPPool initializes the NNTP connection pool
-func setupNNTPPool(ctx context.Context, cfg *config.Config, poolManager pool.Manager) error {
-	if len(cfg.Providers) > 0 {
-		providers := cfg.ToNNTPProviders()
-		if err := poolManager.SetProviders(providers); err != nil {
-			slog.ErrorContext(ctx, "failed to create initial NNTP pool", "err", err)
-			return err
-		}
-		slog.InfoContext(ctx, "NNTP connection pool initialized", "provider_count", len(cfg.Providers))
+// setupNNTPPool normalizes and commits the initial configuration through the
+// same authority used by runtime updates. It installs the pool precommit before
+// committing, so no provider can dial under an unresolved identity.
+func setupNNTPPool(ctx context.Context, configManager *config.Manager, poolManager pool.Manager) (*config.Config, error) {
+	pool.RegisterConfigHandlers(ctx, configManager, poolManager)
+	snapshot, err := configManager.Snapshot()
+	if err != nil {
+		return nil, fmt.Errorf("snapshot initial configuration: %w", err)
+	}
+	committed, err := configManager.CompareAndSwap(ctx, snapshot.Revision, snapshot.Config)
+	if err != nil {
+		return nil, fmt.Errorf("commit initial configuration and NNTP pool: %w", err)
+	}
+	if poolManager.HasPool() {
+		slog.InfoContext(ctx, "NNTP connection pool initialized", "provider_count", len(committed.Config.ToNNTPProviders()))
 	} else {
 		slog.InfoContext(ctx, "Starting server without NNTP providers - configure via API to enable downloads")
 	}
-
-	return nil
+	return committed.Config, nil
 }
 
 // setupRCloneClient creates an RClone client if enabled
@@ -221,9 +227,10 @@ func setupRepositories(ctx context.Context, db *database.DB) *repositorySet {
 	d := db.Dialect()
 
 	return &repositorySet{
-		MainRepo:   database.NewRepository(dbConn, d),
-		HealthRepo: database.NewHealthRepository(dbConn, d),
-		UserRepo:   database.NewUserRepository(dbConn, d),
+		MainRepo:             database.NewRepository(dbConn, d),
+		HealthRepo:           database.NewHealthRepository(dbConn, d),
+		ProviderIdentityRepo: database.NewHealthStateRepository(dbConn, d),
+		UserRepo:             database.NewUserRepository(dbConn, d),
 	}
 }
 
