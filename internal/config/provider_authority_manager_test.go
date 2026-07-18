@@ -287,3 +287,51 @@ func TestManagerPreparedChangeOrdering(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"precommit", "persist", "commit", "callback-1", "callback-2"}, events)
 }
+
+func TestManagerCASCommitsAfterPostRenameDirectorySyncFailure(t *testing.T) {
+	m, _, path := newAuthorityManager(t)
+	base, err := m.Snapshot()
+	require.NoError(t, err)
+	candidate := base.Config.DeepCopy()
+	candidate.Network.NoProxy = "committed.invalid"
+
+	var events []string
+	staged := false
+	m.SetPrecommit(func(context.Context, *Config, *Config) (PreparedChange, error) {
+		events = append(events, "precommit")
+		staged = true
+		return PreparedChange{
+			Commit: func() {
+				events = append(events, "commit")
+				staged = false
+			},
+			Abort: func() {
+				events = append(events, "abort")
+				staged = false
+			},
+		}, nil
+	})
+	m.persist = func(config *Config, filename string) error {
+		events = append(events, "persist")
+		return saveToFileWithDirectorySync(config, filename, func(*os.File) error {
+			return assert.AnError
+		})
+	}
+	m.OnConfigChange(func(_, _ *Config) { events = append(events, "callback") })
+
+	committed, err := m.CompareAndSwap(context.Background(), base.Revision, candidate)
+	require.NoError(t, err)
+	assert.Equal(t, base.Revision+1, committed.Revision)
+	assert.Equal(t, "committed.invalid", committed.Config.Network.NoProxy)
+	assert.False(t, staged)
+	assert.Equal(t, []string{"precommit", "persist", "commit", "callback"}, events)
+
+	current, err := m.Snapshot()
+	require.NoError(t, err)
+	assert.Equal(t, committed, current)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var persisted Config
+	require.NoError(t, yaml.Unmarshal(data, &persisted))
+	assert.Equal(t, "committed.invalid", persisted.Network.NoProxy)
+}
