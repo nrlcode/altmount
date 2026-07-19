@@ -332,7 +332,7 @@ func processorTestParsedFile(filename, segmentID string) parser.ParsedFile {
 		Filename: filename,
 		Size:     100,
 		Segments: []*metapb.SegmentData{
-			{Id: segmentID, StartOffset: 0, EndOffset: 99},
+			{Id: segmentID, SegmentSize: 100, StartOffset: 0, EndOffset: 99},
 		},
 		ReleaseDate: time.Unix(1, 0),
 	}

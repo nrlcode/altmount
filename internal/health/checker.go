@@ -98,6 +98,8 @@ type preparedCheck struct {
 	sourceNzbPath  string
 	sampledTargets []usenet.ValidationTarget
 	earlyEvent     *HealthEvent
+	fileSize       int64
+	holeEligible   bool
 	// totalSegments is the full (unsampled) segment count, kept as a scalar so
 	// it survives past preparation for error reporting without holding onto
 	// the segment slice itself during the network sweep.
@@ -168,6 +170,10 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 	fileMeta = nil //nolint:ineffassign // explicit drop so the proto can be collected
 
 	prep.sourceNzbPath = input.sourceNzbPath
+	prep.fileSize = input.fileSize
+	prep.holeEligible = holes.EligibleFile(filePath) &&
+		input.encryption == metapb.Encryption_NONE &&
+		!input.hasNestedOrRemuxedSources
 
 	if len(input.segments) == 0 {
 		event := baseResultEvent(filePath, input.sourceNzbPath)
@@ -199,9 +205,15 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 
 	prep.totalSegments = len(input.segments)
 
-	// 1. Metadata integrity check - Verify the entire file map is complete
-	loader := &metadataSegmentLoader{segments: input.segments}
-	if err := usenet.CheckMetadataIntegrity(input.fileSize, loader); err != nil {
+	// Validate the complete segment map once before sampling. The returned
+	// usable lengths are also the authority for each target's logical byte
+	// span, keeping validation and later hole accounting on the same layout.
+	expectedSize, err := metadata.ExpectedSegmentLayoutSize(input.fileSize, input.encryption)
+	var usableLengths []int64
+	if err == nil {
+		usableLengths, err = metadata.ValidateSegmentLayout(expectedSize, input.segments)
+	}
+	if err != nil {
 		event := baseResultEvent(filePath, input.sourceNzbPath)
 		event.Type = EventTypeFileCorrupted
 		event.Status = database.HealthStatusCorrupted
@@ -215,13 +227,17 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 	// Sample and copy message IDs with their original positions so the proto
 	// segment slice becomes collectible before the network sweep begins.
 	selected := usenet.SelectSegmentsForValidation(input.segments, samplePercentage)
-	indexBySegment := make(map[*metapb.SegmentData]int, len(input.segments))
+	targetBySegment := make(map[*metapb.SegmentData]usenet.ValidationTarget, len(input.segments))
+	var logicalPos int64
 	for idx, segment := range input.segments {
-		indexBySegment[segment] = idx
+		targetBySegment[segment] = usenet.ValidationTarget{
+			ID: segment.Id, Index: idx, Start: logicalPos, End: logicalPos + usableLengths[idx] - 1,
+		}
+		logicalPos += usableLengths[idx]
 	}
 	prep.sampledTargets = make([]usenet.ValidationTarget, len(selected))
 	for i, seg := range selected {
-		prep.sampledTargets[i] = usenet.ValidationTarget{ID: seg.Id, Index: indexBySegment[seg]}
+		prep.sampledTargets[i] = targetBySegment[seg]
 	}
 
 	return prep
@@ -229,9 +245,6 @@ func (hc *HealthChecker) prepareCheck(ctx context.Context, filePath string, opts
 
 // judgeValidation turns a prepared check's segment-sweep outcome into the
 // terminal HealthEvent, mirroring the pre-batch per-file semantics exactly.
-// It is a method (not a free function) because a missing-segment outcome
-// classifies playback impact via the hole model, which re-reads metadata
-// through hc.metadataService.
 func (hc *HealthChecker) judgeValidation(ctx context.Context, prep preparedCheck, result usenet.ValidationResult, valErr error) HealthEvent {
 	event := baseResultEvent(prep.filePath, prep.sourceNzbPath)
 
@@ -267,7 +280,7 @@ func (hc *HealthChecker) judgeValidation(ctx context.Context, prep preparedCheck
 		event.Status = database.HealthStatusCorrupted
 		event.Error = fmt.Errorf("%d of %d checked segments are missing from your Usenet provider",
 			result.MissingCount, result.TotalChecked)
-		event.Classification = hc.classifyHoles(ctx, prep.filePath, result)
+		event.Classification = hc.classifyHoles(prep, result)
 		details := database.HealthErrorDetails{
 			ErrorType:       "missing_segments",
 			MissingArticles: result.MissingCount,
@@ -409,22 +422,4 @@ func (hc *HealthChecker) notifyRcloneVFS(filePath string, event HealthEvent) {
 			slog.ErrorContext(ctx, "Failed to notify rclone VFS about file status change", "file", filePath, "event", event.Type, "err", err)
 		}
 	}()
-}
-
-type metadataSegmentLoader struct {
-	segments []*metapb.SegmentData
-}
-
-func (l *metadataSegmentLoader) GetSegment(index int) (usenet.Segment, []string, bool) {
-	if index < 0 || index >= len(l.segments) {
-		return usenet.Segment{}, nil, false
-	}
-
-	s := l.segments[index]
-	return usenet.Segment{
-		Id:    s.Id,
-		Start: s.StartOffset,
-		End:   s.EndOffset,
-		Size:  s.SegmentSize,
-	}, []string{}, true
 }

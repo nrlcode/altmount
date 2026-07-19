@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -802,6 +803,8 @@ type MetadataVirtualFile struct {
 	streamID         string
 	segmentStore     usenet.SegmentStore // optional segment cache
 	segmentIndexOnce sync.Once           // guards lazy init of segmentIndex
+	nestedIndexOnce  sync.Once           // guards whole nested-layout preflight
+	nestedIndexes    map[*metapb.NestedSegmentSource]*segmentOffsetIndex
 
 	// clipSpans is the lazily-built absolute byte-range + delta table for the
 	// continuous-timeline remux, derived once from meta.ClipBoundaries.
@@ -913,26 +916,107 @@ type segmentOffsetIndex struct {
 	sizes   []int64 // Size of each segment's usable data
 }
 
-// buildSegmentIndex builds an offset index from metadata segments for O(1) lookup
-func buildSegmentIndex(segments []*metapb.SegmentData) *segmentOffsetIndex {
-	if len(segments) == 0 {
+// buildSegmentIndex validates an exact segment layout and builds its offset
+// index. Production callers provide the authoritative expected physical size.
+func buildSegmentIndex(expectedSize int64, segments []*metapb.SegmentData) *segmentOffsetIndex {
+	lengths, err := metadata.ValidateSegmentLayout(expectedSize, segments)
+	if err != nil {
 		return nil
 	}
+	return newSegmentOffsetIndex(lengths)
+}
 
+func newSegmentOffsetIndex(lengths []int64) *segmentOffsetIndex {
 	idx := &segmentOffsetIndex{
-		offsets: make([]int64, len(segments)),
-		sizes:   make([]int64, len(segments)),
+		offsets: make([]int64, len(lengths)),
+		sizes:   lengths,
 	}
 
 	var pos int64
-	for i, seg := range segments {
+	for i, usableLen := range lengths {
 		idx.offsets[i] = pos
-		usableLen := seg.EndOffset - seg.StartOffset + 1
-		idx.sizes[i] = usableLen
 		pos += usableLen
 	}
 
 	return idx
+}
+
+func (mvf *MetadataVirtualFile) initSegmentIndex() *segmentOffsetIndex {
+	mvf.segmentIndexOnce.Do(func() {
+		if mvf.meta == nil {
+			return
+		}
+		expectedSize, err := metadata.ExpectedSegmentLayoutSize(mvf.meta.FileSize, mvf.meta.Encryption)
+		if err != nil {
+			return
+		}
+		mvf.segmentIndex = buildSegmentIndex(expectedSize, mvf.meta.SegmentData)
+	})
+	return mvf.segmentIndex
+}
+
+func (mvf *MetadataVirtualFile) initNestedIndexes() map[*metapb.NestedSegmentSource]*segmentOffsetIndex {
+	mvf.nestedIndexOnce.Do(func() {
+		if mvf.meta == nil || len(mvf.meta.NestedSources) == 0 || mvf.meta.FileSize < 0 {
+			return
+		}
+
+		indexes := make(map[*metapb.NestedSegmentSource]*segmentOffsetIndex, len(mvf.meta.NestedSources))
+		type segmentSliceKey struct {
+			first **metapb.SegmentData
+			len   int
+		}
+		type cachedLayout struct {
+			index        *segmentOffsetIndex
+			physicalSize int64
+		}
+		layouts := make(map[segmentSliceKey]cachedLayout)
+		var totalLength int64
+		for _, src := range mvf.meta.NestedSources {
+			if src == nil || src.InnerOffset < 0 || src.InnerLength <= 0 || src.InnerVolumeSize < 0 || len(src.Segments) == 0 {
+				return
+			}
+			encrypted := len(src.AesKey) > 0
+
+			key := segmentSliceKey{first: &src.Segments[0], len: len(src.Segments)}
+			layout, ok := layouts[key]
+			if !ok {
+				lengths, physicalSize, err := metadata.InspectSegmentLayout(src.Segments)
+				if err != nil {
+					return
+				}
+				layout = cachedLayout{index: newSegmentOffsetIndex(lengths), physicalSize: physicalSize}
+				layouts[key] = layout
+			}
+			volumeSize := src.InnerVolumeSize
+			expectedPhysical := layout.physicalSize
+			if encrypted {
+				if volumeSize <= 0 {
+					return
+				}
+				computedSize, sizeErr := metadata.ExpectedSegmentLayoutSize(volumeSize, metapb.Encryption_AES)
+				if sizeErr != nil {
+					return
+				}
+				expectedPhysical = computedSize
+			} else if volumeSize > 0 {
+				expectedPhysical = volumeSize
+			} else {
+				volumeSize = layout.physicalSize
+			}
+			if layout.physicalSize != expectedPhysical || src.InnerOffset > volumeSize ||
+				src.InnerLength > volumeSize-src.InnerOffset || src.InnerLength > math.MaxInt64-totalLength {
+				return
+			}
+
+			totalLength += src.InnerLength
+			indexes[src] = layout.index
+		}
+		if totalLength == mvf.meta.FileSize {
+			mvf.nestedIndexes = indexes
+		}
+	})
+	return mvf.nestedIndexes
 }
 
 // findSegmentForOffset returns the segment index containing the given file offset
@@ -1220,18 +1304,16 @@ func (mvf *MetadataVirtualFile) tryServeFromRandomReadCache(readCtx context.Cont
 		len(mvf.meta.SegmentData) == 0 {
 		return 0, false
 	}
-	mvf.segmentIndexOnce.Do(func() {
-		mvf.segmentIndex = buildSegmentIndex(mvf.meta.SegmentData)
-	})
-	if mvf.segmentIndex == nil {
+	idx := mvf.initSegmentIndex()
+	if idx == nil {
 		return 0, false
 	}
-	segIdx := mvf.segmentIndex.findSegmentForOffset(off)
+	segIdx := idx.findSegmentForOffset(off)
 	if segIdx < 0 {
 		return 0, false
 	}
-	segStart := mvf.segmentIndex.getOffsetForSegment(segIdx)
-	segSize := mvf.segmentIndex.sizes[segIdx]
+	segStart := idx.getOffsetForSegment(segIdx)
+	segSize := idx.sizes[segIdx]
 	segEnd := segStart + segSize - 1
 	// Only single-segment reads benefit from the per-segment cache.
 	if end > segEnd {
@@ -1489,7 +1571,8 @@ func (mvf *MetadataVirtualFile) Close() error {
 		mvf.readerInitialized = false
 	}
 	mvf.segmentIndex = nil // Release segment offset index for GC
-	mvf.meta = nil         // Release segment/nested-source slices for GC
+	mvf.nestedIndexes = nil
+	mvf.meta = nil // Release segment/nested-source slices for GC
 	if mvf.randomReadCache != nil {
 		mvf.randomReadCache.Purge()
 		mvf.randomReadCache = nil
@@ -1754,10 +1837,10 @@ func (mvf *MetadataVirtualFile) createUsenetReader(ctx context.Context, start, e
 		return nil, ErrMissmatchedSegments
 	}
 
-	// Build segment offset index lazily on first read (thread-safe via sync.Once)
-	mvf.segmentIndexOnce.Do(func() {
-		mvf.segmentIndex = buildSegmentIndex(mvf.meta.SegmentData)
-	})
+	idx := mvf.initSegmentIndex()
+	if idx == nil {
+		return nil, ErrMissmatchedSegments
+	}
 
 	loader := newMetadataSegmentLoader(mvf.meta.SegmentData)
 
@@ -1765,10 +1848,10 @@ func (mvf *MetadataVirtualFile) createUsenetReader(ctx context.Context, start, e
 	// Use O(log n) binary search to find segment boundaries, then create a lazy
 	// range with O(1) initialization. Corrupt metadata (index returning -1) results
 	// in an empty range caught by HasSegments() below.
-	startSegIdx := mvf.segmentIndex.findSegmentForOffset(start)
-	startFilePos := mvf.segmentIndex.getOffsetForSegment(startSegIdx)
-	endSegIdx := mvf.segmentIndex.findSegmentForOffset(end)
-	endFilePos := mvf.segmentIndex.getOffsetForSegment(endSegIdx)
+	startSegIdx := idx.findSegmentForOffset(start)
+	startFilePos := idx.getOffsetForSegment(startSegIdx)
+	endSegIdx := idx.findSegmentForOffset(end)
+	endFilePos := idx.getOffsetForSegment(endSegIdx)
 
 	rg := usenet.NewLazySegmentRange(ctx, start, end, loader, startSegIdx, startFilePos, endSegIdx, endFilePos)
 
@@ -1823,6 +1906,10 @@ func (mvf *MetadataVirtualFile) createNestedReader(start, end int64) (io.ReadClo
 	if len(sources) == 0 {
 		return nil, fmt.Errorf("no nested sources available")
 	}
+	indexes := mvf.initNestedIndexes()
+	if indexes == nil {
+		return nil, fmt.Errorf("%w: invalid nested source layout", ErrMissmatchedSegments)
+	}
 
 	// Calculate which sources contain the requested byte range.
 	// Sources are concatenated: source 0 covers [0, InnerLength0),
@@ -1860,7 +1947,7 @@ func (mvf *MetadataVirtualFile) createNestedReader(start, end int64) (io.ReadClo
 			continue
 		}
 
-		specs = append(specs, nestedSourceSpec{src: src, localStart: localStart, readLen: readLen})
+		specs = append(specs, nestedSourceSpec{src: src, index: indexes[src], localStart: localStart, readLen: readLen})
 		sourceOffset += src.InnerLength
 	}
 
@@ -1875,6 +1962,7 @@ func (mvf *MetadataVirtualFile) createNestedReader(start, end int64) (io.ReadClo
 // starting at innerStart within the decrypted inner volume and reading readLen bytes.
 func (mvf *MetadataVirtualFile) createNestedSourceReader(
 	src *metapb.NestedSegmentSource,
+	idx *segmentOffsetIndex,
 	innerStart int64,
 	readLen int64,
 ) (io.ReadCloser, error) {
@@ -1898,24 +1986,28 @@ func (mvf *MetadataVirtualFile) createNestedSourceReader(
 			src.AesKey,
 			src.AesIv,
 			func(ctx context.Context, s, e int64) (io.ReadCloser, error) {
-				return mvf.createUsenetReaderFromSegments(ctx, src.Segments, s, e)
+				return mvf.createUsenetReaderFromSegments(ctx, src.Segments, idx, s, e)
 			},
 		)
 	}
 
 	// Unencrypted source: read directly from segments at inner offset
-	return mvf.createUsenetReaderFromSegments(mvf.ctx, src.Segments, absoluteStart, absoluteStart+readLen-1)
+	return mvf.createUsenetReaderFromSegments(mvf.ctx, src.Segments, idx, absoluteStart, absoluteStart+readLen-1)
 }
 
 // createUsenetReaderFromSegments creates a usenet reader from a specific set of segments
 // (used for nested source reading where segments differ from the main file metadata).
-func (mvf *MetadataVirtualFile) createUsenetReaderFromSegments(ctx context.Context, segments []*metapb.SegmentData, start, end int64) (io.ReadCloser, error) {
-	if len(segments) == 0 {
+func (mvf *MetadataVirtualFile) createUsenetReaderFromSegments(
+	ctx context.Context,
+	segments []*metapb.SegmentData,
+	idx *segmentOffsetIndex,
+	start, end int64,
+) (io.ReadCloser, error) {
+	if len(segments) == 0 || idx == nil {
 		return nil, ErrMissmatchedSegments
 	}
 
 	loader := newMetadataSegmentLoader(segments)
-	idx := buildSegmentIndex(segments)
 
 	startSegIdx := idx.findSegmentForOffset(start)
 	startFilePos := idx.getOffsetForSegment(startSegIdx)
@@ -1939,6 +2031,7 @@ func (mvf *MetadataVirtualFile) createUsenetReaderFromSegments(ctx context.Conte
 // nestedSourceSpec holds the parameters needed to lazily open one inner-volume reader.
 type nestedSourceSpec struct {
 	src        *metapb.NestedSegmentSource
+	index      *segmentOffsetIndex
 	localStart int64
 	readLen    int64
 }
@@ -1960,7 +2053,7 @@ func (r *lazyNestedMultiReader) Read(p []byte) (int, error) {
 				return 0, io.EOF
 			}
 			spec := r.specs[r.idx]
-			rc, err := r.mvf.createNestedSourceReader(spec.src, spec.localStart, spec.readLen)
+			rc, err := r.mvf.createNestedSourceReader(spec.src, spec.index, spec.localStart, spec.readLen)
 			if err != nil {
 				return 0, err
 			}

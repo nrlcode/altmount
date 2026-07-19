@@ -22,12 +22,13 @@ const (
 	// that may be zero-filled. A longer measured run fails the file.
 	MaxPadRunSegments = 4
 	// MaxPadTotalSegments is the cumulative padded-segment cap per file.
-	MaxPadTotalSegments = 64
+	MaxPadTotalSegments        = 64
+	maxPadFileBytesDenominator = int64(50)
 	// MaxPadFileBytesRatio is the cumulative padded-bytes share of the file
 	// above which it is unwatchable. The segment-count caps are the primary
 	// guards; this ratio only protects small files where the segment caps
 	// would be a large share.
-	MaxPadFileBytesRatio = 0.02
+	MaxPadFileBytesRatio = 1.0 / float64(maxPadFileBytesDenominator)
 	// ProjectionMinHits is the minimum number of confirmed misses a PARTIAL
 	// sample needs before a projection may fail a file; an observed run
 	// beyond MaxPadRunSegments fails regardless (measured, not projected).
@@ -109,9 +110,9 @@ func EligibleFile(name string) bool {
 // Classify applies the threshold table to a file's confirmed damage. runs
 // must cover the file's whole segment space (i.e. come from a full check or
 // the persisted hole map). fileBytes is the file's decoded size when known
-// (<= 0 skips the ratio guard); avgSegBytes an average decoded segment size
-// (encoded sizes are fine; yEnc overhead is negligible for the ratio guard).
-func Classify(runs []Run, fileBytes int64, avgSegBytes int64) Verdict {
+// (<= 0 skips the ratio guard); paddedBytes is the exact cumulative number of
+// file bytes covered by the confirmed holes.
+func Classify(runs []Run, fileBytes int64, paddedBytes int64) Verdict {
 	if len(runs) == 0 {
 		return VerdictClean
 	}
@@ -129,13 +130,8 @@ func Classify(runs []Run, fileBytes int64, avgSegBytes int64) Verdict {
 	if total > MaxPadTotalSegments {
 		return VerdictFailed
 	}
-	if fileBytes > 0 {
-		if avgSegBytes < 1 {
-			avgSegBytes = 1
-		}
-		if float64(total)*float64(avgSegBytes) > MaxPadFileBytesRatio*float64(fileBytes) {
-			return VerdictFailed
-		}
+	if fileBytes > 0 && paddedBytes > fileBytes/maxPadFileBytesDenominator {
+		return VerdictFailed
 	}
 	return VerdictDegraded
 }

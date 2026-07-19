@@ -236,16 +236,6 @@ func TestCheckFileRejectsMalformedSegmentsBeforeSTAT(t *testing.T) {
 	}
 }
 
-func TestMetadataSegmentLoaderRejectsNilWithoutPanic(t *testing.T) {
-	loader := &metadataSegmentLoader{segments: []*metapb.SegmentData{nil}}
-
-	var ok bool
-	require.NotPanics(t, func() {
-		_, _, ok = loader.GetSegment(0)
-	})
-	assert.False(t, ok)
-}
-
 func TestCheckFilesBatchMalformedFileDoesNotPoisonHealthySibling(t *testing.T) {
 	client := fakepool.New()
 	env := newBatchTestEnv(t, t.TempDir(), client)

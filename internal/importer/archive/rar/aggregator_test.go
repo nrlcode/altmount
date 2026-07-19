@@ -173,34 +173,43 @@ func TestProcessArchiveContextCancelledNotIsolated(t *testing.T) {
 }
 
 func TestProcessArchiveChildDeadlineNotIsolated(t *testing.T) {
-	metaRoot := t.TempDir()
-	proc := &scriptedRarProcessor{behavior: map[string]groupBehavior{
-		"seta": {err: fmt.Errorf("RAR child read timed out: %w", context.DeadlineExceeded)},
-		"setb": {contents: []Content{
-			{InternalPath: "videoB.mkv", Filename: "videoB.mkv", Size: 1000,
-				Segments: []*metapb.SegmentData{{Id: "b", StartOffset: 0, EndOffset: 999}}},
-		}},
-	}}
-
-	err := ProcessArchive(context.Background(), ProcessArchiveOptions{
-		VirtualDir: "movies/Release",
-		ArchiveFiles: []parser.ParsedFile{
-			{Filename: "setA.part01.rar"}, {Filename: "setA.part02.rar"},
-			{Filename: "setB.part01.rar"}, {Filename: "setB.part02.rar"},
-		},
-		NzbPath:         "movies/Release.nzb",
-		Processor:       proc,
-		MetadataService: metadata.NewMetadataService(metaRoot),
-		ExtractedFiles:  []parser.ExtractedFileInfo{{Name: "videoB.mkv", Size: 1000}},
-		MaxPrefetch:     1,
-		ReadTimeout:     30 * time.Second,
-	})
-
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("ProcessArchive error = %v, want wrapped context deadline exceeded", err)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "raw", err: context.DeadlineExceeded},
+		{name: "wrapped", err: fmt.Errorf("RAR child read timed out: %w", context.DeadlineExceeded)},
 	}
-	if metaExists(t, metaRoot, "movies/Release/videoB.mkv") {
-		t.Error("healthy sibling committed metadata after incomplete archive analysis")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metaRoot := t.TempDir()
+			proc := &scriptedRarProcessor{behavior: map[string]groupBehavior{
+				"seta": {err: tt.err},
+				"setb": {contents: []Content{
+					{InternalPath: "videoB.mkv", Filename: "videoB.mkv", Size: 1000,
+						Segments: []*metapb.SegmentData{{Id: "b", StartOffset: 0, EndOffset: 999}}},
+				}},
+			}}
+
+			err := ProcessArchive(context.Background(), ProcessArchiveOptions{
+				VirtualDir: "movies/Release",
+				ArchiveFiles: []parser.ParsedFile{
+					{Filename: "setA.part01.rar"}, {Filename: "setA.part02.rar"},
+					{Filename: "setB.part01.rar"}, {Filename: "setB.part02.rar"},
+				},
+				NzbPath:         "movies/Release.nzb",
+				Processor:       proc,
+				MetadataService: metadata.NewMetadataService(metaRoot),
+				ExtractedFiles:  []parser.ExtractedFileInfo{{Name: "videoB.mkv", Size: 1000}},
+				MaxPrefetch:     1,
+				ReadTimeout:     30 * time.Second,
+			})
+
+			require.ErrorIs(t, err, context.DeadlineExceeded, "child deadline must propagate")
+			require.False(t, metaExists(t, metaRoot, "movies/Release/videoB.mkv"),
+				"healthy sibling committed metadata after incomplete archive analysis")
+		})
 	}
 }
 

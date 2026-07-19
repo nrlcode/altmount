@@ -46,6 +46,33 @@ func TestValidateSegmentsForFile_EmptySegmentsError(t *testing.T) {
 	}
 }
 
+func TestValidateSegmentsForFile_UsesEncryptionAwarePhysicalCoverage(t *testing.T) {
+	tests := []struct {
+		name         string
+		fileSize     int64
+		physicalSize int64
+		encryption   metapb.Encryption
+		wantError    bool
+	}{
+		{"AES accepts padded physical coverage", 17, 32, metapb.Encryption_AES, false},
+		{"AES rejects logical-only coverage", 17, 17, metapb.Encryption_AES, true},
+		{"rclone accepts header and block overhead", 1, 49, metapb.Encryption_RCLONE, false},
+		{"rclone rejects logical-only coverage", 1, 1, metapb.Encryption_RCLONE, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSegmentsForFile(
+				"encrypted.bin", tt.fileSize,
+				segmentsOfSize("encrypted", 1, tt.physicalSize), tt.encryption,
+			)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("ValidateSegmentsForFile() error = %v, wantError %t", err, tt.wantError)
+			}
+		})
+	}
+}
+
 func TestValidateSegmentsForFile_RejectsInvalidPhysicalBounds(t *testing.T) {
 	tests := []struct {
 		name     string

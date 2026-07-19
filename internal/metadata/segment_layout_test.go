@@ -57,3 +57,44 @@ func TestValidateSegmentLayout(t *testing.T) {
 		})
 	}
 }
+
+func TestExpectedSegmentLayoutSize(t *testing.T) {
+	valid := []struct {
+		name       string
+		fileSize   int64
+		encryption metapb.Encryption
+		want       int64
+	}{
+		{"plain", 17, metapb.Encryption_NONE, 17},
+		{"AES aligned", 16, metapb.Encryption_AES, 16},
+		{"AES padded", 17, metapb.Encryption_AES, 32},
+		{"rclone empty payload", 0, metapb.Encryption_RCLONE, 32},
+	}
+	for _, tt := range valid {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ExpectedSegmentLayoutSize(tt.fileSize, tt.encryption)
+			if err != nil || got != tt.want {
+				t.Fatalf("ExpectedSegmentLayoutSize() = (%d, %v), want (%d, nil)", got, err, tt.want)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name       string
+		fileSize   int64
+		encryption metapb.Encryption
+	}{
+		{"negative size", -1, metapb.Encryption_NONE},
+		{"AES overflow", math.MaxInt64, metapb.Encryption_AES},
+		{"rclone overflow", math.MaxInt64, metapb.Encryption_RCLONE},
+		{"unsupported headers", 17, metapb.Encryption_HEADERS},
+		{"unknown enum", 17, metapb.Encryption(99)},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ExpectedSegmentLayoutSize(tt.fileSize, tt.encryption); err == nil {
+				t.Fatal("ExpectedSegmentLayoutSize() error = nil, want rejection")
+			}
+		})
+	}
+}

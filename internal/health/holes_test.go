@@ -207,16 +207,64 @@ func TestHealthCheckSkipsClassificationForNonVideo(t *testing.T) {
 	assert.Nil(t, event.Classification, "non-video files are not hole-classified")
 }
 
-func TestHealthCheckSkipsClassificationForEncrypted(t *testing.T) {
-	env := newHoleTestEnv(t, "movie.mp4", 4*1024*1024, 1024)
-	require.NoError(t, env.ms.UpdateFileMetadata(env.filePath, func(m *metapb.FileMetadata) {
-		m.Encryption = metapb.Encryption_RCLONE
-	}))
-	env.markSegmentMissing(10)
+func TestHealthCheckEncryptedLayoutWiring(t *testing.T) {
+	const (
+		aesLogicalSize    = int64(17)
+		rcloneLogicalSize = int64(65_537)
+	)
+	aesPhysicalSize, err := metadata.ExpectedSegmentLayoutSize(aesLogicalSize, metapb.Encryption_AES)
+	require.NoError(t, err)
+	rclonePhysicalSize, err := metadata.ExpectedSegmentLayoutSize(rcloneLogicalSize, metapb.Encryption_RCLONE)
+	require.NoError(t, err)
 
-	event := env.checker.CheckFile(context.Background(), env.filePath)
-	require.Equal(t, EventTypeFileCorrupted, event.Type)
-	assert.Nil(t, event.Classification, "encrypted files are not hole-classified")
+	tests := []struct {
+		name         string
+		encryption   metapb.Encryption
+		logicalSize  int64
+		physicalSize int64
+		wantSTAT     bool
+	}{
+		{
+			name:       "non-aligned AES physical coverage accepted",
+			encryption: metapb.Encryption_AES, logicalSize: aesLogicalSize,
+			physicalSize: aesPhysicalSize, wantSTAT: true,
+		},
+		{
+			name:       "RCLONE physical coverage accepted",
+			encryption: metapb.Encryption_RCLONE, logicalSize: rcloneLogicalSize,
+			physicalSize: rclonePhysicalSize, wantSTAT: true,
+		},
+		{
+			name:       "AES logical-only coverage rejected",
+			encryption: metapb.Encryption_AES, logicalSize: aesLogicalSize,
+			physicalSize: aesLogicalSize,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newHoleTestEnvWithSegmentSizes(t, "movie.mp4", []int64{tt.physicalSize})
+			require.NoError(t, env.ms.UpdateFileMetadata(env.filePath, func(m *metapb.FileMetadata) {
+				m.FileSize = tt.logicalSize
+				m.Encryption = tt.encryption
+			}))
+			if tt.wantSTAT {
+				env.markSegmentMissing(0)
+			}
+
+			event := env.checker.CheckFile(context.Background(), env.filePath)
+			require.Equal(t, EventTypeFileCorrupted, event.Type)
+			require.Error(t, event.Error)
+			assert.Nil(t, event.Classification, "encrypted files are not hole-classified")
+			if tt.wantSTAT {
+				assert.Equal(t, int64(1), env.fp.StatCalls(), "valid encrypted layout must reach STAT")
+				assert.Contains(t, event.Error.Error(), "checked segments are missing")
+			} else {
+				assert.Zero(t, env.fp.StatCalls(), "physical-size mismatch must fail before network I/O")
+				assert.Contains(t, event.Error.Error(), "metadata corruption")
+			}
+		})
+	}
 }
 
 func TestHealthCheckIgnoresLegacyPersistedHoles(t *testing.T) {
@@ -234,6 +282,83 @@ func TestHealthCheckIgnoresLegacyPersistedHoles(t *testing.T) {
 	assert.Equal(t, 1, event.Classification.TotalMissing)
 }
 
+func TestHealthClassificationUsesPreparedMetadataSnapshot(t *testing.T) {
+	originalSizes := make([]int64, 50)
+	for i := range originalSizes {
+		originalSizes[i] = 200
+	}
+	env := newHoleTestEnvWithSegmentSizes(t, "movie.mp4", originalSizes)
+	ctx := context.Background()
+
+	original := env.checker.prepareCheck(ctx, env.filePath)
+	require.Nil(t, original.earlyEvent)
+	require.True(t, original.holeEligible)
+	require.Equal(t, int64(10_000), original.fileSize)
+	require.Len(t, original.sampledTargets, 50)
+	assert.Equal(t, usenet.ValidationTarget{
+		ID: env.segIDs[0], Index: 0, Start: 0, End: 199,
+	}, original.sampledTargets[0])
+	assert.Equal(t, usenet.ValidationTarget{
+		ID: env.segIDs[49], Index: 49, Start: 9_800, End: 9_999,
+	}, original.sampledTargets[49])
+
+	missingResult := func(prep preparedCheck) usenet.ValidationResult {
+		target := prep.sampledTargets[0]
+		return usenet.ValidationResult{
+			TotalExpected: len(prep.sampledTargets),
+			TotalChecked:  len(prep.sampledTargets),
+			MissingCount:  1,
+			MissingIDs:    []string{target.ID},
+			MissingSegments: []usenet.MissingSegment{{
+				Index: target.Index, ID: target.ID, Start: target.Start, End: target.End,
+			}},
+		}
+	}
+	originalResult := missingResult(original)
+
+	// Replace the backing metadata with a smaller, differently partitioned but
+	// valid layout. A fresh preparation would classify its 300-byte first
+	// segment as 6.25% damage (failed), rather than the original 2% (degraded).
+	replacementSegments := []*metapb.SegmentData{
+		{Id: "replacement-0@test", SegmentSize: 300, StartOffset: 0, EndOffset: 299},
+		{Id: "replacement-1@test", SegmentSize: 4_500, StartOffset: 0, EndOffset: 4_499},
+	}
+	require.NoError(t, env.ms.UpdateFileMetadata(env.filePath, func(m *metapb.FileMetadata) {
+		m.FileSize = 4_800
+		m.SegmentData = replacementSegments
+	}))
+
+	replacement := env.checker.prepareCheck(ctx, env.filePath)
+	require.Nil(t, replacement.earlyEvent)
+	require.True(t, replacement.holeEligible)
+	assert.Equal(t, usenet.ValidationTarget{
+		ID: "replacement-0@test", Index: 0, Start: 0, End: 299,
+	}, replacement.sampledTargets[0])
+	replacementImpact := env.checker.classifyHoles(replacement, missingResult(replacement))
+	require.NotNil(t, replacementImpact)
+	assert.Equal(t, holes.VerdictFailed, replacementImpact.Verdict)
+	assert.InDelta(t, 0.0625, replacementImpact.PaddedRatio, 1e-12)
+
+	// The replacement's aligned physical layout is also valid AES coverage.
+	// Changing encryption therefore flips only eligibility, not preparation
+	// validity, and demonstrates that eligibility is part of the snapshot too.
+	require.NoError(t, env.ms.UpdateFileMetadata(env.filePath, func(m *metapb.FileMetadata) {
+		m.Encryption = metapb.Encryption_AES
+	}))
+	encryptedReplacement := env.checker.prepareCheck(ctx, env.filePath)
+	require.Nil(t, encryptedReplacement.earlyEvent)
+	assert.False(t, encryptedReplacement.holeEligible)
+	assert.Nil(t, env.checker.classifyHoles(encryptedReplacement, missingResult(encryptedReplacement)))
+
+	// Judging the already-prepared sweep must use its copied size, eligibility,
+	// and positional ranges even though the backing metadata now says otherwise.
+	event := env.checker.judgeValidation(ctx, original, originalResult, nil)
+	require.Equal(t, EventTypeFileCorrupted, event.Type)
+	require.NotNil(t, event.Classification)
+	assert.Equal(t, holes.VerdictDegraded, event.Classification.Verdict)
+	assert.InDelta(t, 0.02, event.Classification.PaddedRatio, 1e-12)
+}
+
 func TestHealthClassificationUsesCompletePositionalMissingSet(t *testing.T) {
 	env := newHoleTestEnv(t, "movie.mp4", 4*1024*1024, 1024)
 
@@ -249,7 +374,10 @@ func TestHealthClassificationUsesCompletePositionalMissingSet(t *testing.T) {
 		}
 	}
 
-	impact := env.checker.classifyHoles(context.Background(), env.filePath, usenet.ValidationResult{
+	impact := env.checker.classifyHoles(preparedCheck{
+		filePath: env.filePath, fileSize: 4 * 1024 * 1024,
+		totalSegments: len(env.segIDs), holeEligible: true,
+	}, usenet.ValidationResult{
 		TotalChecked:    len(env.segIDs),
 		MissingCount:    len(missing),
 		MissingIDs:      examples,

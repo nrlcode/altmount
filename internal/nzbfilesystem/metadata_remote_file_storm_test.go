@@ -71,12 +71,12 @@ func (r *slowCloseReader) Close() error {
 func TestStorm_RandomReadAtCreatesEphemeralReaderPerCall(t *testing.T) {
 	t.Parallel()
 	const (
-		segCount     = 200
-		segSize      = 1024
-		readCount    = 200
-		readSize     = 64
+		segCount      = 200
+		segSize       = 1024
+		readCount     = 200
+		readSize      = 64
 		hotWindowSegs = 8 // working set fits in randomReadCacheSize
-		maxPrefetch  = 4
+		maxPrefetch   = 4
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -129,7 +129,7 @@ func TestStorm_RandomReadAtCreatesEphemeralReaderPerCall(t *testing.T) {
 // 16 KiB). The cache then slices `full[rel : rel + len(p)]` past the
 // segment's actual size:
 //
-//   panic: runtime error: slice bounds out of range [:704512] with capacity 703432
+//	panic: runtime error: slice bounds out of range [:704512] with capacity 703432
 //
 // reproduced on a Jellyfin library scan against an .mp4 whose last
 // segment is partially-filled. The fix clamps the copy length to the
@@ -166,11 +166,15 @@ func TestRandomReadCache_EOFReadDoesNotPanic(t *testing.T) {
 
 	segData := make([]*metapb.SegmentData, fullSegs+1)
 	for i := range segData {
+		endOffset := int64(segSize - 1)
+		if i == fullSegs {
+			endOffset = tailUsable - 1
+		}
 		segData[i] = &metapb.SegmentData{
 			Id:          segments.MessageID(i),
 			SegmentSize: int64(segSize),
 			StartOffset: 0,
-			EndOffset:   int64(segSize - 1),
+			EndOffset:   endOffset,
 		}
 	}
 	fileSize := int64(fullSegs*segSize + tailUsable)

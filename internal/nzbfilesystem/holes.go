@@ -3,6 +3,7 @@ package nzbfilesystem
 import (
 	"context"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/javi11/altmount/internal/database"
@@ -46,6 +47,11 @@ func (mvf *MetadataVirtualFile) holeHooks() *usenet.HoleHooks {
 // within the padding caps — records the file as degraded off the hot path.
 // Runs on download goroutines: no network, no blocking I/O.
 func (mvf *MetadataVirtualFile) onHole(segIndex int, segID string) holes.Decision {
+	idx := mvf.initSegmentIndex()
+	if idx == nil || segIndex < 0 || segIndex >= len(idx.sizes) || mvf.holeAcc == nil {
+		return holes.DecisionFail
+	}
+
 	mvf.holeMu.Lock()
 	alreadyKnown := mvf.holeAcc.Has(segIndex)
 	mvf.holeAcc.Add(segIndex)
@@ -55,8 +61,11 @@ func (mvf *MetadataVirtualFile) onHole(segIndex int, segID string) holes.Decisio
 	mvf.holeMu.Unlock()
 
 	totalSegments := len(mvf.meta.SegmentData)
-	segBytes := avgSegBytes(mvf.meta.FileSize, totalSegments)
-	verdict := holes.Classify(runs, mvf.meta.FileSize, segBytes)
+	paddedBytes, ok := paddedBytesForRuns(runs, idx)
+	if !ok {
+		return holes.DecisionFail
+	}
+	verdict := holes.Classify(runs, mvf.meta.FileSize, paddedBytes)
 	if verdict != holes.VerdictDegraded {
 		// Caps exceeded: fail the stream; the DataCorruptionError path takes
 		// over (repair trigger, safety-folder move) as it always has.
@@ -71,7 +80,7 @@ func (mvf *MetadataVirtualFile) onHole(segIndex int, segID string) holes.Decisio
 	// Record the degradation without stalling the download goroutine. Replays
 	// within this handle change nothing, so only new discoveries write.
 	if !alreadyKnown {
-		go mvf.recordDegradedPad(total, longest, totalSegments, segBytes)
+		go mvf.recordDegradedPad(total, longest, totalSegments, paddedBytes)
 	}
 	return holes.DecisionPad
 }
@@ -82,7 +91,7 @@ func (mvf *MetadataVirtualFile) onHole(segIndex int, segID string) holes.Decisio
 // safety-folder move and NO masking-counter increment — the file still plays.
 // Status writes are debounced per file so a burst of pads writes once per
 // window.
-func (mvf *MetadataVirtualFile) recordDegradedPad(total, longest, totalSegments int, segBytes int64) {
+func (mvf *MetadataVirtualFile) recordDegradedPad(total, longest, totalSegments int, paddedBytes int64) {
 	// Distinct debounce key from the repair path so pads never consume a
 	// repair-trigger token.
 	if !mvf.repairCoalescer.ShouldTrigger(mvf.name + "\x00degraded-pad") {
@@ -105,7 +114,7 @@ func (mvf *MetadataVirtualFile) recordDegradedPad(total, longest, totalSegments 
 			TotalMissing:  total,
 			LongestRun:    longest,
 			TotalSegments: totalSegments,
-			PaddedRatio:   paddedRatio(total, segBytes, mvf.meta.FileSize),
+			PaddedRatio:   paddedRatio(paddedBytes, mvf.meta.FileSize),
 		},
 	}
 	errorMsg := "missing segments zero-filled during streaming"
@@ -148,37 +157,60 @@ func (mvf *MetadataVirtualFile) classifyStreamingFailure(dcErr *usenet.DataCorru
 	}
 	mvf.holeMu.Unlock()
 
+	idx := mvf.initSegmentIndex()
+	if idx == nil {
+		return &holes.Impact{Verdict: holes.VerdictFailed, TotalSegments: len(mvf.meta.SegmentData)}
+	}
+
 	// Fold in the failing segment when its position is known.
 	if dcErr.FileOffset >= 0 {
-		idx := buildSegmentIndex(mvf.meta.SegmentData)
 		if segIdx := idx.findSegmentForOffset(dcErr.FileOffset); segIdx >= 0 {
 			acc.Add(segIdx)
 		}
 	}
 
 	totalSegments := len(mvf.meta.SegmentData)
-	segBytes := avgSegBytes(mvf.meta.FileSize, totalSegments)
+	paddedBytes, ok := paddedBytesForRuns(acc.Runs(), idx)
+	if !ok {
+		return &holes.Impact{
+			Verdict:       holes.VerdictFailed,
+			TotalMissing:  acc.Total(),
+			LongestRun:    acc.LongestRun(),
+			TotalSegments: totalSegments,
+		}
+	}
 	return &holes.Impact{
-		Verdict:       holes.Classify(acc.Runs(), mvf.meta.FileSize, segBytes),
+		Verdict:       holes.Classify(acc.Runs(), mvf.meta.FileSize, paddedBytes),
 		TotalMissing:  acc.Total(),
 		LongestRun:    acc.LongestRun(),
 		TotalSegments: totalSegments,
-		PaddedRatio:   paddedRatio(acc.Total(), segBytes, mvf.meta.FileSize),
+		PaddedRatio:   paddedRatio(paddedBytes, mvf.meta.FileSize),
 	}
 }
 
-// avgSegBytes estimates the decoded segment size for the byte-ratio guard.
-func avgSegBytes(fileSize int64, totalSegments int) int64 {
-	if totalSegments <= 0 || fileSize <= 0 {
-		return 1
+func paddedBytesForRuns(runs []holes.Run, idx *segmentOffsetIndex) (int64, bool) {
+	if idx == nil {
+		return 0, false
 	}
-	return fileSize / int64(totalSegments)
+	var total int64
+	for _, run := range runs {
+		if run.Start < 0 || run.Count <= 0 || run.Start > len(idx.sizes)-run.Count {
+			return 0, false
+		}
+		for i := run.Start; i < run.Start+run.Count; i++ {
+			if idx.sizes[i] > math.MaxInt64-total {
+				return 0, false
+			}
+			total += idx.sizes[i]
+		}
+	}
+	return total, true
 }
 
 // paddedRatio is missing bytes over file bytes (0 when size is unknown).
-func paddedRatio(total int, segBytes, fileSize int64) float64 {
+func paddedRatio(paddedBytes, fileSize int64) float64 {
 	if fileSize <= 0 {
 		return 0
 	}
-	return float64(int64(total)*segBytes) / float64(fileSize)
+	return float64(paddedBytes) / float64(fileSize)
 }
