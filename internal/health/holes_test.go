@@ -198,6 +198,30 @@ func TestHealthCheckUsesExactMissingSegmentBytes(t *testing.T) {
 	assert.InDelta(t, 0.03, event.Classification.PaddedRatio, 1e-12)
 }
 
+func TestHealthSampledClassificationExactBytesOverrideProjection(t *testing.T) {
+	result := usenet.ValidationResult{
+		TotalExpected: 100,
+		TotalChecked:  50,
+		MissingCount:  1,
+		MissingSegments: []usenet.MissingSegment{{
+			Index: 0,
+			Start: 0,
+			End:   299,
+		}},
+	}
+
+	assert.Equal(t, holes.VerdictDegraded,
+		holes.ClassifyProjected(result.MissingCount, result.TotalChecked, 100, 1))
+	impact := (&HealthChecker{}).classifyHoles(preparedCheck{
+		fileSize:      10_000,
+		totalSegments: 100,
+		holeEligible:  true,
+	}, result)
+	require.NotNil(t, impact)
+	assert.Equal(t, holes.VerdictFailed, impact.Verdict)
+	assert.InDelta(t, 0.03, impact.PaddedRatio, 1e-12)
+}
+
 func TestHealthCheckSkipsClassificationForNonVideo(t *testing.T) {
 	env := newHoleTestEnv(t, "archive.rar", 4*1024*1024, 1024)
 	env.markSegmentMissing(10)

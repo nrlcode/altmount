@@ -104,18 +104,21 @@ func TestCreateNestedReaderRejectsInvalidWholeTopology(t *testing.T) {
 		Segments: nestedTestSegments("valid@test", 5), InnerLength: 5, InnerVolumeSize: 5,
 	}
 	tests := []struct {
-		name   string
-		second *metapb.NestedSegmentSource
+		name     string
+		second   *metapb.NestedSegmentSource
+		fileSize int64
 	}{
-		{"nil later source", nil},
-		{"nil later segment", &metapb.NestedSegmentSource{Segments: []*metapb.SegmentData{nil}, InnerLength: 5, InnerVolumeSize: 5}},
-		{"range outside volume", &metapb.NestedSegmentSource{Segments: nestedTestSegments("range@test", 5), InnerOffset: 4, InnerLength: 2, InnerVolumeSize: 5}},
+		{"nil later source", nil, 10},
+		{"nil later segment", &metapb.NestedSegmentSource{Segments: []*metapb.SegmentData{nil}, InnerLength: 5, InnerVolumeSize: 5}, 10},
+		{"range outside volume", &metapb.NestedSegmentSource{Segments: nestedTestSegments("range@test", 5), InnerOffset: 4, InnerLength: 2, InnerVolumeSize: 5}, 10},
+		{"aggregate shorter than file", &metapb.NestedSegmentSource{Segments: nestedTestSegments("short@test", 5), InnerLength: 4, InnerVolumeSize: 5}, 10},
+		{"aggregate longer than file", &metapb.NestedSegmentSource{Segments: nestedTestSegments("long@test", 5), InnerLength: 5, InnerVolumeSize: 5}, 9},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mvf := &MetadataVirtualFile{meta: &fileHandleMeta{
-				FileSize: 10, NestedSources: []*metapb.NestedSegmentSource{valid, tt.second},
+				FileSize: tt.fileSize, NestedSources: []*metapb.NestedSegmentSource{valid, tt.second},
 			}}
 			reader, err := mvf.createNestedReader(0, 4)
 			if reader != nil {
