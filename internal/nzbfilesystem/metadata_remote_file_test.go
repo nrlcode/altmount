@@ -108,11 +108,60 @@ func TestBuildSegmentIndex(t *testing.T) {
 			},
 			wantNil: false,
 		},
+		{
+			name:     "nil segment entry",
+			segments: []*metapb.SegmentData{nil},
+			wantNil:  true,
+		},
+		{
+			name: "negative start offset",
+			segments: []*metapb.SegmentData{
+				{StartOffset: -1, EndOffset: 999, SegmentSize: 1000},
+			},
+			wantNil: true,
+		},
+		{
+			name: "start after end",
+			segments: []*metapb.SegmentData{
+				{StartOffset: 10, EndOffset: 9, SegmentSize: 1000},
+			},
+			wantNil: true,
+		},
+		{
+			name: "zero physical size",
+			segments: []*metapb.SegmentData{
+				{StartOffset: 0, EndOffset: 0, SegmentSize: 0},
+			},
+			wantNil: true,
+		},
+		{
+			name: "negative physical size",
+			segments: []*metapb.SegmentData{
+				{StartOffset: 0, EndOffset: 0, SegmentSize: -1},
+			},
+			wantNil: true,
+		},
+		{
+			name: "end outside physical segment",
+			segments: []*metapb.SegmentData{
+				{StartOffset: 0, EndOffset: 1000, SegmentSize: 1000},
+			},
+			wantNil: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			idx := buildSegmentIndex(tt.segments)
+			var idx *segmentOffsetIndex
+			var panicValue any
+			func() {
+				defer func() { panicValue = recover() }()
+				idx = buildSegmentIndex(tt.segments)
+			}()
+			if panicValue != nil {
+				t.Errorf("buildSegmentIndex() panicked: %v", panicValue)
+				return
+			}
 			if tt.wantNil {
 				if idx != nil {
 					t.Errorf("buildSegmentIndex() = %v, want nil", idx)

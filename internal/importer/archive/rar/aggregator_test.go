@@ -3,6 +3,7 @@ package rar
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -169,6 +170,38 @@ func TestProcessArchiveContextCancelledNotIsolated(t *testing.T) {
 		ReadTimeout:     30 * time.Second,
 	})
 	require.ErrorIs(t, err, context.Canceled, "cancellation must propagate, never be isolated")
+}
+
+func TestProcessArchiveChildDeadlineNotIsolated(t *testing.T) {
+	metaRoot := t.TempDir()
+	proc := &scriptedRarProcessor{behavior: map[string]groupBehavior{
+		"seta": {err: fmt.Errorf("RAR child read timed out: %w", context.DeadlineExceeded)},
+		"setb": {contents: []Content{
+			{InternalPath: "videoB.mkv", Filename: "videoB.mkv", Size: 1000,
+				Segments: []*metapb.SegmentData{{Id: "b", StartOffset: 0, EndOffset: 999}}},
+		}},
+	}}
+
+	err := ProcessArchive(context.Background(), ProcessArchiveOptions{
+		VirtualDir: "movies/Release",
+		ArchiveFiles: []parser.ParsedFile{
+			{Filename: "setA.part01.rar"}, {Filename: "setA.part02.rar"},
+			{Filename: "setB.part01.rar"}, {Filename: "setB.part02.rar"},
+		},
+		NzbPath:         "movies/Release.nzb",
+		Processor:       proc,
+		MetadataService: metadata.NewMetadataService(metaRoot),
+		ExtractedFiles:  []parser.ExtractedFileInfo{{Name: "videoB.mkv", Size: 1000}},
+		MaxPrefetch:     1,
+		ReadTimeout:     30 * time.Second,
+	})
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("ProcessArchive error = %v, want wrapped context deadline exceeded", err)
+	}
+	if metaExists(t, metaRoot, "movies/Release/videoB.mkv") {
+		t.Error("healthy sibling committed metadata after incomplete archive analysis")
+	}
 }
 
 func TestProcessArchiveSkipsGroupWithVolumeGap(t *testing.T) {

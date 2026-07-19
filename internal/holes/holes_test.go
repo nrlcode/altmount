@@ -83,6 +83,17 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestClassifyUsesExactPaddedBytesAtRatioBoundary(t *testing.T) {
+	runs := []Run{{Start: 10, Count: 2}}
+
+	if got := Classify(runs, 10_000, 200); got != VerdictDegraded {
+		t.Errorf("Classify() at exact 2%% boundary = %v, want %v", got, VerdictDegraded)
+	}
+	if got := Classify(runs, 10_000, 201); got != VerdictFailed {
+		t.Errorf("Classify() above 2%% boundary = %v, want %v", got, VerdictFailed)
+	}
+}
+
 func TestClassifyProjected(t *testing.T) {
 	tests := []struct {
 		name          string

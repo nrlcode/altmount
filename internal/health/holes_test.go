@@ -42,23 +42,33 @@ type holeTestEnv struct {
 
 func newHoleTestEnv(t *testing.T, fileName string, fileSize, segSize int64) *holeTestEnv {
 	t.Helper()
+	var sizes []int64
+	for off := int64(0); off < fileSize; off += segSize {
+		sizes = append(sizes, min(segSize, fileSize-off))
+	}
+	return newHoleTestEnvWithSegmentSizes(t, fileName, sizes)
+}
+
+func newHoleTestEnvWithSegmentSizes(t *testing.T, fileName string, sizes []int64) *holeTestEnv {
+	t.Helper()
 	tempDir := t.TempDir()
 	ms := metadata.NewMetadataService(tempDir)
 	fp := fakepool.New()
 
+	var fileSize int64
 	var segs []*metapb.SegmentData
 	var ids []string
-	for off := int64(0); off < fileSize; off += segSize {
-		end := min(off+segSize, fileSize)
+	for _, size := range sizes {
 		id := fmt.Sprintf("hole-seg-%d@test", len(segs))
-		fp.SetBehavior(id, fakepool.SegmentBehavior{Bytes: make([]byte, end-off)})
+		fp.SetBehavior(id, fakepool.SegmentBehavior{Bytes: make([]byte, size)})
 		segs = append(segs, &metapb.SegmentData{
 			Id:          id,
-			SegmentSize: end - off,
+			SegmentSize: size,
 			StartOffset: 0,
-			EndOffset:   end - off - 1,
+			EndOffset:   size - 1,
 		})
 		ids = append(ids, id)
+		fileSize += size
 	}
 
 	filePath := "/movies/" + fileName
@@ -151,6 +161,41 @@ func TestHealthCheckClassifiesLongRunAsFailed(t *testing.T) {
 	meta, err := env.ms.ReadFileMetadata(env.filePath)
 	require.NoError(t, err)
 	assert.Empty(t, meta.KnownHoles)
+}
+
+func TestHealthCheckExactTwoPercentIsDegraded(t *testing.T) {
+	sizes := make([]int64, 50)
+	for i := range sizes {
+		sizes[i] = 200
+	}
+	env := newHoleTestEnvWithSegmentSizes(t, "movie.mp4", sizes)
+	env.markSegmentMissing(0)
+
+	event := env.checker.CheckFile(context.Background(), env.filePath)
+	require.Equal(t, EventTypeFileCorrupted, event.Type)
+	require.NotNil(t, event.Classification)
+	assert.Equal(t, holes.VerdictDegraded, event.Classification.Verdict)
+	assert.InDelta(t, 0.02, event.Classification.PaddedRatio, 1e-12)
+}
+
+func TestHealthCheckUsesExactMissingSegmentBytes(t *testing.T) {
+	// One 300-byte segment plus 98 98-byte segments and one 96-byte segment:
+	// exactly 10,000 bytes across 100 non-uniform segments. The missing first
+	// segment is 3% of the file even though the average segment is only 1%.
+	sizes := make([]int64, 100)
+	sizes[0] = 300
+	for i := 1; i < 99; i++ {
+		sizes[i] = 98
+	}
+	sizes[99] = 96
+	env := newHoleTestEnvWithSegmentSizes(t, "movie.mp4", sizes)
+	env.markSegmentMissing(0)
+
+	event := env.checker.CheckFile(context.Background(), env.filePath)
+	require.Equal(t, EventTypeFileCorrupted, event.Type)
+	require.NotNil(t, event.Classification)
+	assert.Equal(t, holes.VerdictFailed, event.Classification.Verdict)
+	assert.InDelta(t, 0.03, event.Classification.PaddedRatio, 1e-12)
 }
 
 func TestHealthCheckSkipsClassificationForNonVideo(t *testing.T) {
