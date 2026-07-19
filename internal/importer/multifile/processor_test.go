@@ -184,7 +184,7 @@ func parsedTestFile(filename, segmentID string) parser.ParsedFile {
 		Filename: filename,
 		Size:     100,
 		Segments: []*metapb.SegmentData{
-			{Id: segmentID, StartOffset: 0, EndOffset: 99},
+			{Id: segmentID, SegmentSize: 100, StartOffset: 0, EndOffset: 99},
 		},
 		ReleaseDate: time.Unix(1, 0),
 	}
@@ -196,7 +196,7 @@ func parsedTestFileSizeMismatch(filename, segmentID string) parser.ParsedFile {
 		Filename: filename,
 		Size:     999, // declared larger than the 100-byte segment
 		Segments: []*metapb.SegmentData{
-			{Id: segmentID, StartOffset: 0, EndOffset: 99},
+			{Id: segmentID, SegmentSize: 100, StartOffset: 0, EndOffset: 99},
 		},
 		ReleaseDate: time.Unix(1, 0),
 	}

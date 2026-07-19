@@ -74,6 +74,15 @@ func writeHealthyFile(t *testing.T, env *repairTestEnv, filePath string) string 
 	return seg.Id
 }
 
+func writeSegmentMetadata(t *testing.T, env *repairTestEnv, filePath string, fileSize int64, segments []*metapb.SegmentData) {
+	t.Helper()
+	meta := env.metadataService.CreateFileMetadata(
+		fileSize, "test.nzb", metapb.FileStatus_FILE_STATUS_HEALTHY,
+		segments, metapb.Encryption_NONE, "", "", nil, nil, 0, nil, "",
+	)
+	require.NoError(t, env.metadataService.WriteFileMetadata(filePath, meta))
+}
+
 func TestCheckFilesBatch(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlinks not supported on Windows")
@@ -166,6 +175,81 @@ func TestCheckFilesBatch(t *testing.T) {
 		env := newBatchTestEnv(t, t.TempDir(), client)
 		assert.Nil(t, env.healthChecker.CheckFilesBatch(context.Background(), nil))
 	})
+}
+
+func TestCheckFileRejectsMalformedSegmentsBeforeSTAT(t *testing.T) {
+	tests := []struct {
+		name     string
+		fileSize int64
+		segment  *metapb.SegmentData
+	}{
+		{
+			name:     "nil segment",
+			fileSize: 1,
+			segment:  nil,
+		},
+		{
+			name:     "empty message ID",
+			fileSize: 1,
+			segment:  &metapb.SegmentData{StartOffset: 0, EndOffset: 0, SegmentSize: 1},
+		},
+		{
+			name:     "negative start offset",
+			fileSize: 2,
+			segment:  &metapb.SegmentData{Id: "negative@test", StartOffset: -1, EndOffset: 0, SegmentSize: 2},
+		},
+		{
+			name:     "start after end",
+			fileSize: 1,
+			segment:  &metapb.SegmentData{Id: "reversed@test", StartOffset: 1, EndOffset: 0, SegmentSize: 2},
+		},
+		{
+			name:     "zero physical size",
+			fileSize: 1,
+			segment:  &metapb.SegmentData{Id: "zero@test", StartOffset: 0, EndOffset: 0, SegmentSize: 0},
+		},
+		{
+			name:     "negative physical size",
+			fileSize: 1,
+			segment:  &metapb.SegmentData{Id: "negative-size@test", StartOffset: 0, EndOffset: 0, SegmentSize: -1},
+		},
+		{
+			name:     "end outside physical segment",
+			fileSize: 2,
+			segment:  &metapb.SegmentData{Id: "outside@test", StartOffset: 0, EndOffset: 1, SegmentSize: 1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := fakepool.New()
+			env := newBatchTestEnv(t, t.TempDir(), client)
+			path := "complete/invalid.mkv"
+			writeSegmentMetadata(t, env, path, tt.fileSize, []*metapb.SegmentData{tt.segment})
+
+			event := env.healthChecker.CheckFile(context.Background(), path)
+			assert.Equal(t, EventTypeFileCorrupted, event.Type)
+			require.Error(t, event.Error)
+			assert.Contains(t, event.Error.Error(), "metadata corruption")
+			assert.Zero(t, client.StatCalls(), "malformed metadata must fail before network I/O")
+		})
+	}
+}
+
+func TestCheckFilesBatchMalformedFileDoesNotPoisonHealthySibling(t *testing.T) {
+	client := fakepool.New()
+	env := newBatchTestEnv(t, t.TempDir(), client)
+	paths := []string{"complete/invalid.mkv", "complete/healthy.mkv"}
+	writeSegmentMetadata(t, env, paths[0], 2, []*metapb.SegmentData{{
+		Id: "outside@test", StartOffset: 0, EndOffset: 1, SegmentSize: 1,
+	}})
+	writeHealthyFile(t, env, paths[1])
+
+	events := env.healthChecker.CheckFilesBatch(context.Background(), paths)
+	require.Len(t, events, 2)
+	assert.Equal(t, EventTypeFileCorrupted, events[0].Type)
+	assert.Equal(t, EventTypeFileHealthy, events[1].Type)
+	assert.Equal(t, int64(1), client.StatCalls(), "only the structurally valid sibling may reach STAT")
 }
 
 // TestCheckFile_ParityWithBatch guards the manual-check path: the single-file

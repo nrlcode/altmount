@@ -78,41 +78,99 @@ func TestBasicRangeCalculation(t *testing.T) {
 // TestBuildSegmentIndex tests the segment offset index building
 func TestBuildSegmentIndex(t *testing.T) {
 	tests := []struct {
-		name     string
-		segments []*metapb.SegmentData
-		wantNil  bool
+		name         string
+		expectedSize int64
+		segments     []*metapb.SegmentData
+		wantNil      bool
 	}{
 		{
-			name:     "nil segments",
-			segments: nil,
-			wantNil:  true,
+			name:         "nil segments",
+			expectedSize: 0,
+			segments:     nil,
+			wantNil:      true,
 		},
 		{
-			name:     "empty segments",
-			segments: []*metapb.SegmentData{},
-			wantNil:  true,
+			name:         "empty segments",
+			expectedSize: 0,
+			segments:     []*metapb.SegmentData{},
+			wantNil:      true,
 		},
 		{
-			name: "single segment",
+			name:         "single segment",
+			expectedSize: 1000,
 			segments: []*metapb.SegmentData{
-				{StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
+				{Id: "single@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
 			},
 			wantNil: false,
 		},
 		{
-			name: "multiple segments",
+			name:         "multiple segments",
+			expectedSize: 2500,
 			segments: []*metapb.SegmentData{
-				{StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
-				{StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
-				{StartOffset: 0, EndOffset: 499, SegmentSize: 500},
+				{Id: "multiple-0@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
+				{Id: "multiple-1@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
+				{Id: "multiple-2@test", StartOffset: 0, EndOffset: 499, SegmentSize: 500},
 			},
 			wantNil: false,
+		},
+		{
+			name:     "nil segment entry",
+			segments: []*metapb.SegmentData{nil},
+			wantNil:  true,
+		},
+		{
+			name:         "negative start offset",
+			expectedSize: 1001,
+			segments: []*metapb.SegmentData{
+				{Id: "negative-start@test", StartOffset: -1, EndOffset: 999, SegmentSize: 1000},
+			},
+			wantNil: true,
+		},
+		{
+			name: "start after end",
+			segments: []*metapb.SegmentData{
+				{Id: "reversed@test", StartOffset: 10, EndOffset: 9, SegmentSize: 1000},
+			},
+			wantNil: true,
+		},
+		{
+			name:         "zero physical size",
+			expectedSize: 1,
+			segments: []*metapb.SegmentData{
+				{Id: "zero@test", StartOffset: 0, EndOffset: 0, SegmentSize: 0},
+			},
+			wantNil: true,
+		},
+		{
+			name:         "negative physical size",
+			expectedSize: 1,
+			segments: []*metapb.SegmentData{
+				{Id: "negative-size@test", StartOffset: 0, EndOffset: 0, SegmentSize: -1},
+			},
+			wantNil: true,
+		},
+		{
+			name:         "end outside physical segment",
+			expectedSize: 1001,
+			segments: []*metapb.SegmentData{
+				{Id: "outside@test", StartOffset: 0, EndOffset: 1000, SegmentSize: 1000},
+			},
+			wantNil: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			idx := buildSegmentIndex(tt.segments)
+			var idx *segmentOffsetIndex
+			var panicValue any
+			func() {
+				defer func() { panicValue = recover() }()
+				idx = buildSegmentIndex(tt.expectedSize, tt.segments)
+			}()
+			if panicValue != nil {
+				t.Errorf("buildSegmentIndex() panicked: %v", panicValue)
+				return
+			}
 			if tt.wantNil {
 				if idx != nil {
 					t.Errorf("buildSegmentIndex() = %v, want nil", idx)
@@ -132,11 +190,11 @@ func TestBuildSegmentIndex(t *testing.T) {
 func TestSegmentOffsetIndexFindSegment(t *testing.T) {
 	// Create an index with 3 segments: [0-999], [1000-1999], [2000-2499]
 	segments := []*metapb.SegmentData{
-		{StartOffset: 0, EndOffset: 999, SegmentSize: 1000}, // usable: 1000 bytes
-		{StartOffset: 0, EndOffset: 999, SegmentSize: 1000}, // usable: 1000 bytes
-		{StartOffset: 0, EndOffset: 499, SegmentSize: 500},  // usable: 500 bytes
+		{Id: "find-0@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000}, // usable: 1000 bytes
+		{Id: "find-1@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000}, // usable: 1000 bytes
+		{Id: "find-2@test", StartOffset: 0, EndOffset: 499, SegmentSize: 500},  // usable: 500 bytes
 	}
-	idx := buildSegmentIndex(segments)
+	idx := buildSegmentIndex(2500, segments)
 
 	tests := []struct {
 		name   string
@@ -186,11 +244,11 @@ func TestSegmentOffsetIndexNil(t *testing.T) {
 func TestGetOffsetForSegment(t *testing.T) {
 	// Create an index with 3 segments: [0-999], [1000-1999], [2000-2499]
 	segments := []*metapb.SegmentData{
-		{StartOffset: 0, EndOffset: 999, SegmentSize: 1000}, // usable: 1000 bytes, offset: 0
-		{StartOffset: 0, EndOffset: 999, SegmentSize: 1000}, // usable: 1000 bytes, offset: 1000
-		{StartOffset: 0, EndOffset: 499, SegmentSize: 500},  // usable: 500 bytes, offset: 2000
+		{Id: "offset-0@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000}, // usable: 1000 bytes, offset: 0
+		{Id: "offset-1@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000}, // usable: 1000 bytes, offset: 1000
+		{Id: "offset-2@test", StartOffset: 0, EndOffset: 499, SegmentSize: 500},  // usable: 500 bytes, offset: 2000
 	}
-	idx := buildSegmentIndex(segments)
+	idx := buildSegmentIndex(2500, segments)
 
 	tests := []struct {
 		name         string
@@ -219,13 +277,13 @@ func TestGetOffsetForSegment(t *testing.T) {
 func TestSegmentIndexIntegration(t *testing.T) {
 	// Create a realistic segment index with varying segment sizes
 	segments := []*metapb.SegmentData{
-		{StartOffset: 0, EndOffset: 749999, SegmentSize: 750000}, // 750KB
-		{StartOffset: 0, EndOffset: 749999, SegmentSize: 750000}, // 750KB
-		{StartOffset: 0, EndOffset: 749999, SegmentSize: 750000}, // 750KB
-		{StartOffset: 0, EndOffset: 749999, SegmentSize: 750000}, // 750KB
-		{StartOffset: 0, EndOffset: 249999, SegmentSize: 250000}, // 250KB (final partial)
+		{Id: "integration-0@test", StartOffset: 0, EndOffset: 749999, SegmentSize: 750000}, // 750KB
+		{Id: "integration-1@test", StartOffset: 0, EndOffset: 749999, SegmentSize: 750000}, // 750KB
+		{Id: "integration-2@test", StartOffset: 0, EndOffset: 749999, SegmentSize: 750000}, // 750KB
+		{Id: "integration-3@test", StartOffset: 0, EndOffset: 749999, SegmentSize: 750000}, // 750KB
+		{Id: "integration-4@test", StartOffset: 0, EndOffset: 249999, SegmentSize: 250000}, // 250KB (final partial)
 	}
-	idx := buildSegmentIndex(segments)
+	idx := buildSegmentIndex(3_250_000, segments)
 
 	// Test that findSegmentForOffset and getOffsetForSegment are consistent
 	testOffsets := []int64{0, 375000, 750000, 1500000, 2250000, 2750000, 3000000}
@@ -297,7 +355,7 @@ func TestReadAtBoundsValidation(t *testing.T) {
 // TestReadAtNoPoolManager tests ReadAt when pool manager is nil
 func TestReadAtNoPoolManager(t *testing.T) {
 	segments := []*metapb.SegmentData{
-		{StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
+		{Id: "no-pool@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
 	}
 
 	mvf := &MetadataVirtualFile{
@@ -305,7 +363,7 @@ func TestReadAtNoPoolManager(t *testing.T) {
 			FileSize:    1000,
 			SegmentData: segments,
 		},
-		segmentIndex: buildSegmentIndex(segments),
+		segmentIndex: buildSegmentIndex(1000, segments),
 		poolManager:  nil, // No pool manager
 	}
 
@@ -620,11 +678,11 @@ func TestSeekErrorCases(t *testing.T) {
 // TestConcurrentSegmentIndexAccess tests thread safety of segment index
 func TestConcurrentSegmentIndexAccess(t *testing.T) {
 	segments := []*metapb.SegmentData{
-		{StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
-		{StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
-		{StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
+		{Id: "concurrent-0@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
+		{Id: "concurrent-1@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
+		{Id: "concurrent-2@test", StartOffset: 0, EndOffset: 999, SegmentSize: 1000},
 	}
-	idx := buildSegmentIndex(segments)
+	idx := buildSegmentIndex(3000, segments)
 
 	// Run concurrent lookups
 	var wg sync.WaitGroup

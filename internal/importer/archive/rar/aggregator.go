@@ -183,7 +183,7 @@ func ProcessArchive(ctx context.Context, opts ProcessArchiveOptions) error {
 			continue
 		}
 		if r.err != nil {
-			if ctx.Err() != nil || errors.Is(r.err, context.Canceled) || usenet.IsClassifiedNNTPError(r.err) {
+			if ctx.Err() != nil || errors.Is(r.err, context.Canceled) || errors.Is(r.err, context.DeadlineExceeded) || usenet.IsClassifiedNNTPError(r.err) {
 				return r.err
 			}
 			slog.ErrorContext(ctx, "Skipping RAR archive group after failed analysis",

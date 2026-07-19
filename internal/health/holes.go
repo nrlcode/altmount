@@ -1,10 +1,9 @@
 package health
 
 import (
-	"context"
+	"math"
 
 	"github.com/javi11/altmount/internal/holes"
-	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/javi11/altmount/internal/usenet"
 )
 
@@ -14,34 +13,23 @@ import (
 // quarantined pending migration and never participate in classification.
 // A full sweep can prove clean; a sampled sweep only projects (never clean).
 //
-// It re-reads metadata rather than taking a healthCheckInput from the caller:
-// prepareCheck deliberately drops the segment slice after sampling so the
-// proto is collectible during the (possibly cross-file, batched) network
-// sweep, and re-reading only pays a disk read in the rare case a file
-// actually has missing segments.
-//
-// Returns nil when the file is ineligible (non-video, encrypted, remuxed) or
-// metadata can no longer be read.
+// Preparation retains only scalar size/eligibility values from the validated
+// layout, so positional results and their denominator remain one coherent
+// snapshot without retaining the segment proto through the network sweep.
 func (hc *HealthChecker) classifyHoles(
-	ctx context.Context,
-	filePath string,
+	prep preparedCheck,
 	result usenet.ValidationResult,
 ) *holes.Impact {
-	_ = ctx
-	if len(result.MissingSegments) == 0 {
-		return nil
-	}
-	input, ok := hc.loadClassificationInput(filePath)
-	if !ok {
+	if len(result.MissingSegments) == 0 || !prep.holeEligible {
 		return nil
 	}
 
 	var acc holes.Accumulator
-	observed := missingRuns(result.MissingSegments, len(input.segments))
+	observed := missingRuns(result.MissingSegments, prep.totalSegments)
 	acc.Load(observed)
 
-	totalSegments := len(input.segments)
-	segBytes := avgSegmentBytes(input.fileSize, totalSegments)
+	totalSegments := prep.totalSegments
+	paddedBytes := missingBytes(result.MissingSegments)
 	fullCheck := result.IncompleteCount == 0 && result.TotalChecked >= totalSegments
 	if result.TotalExpected > 0 {
 		fullCheck = fullCheck && result.TotalChecked >= result.TotalExpected
@@ -49,18 +37,18 @@ func (hc *HealthChecker) classifyHoles(
 
 	var verdict holes.Verdict
 	if fullCheck {
-		verdict = holes.Classify(acc.Runs(), input.fileSize, segBytes)
+		verdict = holes.Classify(acc.Runs(), prep.fileSize, paddedBytes)
 	} else {
 		// Sampled evidence projects from the complete positional sample.
 		verdict = holes.ClassifyProjected(result.MissingCount, result.TotalChecked, totalSegments, acc.LongestRun())
-		if holes.Classify(acc.Runs(), input.fileSize, segBytes) == holes.VerdictFailed {
+		if holes.Classify(acc.Runs(), prep.fileSize, paddedBytes) == holes.VerdictFailed {
 			verdict = holes.VerdictFailed
 		}
 	}
 
 	var ratio float64
-	if input.fileSize > 0 {
-		ratio = float64(int64(acc.Total())*segBytes) / float64(input.fileSize)
+	if prep.fileSize > 0 {
+		ratio = float64(paddedBytes) / float64(prep.fileSize)
 	}
 	return &holes.Impact{
 		Verdict:       verdict,
@@ -70,30 +58,6 @@ func (hc *HealthChecker) classifyHoles(
 		TotalSegments: totalSegments,
 		PaddedRatio:   ratio,
 	}
-}
-
-// loadClassificationInput re-reads metadata for hole classification and
-// reports whether the file is eligible (plain unencrypted video).
-func (hc *HealthChecker) loadClassificationInput(filePath string) (healthCheckInput, bool) {
-	fileMeta, err := hc.metadataService.ReadFileMetadata(filePath)
-	if err != nil || fileMeta == nil {
-		return healthCheckInput{}, false
-	}
-	input := healthCheckInput{
-		fileSize:      fileMeta.FileSize,
-		sourceNzbPath: fileMeta.SourceNzbPath,
-		segments:      fileMeta.SegmentData,
-		encryption:    fileMeta.Encryption,
-		hasNestedOrRemuxedSources: len(fileMeta.NestedSources) > 0 ||
-			len(fileMeta.SharedOuterSources) > 0 ||
-			len(fileMeta.ClipBoundaries) > 0,
-	}
-	if !holes.EligibleFile(filePath) ||
-		input.encryption != metapb.Encryption_NONE ||
-		input.hasNestedOrRemuxedSources {
-		return healthCheckInput{}, false
-	}
-	return input, true
 }
 
 // missingRuns folds the complete positional missing set into hole runs.
@@ -107,11 +71,25 @@ func missingRuns(missing []usenet.MissingSegment, totalSegments int) []holes.Run
 	return acc.Runs()
 }
 
-// avgSegmentBytes estimates the decoded segment size for the byte-ratio
-// guard; encoded/decoded skew is negligible at 2%.
-func avgSegmentBytes(fileSize int64, totalSegments int) int64 {
-	if totalSegments <= 0 || fileSize <= 0 {
-		return 1
+// missingBytes sums the exact inclusive logical ranges attached to the
+// complete positional missing set. Saturating malformed or overflowing input
+// makes it fail closed at the byte-ratio guard without risking arithmetic
+// wraparound; prepared health targets always carry valid disjoint ranges.
+func missingBytes(missing []usenet.MissingSegment) int64 {
+	var total int64
+	for _, segment := range missing {
+		if segment.Start < 0 || segment.End < segment.Start {
+			return math.MaxInt64
+		}
+		span := segment.End - segment.Start
+		if span == math.MaxInt64 {
+			return math.MaxInt64
+		}
+		span++
+		if total > math.MaxInt64-span {
+			return math.MaxInt64
+		}
+		total += span
 	}
-	return fileSize / int64(totalSegments)
+	return total
 }

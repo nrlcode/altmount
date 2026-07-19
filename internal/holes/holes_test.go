@@ -1,6 +1,7 @@
 package holes
 
 import (
+	"math"
 	"reflect"
 	"testing"
 )
@@ -76,10 +77,37 @@ func TestClassify(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := Classify(tt.runs, tt.fileBytes, segBytes); got != tt.want {
+			var paddedBytes int64
+			for _, run := range tt.runs {
+				paddedBytes += int64(run.Count) * segBytes
+			}
+			if got := Classify(tt.runs, tt.fileBytes, paddedBytes); got != tt.want {
 				t.Errorf("Classify() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestClassifyUsesExactPaddedBytesAtRatioBoundary(t *testing.T) {
+	runs := []Run{{Start: 10, Count: 2}}
+
+	if got := Classify(runs, 10_000, 200); got != VerdictDegraded {
+		t.Errorf("Classify() at exact 2%% boundary = %v, want %v", got, VerdictDegraded)
+	}
+	if got := Classify(runs, 10_000, 201); got != VerdictFailed {
+		t.Errorf("Classify() above 2%% boundary = %v, want %v", got, VerdictFailed)
+	}
+}
+
+func TestClassifyUsesExactRatioAtInt64Scale(t *testing.T) {
+	fileBytes := int64(math.MaxInt64)
+	boundary := fileBytes / 50
+	runs := []Run{{Start: 0, Count: 1}}
+	if got := Classify(runs, fileBytes, boundary); got != VerdictDegraded {
+		t.Fatalf("Classify() at large exact boundary = %v, want %v", got, VerdictDegraded)
+	}
+	if got := Classify(runs, fileBytes, boundary+1); got != VerdictFailed {
+		t.Fatalf("Classify() one byte over large boundary = %v, want %v", got, VerdictFailed)
 	}
 }
 

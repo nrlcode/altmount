@@ -3,7 +3,7 @@ package validation
 import (
 	"fmt"
 
-	"github.com/javi11/altmount/internal/encryption/rclone"
+	"github.com/javi11/altmount/internal/metadata"
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 )
 
@@ -17,59 +17,13 @@ func ValidateSegmentsForFile(
 	segments []*metapb.SegmentData,
 	encryption metapb.Encryption,
 ) error {
-	if len(segments) == 0 {
-		return fmt.Errorf("no segments provided for file %s", filename)
+	expectedSize, err := metadata.ExpectedSegmentLayoutSize(fileSize, encryption)
+	if err != nil {
+		return fmt.Errorf("invalid segment layout size for file %q: %w", filename, err)
 	}
 
-	// Single pass: structural validation + size accumulation.
-	var totalSegmentSize int64
-	for i, segment := range segments {
-		if segment == nil {
-			return fmt.Errorf("segment %d is nil for file %s", i, filename)
-		}
-
-		if segment.StartOffset < 0 || segment.EndOffset < 0 {
-			return fmt.Errorf("invalid offsets (start=%d, end=%d) in segment %d for file %s",
-				segment.StartOffset, segment.EndOffset, i, filename)
-		}
-
-		if segment.StartOffset > segment.EndOffset {
-			return fmt.Errorf("start offset greater than end offset (start=%d, end=%d) in segment %d for file %s",
-				segment.StartOffset, segment.EndOffset, i, filename)
-		}
-
-		segSize := segment.EndOffset - segment.StartOffset + 1
-		if segSize <= 0 {
-			return fmt.Errorf("non-positive size %d in segment %d for file %s", segSize, i, filename)
-		}
-
-		if segment.Id == "" {
-			return fmt.Errorf("empty message ID in segment %d for file %s (cannot retrieve data)", i, filename)
-		}
-
-		totalSegmentSize += segSize
-	}
-
-	expectedSize := fileSize
-	switch encryption {
-	case metapb.Encryption_RCLONE:
-		expectedSize = rclone.EncryptedSize(fileSize)
-	case metapb.Encryption_AES:
-		// AES-CBC pads to 16-byte block boundary
-		const aesBlockSize = 16
-		if fileSize%aesBlockSize != 0 {
-			expectedSize = fileSize + (aesBlockSize - (fileSize % aesBlockSize))
-		}
-	}
-
-	if totalSegmentSize != expectedSize {
-		sizeType := "decrypted"
-		if encryption == metapb.Encryption_RCLONE || encryption == metapb.Encryption_AES {
-			sizeType = "encrypted"
-		}
-
-		return fmt.Errorf("file '%s' is incomplete: expected %d bytes (%s) but found %d bytes (missing %d bytes)",
-			filename, expectedSize, sizeType, totalSegmentSize, expectedSize-totalSegmentSize)
+	if _, err = metadata.ValidateSegmentLayout(expectedSize, segments); err != nil {
+		return fmt.Errorf("invalid segment layout for file %q: %w", filename, err)
 	}
 
 	return nil

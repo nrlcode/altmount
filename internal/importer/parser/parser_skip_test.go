@@ -2,9 +2,11 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/javi11/altmount/internal/testsupport/fakepool"
+	"github.com/javi11/altmount/internal/usenet"
 	"github.com/javi11/nntppool/v4"
 	"github.com/javi11/nzbparser"
 )
@@ -143,5 +145,91 @@ func TestParseNzbKeepsFileWhenYencHeaderUnavailable(t *testing.T) {
 	}
 	if got := parsed.Files[0].Segments[0].SegmentSize; got != declaredSize {
 		t.Errorf("segment size = %d, want %d (NZB-declared size preserved)", got, declaredSize)
+	}
+}
+
+// TestParseNzbPropagatesIncompleteNormalization pins incomplete provider work
+// at the public ParseNzb boundary. A temporary failure while learning a last
+// part's decoded size must invalidate the whole parse: neither a healthy
+// sibling nor the absence of any successful file may turn it into partial or
+// empty success.
+func TestParseNzbPropagatesIncompleteNormalization(t *testing.T) {
+	const (
+		firstPartDecoded = 700000
+		lastPartDecoded  = 50000
+		firstPartEncoded = 720000
+		lastPartEncoded  = 51000
+		brokenName       = "Interstellar.2014.1080p.BluRay.mkv"
+		healthyName      = "Arrival.2016.1080p.BluRay.mkv"
+	)
+
+	for _, tc := range []struct {
+		name           string
+		includeHealthy bool
+	}{
+		{name: "healthy sibling cannot mask incomplete work", includeHealthy: true},
+		{name: "all incomplete cannot become empty success", includeHealthy: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sentinel := errors.New("temporary provider failure")
+			temporary := &nntppool.TransportError{
+				Kind:  nntppool.OutcomeTemporaryFailure,
+				Cause: sentinel,
+			}
+
+			fp := fakepool.New()
+			fp.SetBehavior("broken-first", fakepool.SegmentBehavior{
+				YEnc: nntppool.YEncMeta{FileName: brokenName, PartSize: firstPartDecoded},
+			})
+			// The first part is cached successfully. The temporary failure is
+			// therefore reached specifically while normalization fetches the
+			// unknown final decoded-part size.
+			fp.SetBehavior("broken-last", fakepool.SegmentBehavior{Err: temporary})
+			fp.SetBehavior("healthy-first", fakepool.SegmentBehavior{
+				YEnc: nntppool.YEncMeta{FileName: healthyName, PartSize: firstPartDecoded},
+			})
+			fp.SetBehavior("healthy-last", fakepool.SegmentBehavior{
+				YEnc: nntppool.YEncMeta{FileName: healthyName, PartSize: lastPartDecoded},
+			})
+
+			files := nzbparser.NzbFiles{
+				{
+					Filename: brokenName,
+					Segments: nzbparser.NzbSegments{
+						{Bytes: firstPartEncoded, Number: 1, ID: "broken-first"},
+						{Bytes: lastPartEncoded, Number: 2, ID: "broken-last"},
+					},
+				},
+			}
+			if tc.includeHealthy {
+				files = append(files, nzbparser.NzbFile{
+					Filename: healthyName,
+					Segments: nzbparser.NzbSegments{
+						{Bytes: firstPartEncoded, Number: 1, ID: "healthy-first"},
+						{Bytes: lastPartEncoded, Number: 2, ID: "healthy-last"},
+					},
+				})
+			}
+
+			p := NewParser(newFakeFullPoolManager(fp), stormConfigGetter(4))
+			parsed, err := p.ParseNzb(context.Background(), &nzbparser.Nzb{Files: files}, "test.nzb", nil, ParseOptions{})
+
+			if parsed != nil {
+				t.Fatalf("ParseNzb result = %#v, want nil when normalization is incomplete", parsed)
+			}
+			if err == nil {
+				t.Fatal("ParseNzb error = nil, want incomplete error")
+			}
+			if !usenet.IsIncomplete(err) {
+				t.Fatalf("ParseNzb error = %v, want usenet incomplete classification", err)
+			}
+			if !errors.Is(err, sentinel) {
+				t.Fatalf("ParseNzb error = %v, want original temporary cause", err)
+			}
+			var gotTransport *nntppool.TransportError
+			if !errors.As(err, &gotTransport) || gotTransport.Kind != nntppool.OutcomeTemporaryFailure {
+				t.Fatalf("ParseNzb error = %v, want temporary TransportError", err)
+			}
+		})
 	}
 }

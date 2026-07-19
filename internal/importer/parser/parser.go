@@ -325,6 +325,9 @@ func (p *Parser) ParseNzb(ctx context.Context, n *nzbparser.Nzb, nzbPath string,
 	var parsedFiles []*ParsedFile
 	for _, result := range results {
 		if result.err != nil {
+			if usenet.IsIncomplete(result.err) {
+				return nil, result.err
+			}
 			slog.InfoContext(ctx, "Failed to parse file", "error", result.err)
 			continue
 		}
