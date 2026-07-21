@@ -9,6 +9,63 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+type healthAdmissionSource interface {
+	AcquireHealthAdmission() (release func(), admitted bool)
+}
+
+func TestCHG005StreamTrackerSerializesHealthAdmissionWithPlaybackStart(t *testing.T) {
+	tracker := NewStreamTracker(nil)
+	defer tracker.Stop()
+
+	admission, ok := any(tracker).(healthAdmissionSource)
+	if !ok {
+		t.Fatal("StreamTracker does not expose the health admission boundary")
+	}
+
+	release, admitted := admission.AcquireHealthAdmission()
+	if !admitted {
+		t.Fatal("idle StreamTracker rejected health admission")
+	}
+	if release == nil {
+		t.Fatal("successful health admission returned a nil release function")
+	}
+
+	started := make(chan struct{})
+	added := make(chan *nzbfilesystem.ActiveStream, 1)
+	go func() {
+		close(started)
+		added <- tracker.AddStream("/movie.mkv", "WebDAV", "user", "127.0.0.1", "TestAgent", 1000)
+	}()
+	<-started
+
+	select {
+	case <-added:
+		t.Fatal("playback start crossed an active health admission")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+
+	var stream *nzbfilesystem.ActiveStream
+	select {
+	case stream = <-added:
+	case <-time.After(2 * time.Second):
+		t.Fatal("playback start did not resume after health admission was released")
+	}
+
+	if tracker.ActiveStreams() != 1 {
+		t.Fatalf("active stream count = %d, want 1", tracker.ActiveStreams())
+	}
+	if releaseActive, admittedActive := admission.AcquireHealthAdmission(); admittedActive {
+		if releaseActive != nil {
+			releaseActive()
+		}
+		t.Fatal("StreamTracker admitted health work while playback was active")
+	}
+
+	tracker.Remove(stream.ID)
+}
+
 func TestStreamTracker_GetAll_Grouping(t *testing.T) {
 	tracker := NewStreamTracker(nil)
 	defer tracker.Stop()

@@ -30,7 +30,8 @@ func TestPrepareUpdateForResultIncompleteNeverDeletesOrRepairs(t *testing.T) {
 
 	update, sideEffect := env.hw.prepareUpdateForResult(context.Background(), &fh, event)
 	assert.False(t, update.Skip, "incomplete checks must not enter delete-on-corruption")
-	assert.Equal(t, database.UpdateTypeRetry, update.Type)
+	assert.NotEqual(t, database.UpdateTypeRetry, update.Type,
+		"incomplete evidence must use a non-consuming health update")
 	assert.Equal(t, database.HealthStatusPending, update.Status)
 	require.NotNil(t, sideEffect)
 	require.NoError(t, sideEffect())
