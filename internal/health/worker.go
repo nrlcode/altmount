@@ -585,22 +585,20 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 	// (repair side effects, ARR API calls).
 	var unhealthyFiles []*database.FileHealth
 	var err error
-	var admissionSerialized bool
-	if hw.shouldPauseForPlayback() {
+	releaseAdmission, admitted, admissionSerialized := hw.acquireHealthAdmission()
+	if admissionSerialized && !admitted {
+		slog.InfoContext(ctx, "Deferring ordinary health batch because playback won admission")
+	} else if !admissionSerialized && hw.shouldPauseForPlayback() {
 		slog.InfoContext(ctx, "Pausing admission of ordinary health checks during active playback")
 	} else {
-		releaseAdmission, admitted, serialized := hw.acquireHealthAdmission()
-		admissionSerialized = serialized
-		if !admitted {
-			slog.InfoContext(ctx, "Deferring ordinary health batch because playback won admission")
-		} else {
+		if admissionSerialized {
 			defer releaseAdmission()
-			// Keep the admission token through due-row selection so the selected
-			// snapshots cannot race a new playback start before claiming.
-			unhealthyFiles, err = hw.healthRepo.GetUnhealthyFiles(ctx, cfg.GetCheckBatchSize(), strategy, libraryDir, hw.configGetter().GetMaxRetries())
-			if err != nil {
-				return fmt.Errorf("failed to get unhealthy files: %w", err)
-			}
+		}
+		// Keep a successful shared token through due-row selection so the
+		// selected snapshots cannot race a new playback start before claiming.
+		unhealthyFiles, err = hw.healthRepo.GetUnhealthyFiles(ctx, cfg.GetCheckBatchSize(), strategy, libraryDir, hw.configGetter().GetMaxRetries())
+		if err != nil {
+			return fmt.Errorf("failed to get unhealthy files: %w", err)
 		}
 	}
 
