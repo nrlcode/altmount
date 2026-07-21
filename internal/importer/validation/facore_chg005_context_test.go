@@ -20,6 +20,24 @@ type facoreCHG005OpenFastFailClient struct {
 	once   sync.Once
 }
 
+type facoreF026CancelOnHardAbsenceError struct {
+	cancel    context.CancelFunc
+	triggered bool
+}
+
+func (e *facoreF026CancelOnHardAbsenceError) Error() string {
+	return "hard absence concurrent with cancellation"
+}
+
+func (e *facoreF026CancelOnHardAbsenceError) Is(target error) bool {
+	if target != nntppool.ErrArticleNotFound {
+		return false
+	}
+	e.triggered = true
+	e.cancel()
+	return true
+}
+
 func (c *facoreCHG005OpenFastFailClient) StatMany(
 	context.Context,
 	[]string,
@@ -36,6 +54,74 @@ func facoreCHG005AwaitFastFailSignal(t *testing.T, signal <-chan struct{}, what 
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for %s", what)
 	}
+}
+
+func TestFACOREF026ReleaseProbeCancellationDominatesBufferedHardAbsence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	classificationErr := &facoreF026CancelOnHardAbsenceError{cancel: cancel}
+	client := &scriptedFastFailClient{
+		Client: fakepool.New(),
+		results: []nntppool.StatManyResult{{
+			MessageID: "cancelled-hard-absence-0",
+			Err:       classificationErr,
+		}},
+	}
+
+	missing, err := FastFailReleaseProbe(
+		ctx,
+		[]FastFailFile{{Filename: "movie.mkv", Segments: makeTestSegments("cancelled-hard-absence", 1)}},
+		fastFailPoolManager{client: client},
+		100,
+		1,
+		time.Hour,
+	)
+
+	require.True(t, classificationErr.triggered,
+		"the result must cancel during hard-absence classification")
+	assert.False(t, missing, "cancelled classification must never become hard absence")
+	require.Error(t, err)
+	var incomplete *usenet.IncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, incomplete.Expected)
+	assert.Zero(t, incomplete.Completed)
+}
+
+func TestFACOREF026FileProbeCancellationDominatesBufferedHardAbsence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	classificationErr := &facoreF026CancelOnHardAbsenceError{cancel: cancel}
+	client := &scriptedFastFailClient{
+		Client: fakepool.New(),
+		results: []nntppool.StatManyResult{{
+			MessageID: "cancelled-hard-absence-0",
+			Err:       classificationErr,
+		}},
+	}
+
+	results, err := FastFailCheckFiles(
+		ctx,
+		[]FastFailFile{{Filename: "movie.mkv", Segments: makeTestSegments("cancelled-hard-absence", 1)}},
+		fastFailPoolManager{client: client},
+		100,
+		1,
+		time.Hour,
+		nil,
+	)
+
+	require.True(t, classificationErr.triggered,
+		"the result must cancel during hard-absence classification")
+	require.Error(t, err)
+	var incomplete *usenet.IncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, incomplete.Expected)
+	assert.Zero(t, incomplete.Completed)
+	require.Len(t, results, 1)
+	assert.False(t, results[0].Broken,
+		"cancelled classification must never mark a file broken")
+	assert.Empty(t, results[0].MissingSegmentIDs)
 }
 
 func TestFACORECHG005ReleaseProbeCancellationInterruptsSilentStatMany(t *testing.T) {

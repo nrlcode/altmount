@@ -19,6 +19,24 @@ type facoreCHG005OpenStatClient struct {
 	once   sync.Once
 }
 
+type facoreF026CancelOnHardAbsenceError struct {
+	cancel    context.CancelFunc
+	triggered bool
+}
+
+func (e *facoreF026CancelOnHardAbsenceError) Error() string {
+	return "hard absence concurrent with cancellation"
+}
+
+func (e *facoreF026CancelOnHardAbsenceError) Is(target error) bool {
+	if target != nntppool.ErrArticleNotFound {
+		return false
+	}
+	e.triggered = true
+	e.cancel()
+	return true
+}
+
 func (c *facoreCHG005OpenStatClient) StatMany(
 	context.Context,
 	[]string,
@@ -35,6 +53,47 @@ func facoreCHG005AwaitSignal(t *testing.T, signal <-chan struct{}, what string) 
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for %s", what)
 	}
+}
+
+func TestFACOREF026TargetBatchCancellationDominatesBufferedHardAbsence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	classificationErr := &facoreF026CancelOnHardAbsenceError{cancel: cancel}
+	client := &scriptedStatClient{
+		Client: fakepool.New(),
+		results: []nntppool.StatManyResult{{
+			MessageID: "cancelled-hard-absence@test",
+			Err:       classificationErr,
+		}},
+	}
+	mgr := &validationTestPoolManager{client: client}
+
+	results, err := ValidateSegmentAvailabilityTargetsBatch(
+		ctx,
+		[][]ValidationTarget{{{
+			ID: "cancelled-hard-absence@test", Index: 7, Start: 100, End: 199,
+		}}},
+		mgr,
+		1,
+		time.Hour,
+	)
+
+	require.True(t, classificationErr.triggered,
+		"the result must cancel during hard-absence classification")
+	require.Error(t, err)
+	var incomplete *IncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, incomplete.Expected)
+	assert.Zero(t, incomplete.Completed)
+	assert.True(t, incomplete.Global)
+	require.Len(t, results, 1)
+	assert.Zero(t, results[0].MissingCount,
+		"cancelled classification must never become hard absence")
+	assert.Empty(t, results[0].MissingIDs)
+	assert.Empty(t, results[0].MissingSegments)
+	assert.Equal(t, 1, results[0].TotalChecked)
+	assert.Equal(t, 1, results[0].IncompleteCount)
 }
 
 func TestFACORECHG005ValidationCancellationInterruptsOpenStatMany(t *testing.T) {
