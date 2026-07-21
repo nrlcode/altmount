@@ -164,6 +164,11 @@ receiveResults:
 		}
 		switch outcome {
 		case nntppool.OutcomeHardArticleAbsence:
+			if statErr := statCtx.Err(); statErr != nil {
+				return false, &usenet.IncompleteError{
+					Expected: len(ids), Completed: checked, Cause: statErr,
+				}
+			}
 			cancel()
 			return true, nil
 		case nntppool.OutcomeSuccess:
@@ -370,6 +375,12 @@ func FastFailCheckFiles(
 			case nntppool.OutcomeSuccess:
 				conclusive++
 			case nntppool.OutcomeHardArticleAbsence:
+				if statErr := statCtx.Err(); statErr != nil {
+					if incompleteErr == nil {
+						incompleteErr = statErr
+					}
+					break receiveResults
+				}
 				conclusive++
 				results[job.fileIdx].Broken = true
 				results[job.fileIdx].MissingSegmentIDs = append(results[job.fileIdx].MissingSegmentIDs, job.segID)

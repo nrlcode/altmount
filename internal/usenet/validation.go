@@ -236,6 +236,13 @@ receiveResults:
 			poolManager.IncArticlesDownloaded()
 			poolManager.UpdateDownloadProgress("", 100)
 		case nntppool.OutcomeHardArticleAbsence:
+			if statErr := statCtx.Err(); statErr != nil {
+				result.IncompleteCount++
+				if firstIncomplete == nil {
+					firstIncomplete = statErr
+				}
+				break receiveResults
+			}
 			result.MissingCount++
 			if len(result.MissingIDs) < 50 {
 				result.MissingIDs = append(result.MissingIDs, owner.target.ID)
