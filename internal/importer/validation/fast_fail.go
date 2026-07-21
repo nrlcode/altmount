@@ -135,7 +135,22 @@ func FastFailReleaseProbe(
 		owners[id]++
 	}
 	checked := 0
-	for r := range usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections}) {
+	statResults := usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections})
+receiveResults:
+	for {
+		var r nntppool.StatManyResult
+		var ok bool
+		select {
+		case <-statCtx.Done():
+			return false, &usenet.IncompleteError{
+				Expected: len(ids), Completed: checked, Cause: statCtx.Err(),
+			}
+		case r, ok = <-statResults:
+			if !ok {
+				break receiveResults
+			}
+		}
+
 		if owners[r.MessageID] == 0 {
 			return false, &usenet.IncompleteError{
 				Expected: len(ids), Completed: checked,
@@ -149,6 +164,11 @@ func FastFailReleaseProbe(
 		}
 		switch outcome {
 		case nntppool.OutcomeHardArticleAbsence:
+			if statErr := statCtx.Err(); statErr != nil {
+				return false, &usenet.IncompleteError{
+					Expected: len(ids), Completed: checked, Cause: statErr,
+				}
+			}
 			cancel()
 			return true, nil
 		case nntppool.OutcomeSuccess:
@@ -318,7 +338,23 @@ func FastFailCheckFiles(
 		seen := make([]bool, len(toCheck))
 		var incompleteErr error
 		conclusive := 0
-		for r := range usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections}) {
+		statResults := usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections})
+	receiveResults:
+		for {
+			var r nntppool.StatManyResult
+			var ok bool
+			select {
+			case <-statCtx.Done():
+				if incompleteErr == nil {
+					incompleteErr = statCtx.Err()
+				}
+				break receiveResults
+			case r, ok = <-statResults:
+				if !ok {
+					break receiveResults
+				}
+			}
+
 			queue := owners[r.MessageID]
 			if len(queue) == 0 {
 				if incompleteErr == nil {
@@ -339,6 +375,12 @@ func FastFailCheckFiles(
 			case nntppool.OutcomeSuccess:
 				conclusive++
 			case nntppool.OutcomeHardArticleAbsence:
+				if statErr := statCtx.Err(); statErr != nil {
+					if incompleteErr == nil {
+						incompleteErr = statErr
+					}
+					break receiveResults
+				}
 				conclusive++
 				results[job.fileIdx].Broken = true
 				results[job.fileIdx].MissingSegmentIDs = append(results[job.fileIdx].MissingSegmentIDs, job.segID)

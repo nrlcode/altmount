@@ -35,6 +35,10 @@ type PlaybackActivitySource interface {
 	ActiveStreams() int
 }
 
+type healthAdmissionSource interface {
+	AcquireHealthAdmission() (release func(), admitted bool)
+}
+
 // WorkerStatus represents the current status of the health worker
 type WorkerStatus string
 
@@ -102,6 +106,25 @@ func (hw *HealthWorker) shouldPauseForPlayback() bool {
 	source := hw.playbackSource
 	hw.mu.RUnlock()
 	return source != nil && source.ActiveStreams() > 0
+}
+
+func (hw *HealthWorker) acquireHealthAdmission() (release func(), admitted bool, serialized bool) {
+	if !hw.configGetter().GetPauseHealthDuringPlayback() {
+		return func() {}, true, false
+	}
+
+	hw.mu.RLock()
+	source := hw.playbackSource
+	hw.mu.RUnlock()
+	boundary, ok := source.(healthAdmissionSource)
+	if !ok {
+		return func() {}, true, false
+	}
+	release, admitted = boundary.AcquireHealthAdmission()
+	if release == nil {
+		release = func() {}
+	}
+	return release, admitted, true
 }
 
 // NewHealthWorker creates a new health worker
@@ -430,7 +453,7 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 		return update, noEffect
 	case EventTypeCheckFailed, EventTypeFileRemoved:
 		exponent := min(max(fh.RetryCount, 0), 6)
-		update.Type = database.UpdateTypeRetry
+		update.Type = database.UpdateTypeInconclusive
 		update.Status = database.HealthStatusPending
 		update.ScheduledCheckAt = time.Now().UTC().Add(time.Duration(15*(1<<exponent)) * time.Minute)
 		return update, noEffect
@@ -562,25 +585,33 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 	// (repair side effects, ARR API calls).
 	var unhealthyFiles []*database.FileHealth
 	var err error
-	if hw.shouldPauseForPlayback() {
+	releaseAdmission, admitted, admissionSerialized := hw.acquireHealthAdmission()
+	if admissionSerialized && !admitted {
+		slog.InfoContext(ctx, "Deferring ordinary health batch because playback won admission")
+	} else if !admissionSerialized && hw.shouldPauseForPlayback() {
 		slog.InfoContext(ctx, "Pausing admission of ordinary health checks during active playback")
 	} else {
+		if admissionSerialized {
+			defer releaseAdmission()
+		}
+		// Keep a successful shared token through due-row selection so the
+		// selected snapshots cannot race a new playback start before claiming.
 		unhealthyFiles, err = hw.healthRepo.GetUnhealthyFiles(ctx, cfg.GetCheckBatchSize(), strategy, libraryDir, hw.configGetter().GetMaxRetries())
 		if err != nil {
 			return fmt.Errorf("failed to get unhealthy files: %w", err)
 		}
 	}
 
-	// Playback may have started after selection. Apply the final admission gate
-	// before claiming so no row is stranded in checking.
-	if len(unhealthyFiles) > 0 && hw.shouldPauseForPlayback() {
+	// Legacy playback sources lack the shared boundary, so retain a final
+	// snapshot before claiming for those implementations.
+	if len(unhealthyFiles) > 0 && !admissionSerialized && hw.shouldPauseForPlayback() {
 		slog.InfoContext(ctx, "Deferring ordinary health batch because playback became active",
 			"files", len(unhealthyFiles))
 		unhealthyFiles = nil
 	}
 
-	// This is the sole automatic admission boundary. From here onward only the
-	// returned current snapshots may be discovered, checked, or published.
+	// Claim only after the shared boundary or legacy final snapshot admits the
+	// batch. From here onward only current claimed snapshots may be checked.
 	unhealthyFiles, err = hw.healthRepo.ClaimFilesCheckingBulk(ctx, unhealthyFiles)
 	if err != nil {
 		return fmt.Errorf("failed to claim health check batch: %w", err)

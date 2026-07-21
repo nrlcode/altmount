@@ -1436,6 +1436,10 @@ func (r *HealthRepository) updateHealthStatusBulk(ctx context.Context, updates [
 			query = `UPDATE file_health SET retry_count = retry_count + 1, last_error = ?, error_details = ?,
 				status = 'pending', scheduled_check_at = ?, updated_at = datetime('now'), last_checked = datetime('now')`
 			args = []any{update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt}
+		case UpdateTypeInconclusive:
+			query = `UPDATE file_health SET last_error = ?, error_details = ?, status = 'pending',
+				scheduled_check_at = ?, updated_at = datetime('now'), last_checked = datetime('now')`
+			args = []any{update.ErrorMessage, update.ErrorDetails, update.ScheduledCheckAt}
 		case UpdateTypeRepairTrigger:
 			query = `UPDATE file_health SET last_error = ?, error_details = ?, status = 'repair_triggered',
 				updated_at = datetime('now'), last_checked = datetime('now'), scheduled_check_at = ?`
@@ -1504,6 +1508,7 @@ const (
 	UpdateTypeCorrupted     UpdateType = 4
 	UpdateTypeRepairTrigger UpdateType = 5 // first-time trigger; does not increment repair_retry_count
 	UpdateTypeDegraded      UpdateType = 6 // playable with glitches; no repair, periodic re-check
+	UpdateTypeInconclusive  UpdateType = 7 // incomplete evidence; reschedules without consuming retry_count
 )
 
 // HealthStatusUpdate represents a single update request for batch processing

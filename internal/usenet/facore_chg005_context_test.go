@@ -1,0 +1,220 @@
+package usenet
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/javi11/altmount/internal/testsupport/fakepool"
+	"github.com/javi11/nntppool/v4"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type facoreCHG005OpenStatClient struct {
+	*fakepool.Client
+	source <-chan nntppool.StatManyResult
+	called chan struct{}
+	once   sync.Once
+}
+
+type facoreF026CancelOnHardAbsenceError struct {
+	cancel    context.CancelFunc
+	triggered bool
+}
+
+func (e *facoreF026CancelOnHardAbsenceError) Error() string {
+	return "hard absence concurrent with cancellation"
+}
+
+func (e *facoreF026CancelOnHardAbsenceError) Is(target error) bool {
+	if target != nntppool.ErrArticleNotFound {
+		return false
+	}
+	e.triggered = true
+	e.cancel()
+	return true
+}
+
+func (c *facoreCHG005OpenStatClient) StatMany(
+	context.Context,
+	[]string,
+	nntppool.StatManyOptions,
+) <-chan nntppool.StatManyResult {
+	c.once.Do(func() { close(c.called) })
+	return c.source
+}
+
+func facoreCHG005AwaitSignal(t *testing.T, signal <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+func TestFACOREF026TargetBatchCancellationDominatesBufferedHardAbsence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	classificationErr := &facoreF026CancelOnHardAbsenceError{cancel: cancel}
+	client := &scriptedStatClient{
+		Client: fakepool.New(),
+		results: []nntppool.StatManyResult{{
+			MessageID: "cancelled-hard-absence@test",
+			Err:       classificationErr,
+		}},
+	}
+	mgr := &validationTestPoolManager{client: client}
+
+	results, err := ValidateSegmentAvailabilityTargetsBatch(
+		ctx,
+		[][]ValidationTarget{{{
+			ID: "cancelled-hard-absence@test", Index: 7, Start: 100, End: 199,
+		}}},
+		mgr,
+		1,
+		time.Hour,
+	)
+
+	require.True(t, classificationErr.triggered,
+		"the result must cancel during hard-absence classification")
+	require.Error(t, err)
+	var incomplete *IncompleteError
+	require.ErrorAs(t, err, &incomplete)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, incomplete.Expected)
+	assert.Zero(t, incomplete.Completed)
+	assert.True(t, incomplete.Global)
+	require.Len(t, results, 1)
+	assert.Zero(t, results[0].MissingCount,
+		"cancelled classification must never become hard absence")
+	assert.Empty(t, results[0].MissingIDs)
+	assert.Empty(t, results[0].MissingSegments)
+	assert.Equal(t, 1, results[0].TotalChecked)
+	assert.Equal(t, 1, results[0].IncompleteCount)
+}
+
+func TestFACORECHG005ValidationCancellationInterruptsOpenStatMany(t *testing.T) {
+	source := make(chan nntppool.StatManyResult)
+	called := make(chan struct{})
+	client := &facoreCHG005OpenStatClient{
+		Client: fakepool.New(),
+		source: source,
+		called: called,
+	}
+	mgr := &validationTestPoolManager{client: client}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type callResult struct {
+		results []ValidationResult
+		err     error
+	}
+	done := make(chan callResult, 1)
+	go func() {
+		results, err := ValidateSegmentAvailabilityBatch(
+			ctx,
+			[][]string{{"returned@test", "omitted@test"}},
+			mgr,
+			2,
+			time.Hour,
+		)
+		done <- callResult{results: results, err: err}
+	}()
+
+	facoreCHG005AwaitSignal(t, called, "StatMany admission")
+	delivered := make(chan struct{})
+	go func() {
+		source <- nntppool.StatManyResult{
+			MessageID: "returned@test",
+			Result:    &nntppool.StatResult{MessageID: "returned@test"},
+		}
+		close(delivered)
+	}()
+	facoreCHG005AwaitSignal(t, delivered, "first STAT result consumption")
+	cancel()
+
+	var got callResult
+	returnedBeforeClose := false
+	select {
+	case got = <-done:
+		returnedBeforeClose = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(source)
+	if !returnedBeforeClose {
+		got = <-done
+	}
+
+	require.True(t, returnedBeforeClose,
+		"validation must select on context cancellation instead of waiting for StatMany to close")
+	require.Error(t, got.err)
+	var incomplete *IncompleteError
+	require.ErrorAs(t, got.err, &incomplete)
+	assert.ErrorIs(t, got.err, context.Canceled)
+	assert.Equal(t, 2, incomplete.Expected)
+	assert.Equal(t, 1, incomplete.Completed)
+	assert.True(t, incomplete.Global)
+	require.Len(t, got.results, 1)
+	assert.Zero(t, got.results[0].MissingCount,
+		"cancelled or omitted work must never become hard absence")
+	assert.Equal(t, 1, got.results[0].TotalChecked)
+	assert.Equal(t, 1, got.results[0].IncompleteCount)
+}
+
+func TestFACORECHG005ValidationTimeoutInterruptsSilentStatMany(t *testing.T) {
+	source := make(chan nntppool.StatManyResult)
+	called := make(chan struct{})
+	client := &facoreCHG005OpenStatClient{
+		Client: fakepool.New(),
+		source: source,
+		called: called,
+	}
+	mgr := &validationTestPoolManager{client: client}
+
+	type callResult struct {
+		results []ValidationResult
+		err     error
+	}
+	done := make(chan callResult, 1)
+	go func() {
+		results, err := ValidateSegmentAvailabilityBatch(
+			context.Background(),
+			[][]string{{"omitted@test"}},
+			mgr,
+			1,
+			20*time.Millisecond,
+		)
+		done <- callResult{results: results, err: err}
+	}()
+
+	facoreCHG005AwaitSignal(t, called, "StatMany admission")
+	var got callResult
+	returnedBeforeClose := false
+	select {
+	case got = <-done:
+		returnedBeforeClose = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(source)
+	if !returnedBeforeClose {
+		got = <-done
+	}
+
+	require.True(t, returnedBeforeClose,
+		"configured STAT timeout must interrupt a silent open result channel")
+	require.Error(t, got.err)
+	var incomplete *IncompleteError
+	require.ErrorAs(t, got.err, &incomplete)
+	assert.ErrorIs(t, got.err, context.DeadlineExceeded)
+	assert.Equal(t, 1, incomplete.Expected)
+	assert.Zero(t, incomplete.Completed)
+	assert.True(t, incomplete.Global)
+	require.Len(t, got.results, 1)
+	assert.Zero(t, got.results[0].MissingCount,
+		"timed-out or omitted work must never become hard absence")
+	assert.Zero(t, got.results[0].TotalChecked)
+	assert.Equal(t, 1, got.results[0].IncompleteCount)
+}

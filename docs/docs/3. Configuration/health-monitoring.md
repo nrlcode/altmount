@@ -273,7 +273,7 @@ health:
   cleanup_orphaned_metadata: false
   check_interval_seconds: 5
   max_connections_for_health_checks: 5
-  # Temporary PR3 safeguard; PR6 replaces this with adaptive admission.
+  # Temporary PR3 safeguard.
   pause_during_playback: true
   max_concurrent_jobs: 1
   segment_sample_percentage: 5

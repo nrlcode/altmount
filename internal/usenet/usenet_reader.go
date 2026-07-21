@@ -519,6 +519,9 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 			if IsHardArticleAbsence(err) {
 				return false // permanent failure — do not retry
 			}
+			if hasTerminalBody451Evidence(err) {
+				return false // nntppool already completed its transport-owned replay
+			}
 			return true
 		}),
 		retry.OnRetry(func(n uint, err error) {
@@ -546,6 +549,25 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 	}
 
 	return resultBytes, err
+}
+
+func hasTerminalBody451Evidence(err error) bool {
+	var transportErr *nntppool.TransportError
+	if !errors.As(err, &transportErr) ||
+		transportErr.Kind != nntppool.OutcomeTemporaryFailure ||
+		transportErr.ResponseCode != 451 {
+		return false
+	}
+
+	matching := 0
+	for _, attempt := range transportErr.Attempts {
+		if attempt.Operation == nntppool.OperationBody &&
+			attempt.Outcome == nntppool.OutcomeTemporaryFailure &&
+			attempt.ResponseCode == 451 {
+			matching++
+		}
+	}
+	return matching >= 2
 }
 
 func (b *UsenetReader) downloadManager(ctx context.Context) {
