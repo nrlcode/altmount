@@ -17,20 +17,42 @@ import (
 
 // TestCHG005TerminalBody451EvidenceIsNotRetried pins the boundary between
 // nntppool's internal 451 replay and AltMount's outer retry loop. Once the
-// pool returns two BODY/451 attempts, the result is terminal for this fetch
-// and must be returned unchanged. The assertion is repeated for both reader
-// profiles because they use different request lanes.
+// pool returns at least two BODY/451 attempts, the result is terminal for this
+// fetch and must be returned unchanged. Two attempts pin the lower bound;
+// three attempts across mixed providers prove retained evidence is not limited
+// to one exact provider pair. Both reader profiles use different request lanes.
 func TestCHG005TerminalBody451EvidenceIsNotRetried(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		importMode bool
-		wantBody   int64
-		wantPri    int64
+		name             string
+		importMode       bool
+		attemptProviders []string
+		wantBody         int64
+		wantPri          int64
 	}{
-		{name: "streaming-priority", wantPri: 1},
-		{name: "import-normal", importMode: true, wantBody: 1},
+		{
+			name:             "streaming-priority/two-attempts",
+			attemptProviders: []string{"provider-a", "provider-a"},
+			wantPri:          1,
+		},
+		{
+			name:             "streaming-priority/three-mixed-providers",
+			attemptProviders: []string{"provider-a", "provider-b", "provider-a"},
+			wantPri:          1,
+		},
+		{
+			name:             "import-normal/two-attempts",
+			importMode:       true,
+			attemptProviders: []string{"provider-a", "provider-a"},
+			wantBody:         1,
+		},
+		{
+			name:             "import-normal/three-mixed-providers",
+			importMode:       true,
+			attemptProviders: []string{"provider-a", "provider-b", "provider-a"},
+			wantBody:         1,
+		},
 	}
 
 	for _, tt := range tests {
@@ -41,27 +63,22 @@ func TestCHG005TerminalBody451EvidenceIsNotRetried(t *testing.T) {
 			defer cancel()
 
 			cause := &nntppool.Error{Code: 451, Message: "temporary article failure"}
+			attempts := make([]nntppool.AttemptEvidence, len(tt.attemptProviders))
+			for i, providerID := range tt.attemptProviders {
+				attempts[i] = nntppool.AttemptEvidence{
+					ProviderID:   providerID,
+					Operation:    nntppool.OperationBody,
+					Outcome:      nntppool.OutcomeTemporaryFailure,
+					ResponseCode: 451,
+					Cause:        cause,
+				}
+			}
 			terminal := &nntppool.TransportError{
 				Kind:         nntppool.OutcomeTemporaryFailure,
 				ProviderID:   "provider-a",
 				ResponseCode: 451,
-				Attempts: []nntppool.AttemptEvidence{
-					{
-						ProviderID:   "provider-a",
-						Operation:    nntppool.OperationBody,
-						Outcome:      nntppool.OutcomeTemporaryFailure,
-						ResponseCode: 451,
-						Cause:        cause,
-					},
-					{
-						ProviderID:   "provider-a",
-						Operation:    nntppool.OperationBody,
-						Outcome:      nntppool.OutcomeTemporaryFailure,
-						ResponseCode: 451,
-						Cause:        cause,
-					},
-				},
-				Cause: cause,
+				Attempts:     attempts,
+				Cause:        cause,
 			}
 
 			fp := fakepool.New()
@@ -99,8 +116,9 @@ func TestCHG005TerminalBody451EvidenceIsNotRetried(t *testing.T) {
 			if gotTransport.Kind != nntppool.OutcomeTemporaryFailure || gotTransport.ResponseCode != 451 {
 				t.Fatalf("transport classification = %s/%d, want temporary_failure/451", gotTransport.Kind, gotTransport.ResponseCode)
 			}
-			if len(gotTransport.Attempts) != 2 {
-				t.Fatalf("transport attempts = %d, want the two provider attempts retained", len(gotTransport.Attempts))
+			if len(gotTransport.Attempts) != len(tt.attemptProviders) {
+				t.Fatalf("transport attempts = %d, want %d provider attempts retained",
+					len(gotTransport.Attempts), len(tt.attemptProviders))
 			}
 			for i, attempt := range gotTransport.Attempts {
 				if attempt.Operation != nntppool.OperationBody ||

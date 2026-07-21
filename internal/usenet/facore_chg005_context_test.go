@@ -104,3 +104,58 @@ func TestFACORECHG005ValidationCancellationInterruptsOpenStatMany(t *testing.T) 
 	assert.Equal(t, 1, got.results[0].TotalChecked)
 	assert.Equal(t, 1, got.results[0].IncompleteCount)
 }
+
+func TestFACORECHG005ValidationTimeoutInterruptsSilentStatMany(t *testing.T) {
+	source := make(chan nntppool.StatManyResult)
+	called := make(chan struct{})
+	client := &facoreCHG005OpenStatClient{
+		Client: fakepool.New(),
+		source: source,
+		called: called,
+	}
+	mgr := &validationTestPoolManager{client: client}
+
+	type callResult struct {
+		results []ValidationResult
+		err     error
+	}
+	done := make(chan callResult, 1)
+	go func() {
+		results, err := ValidateSegmentAvailabilityBatch(
+			context.Background(),
+			[][]string{{"omitted@test"}},
+			mgr,
+			1,
+			20*time.Millisecond,
+		)
+		done <- callResult{results: results, err: err}
+	}()
+
+	facoreCHG005AwaitSignal(t, called, "StatMany admission")
+	var got callResult
+	returnedBeforeClose := false
+	select {
+	case got = <-done:
+		returnedBeforeClose = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(source)
+	if !returnedBeforeClose {
+		got = <-done
+	}
+
+	require.True(t, returnedBeforeClose,
+		"configured STAT timeout must interrupt a silent open result channel")
+	require.Error(t, got.err)
+	var incomplete *IncompleteError
+	require.ErrorAs(t, got.err, &incomplete)
+	assert.ErrorIs(t, got.err, context.DeadlineExceeded)
+	assert.Equal(t, 1, incomplete.Expected)
+	assert.Zero(t, incomplete.Completed)
+	assert.True(t, incomplete.Global)
+	require.Len(t, got.results, 1)
+	assert.Zero(t, got.results[0].MissingCount,
+		"timed-out or omitted work must never become hard absence")
+	assert.Zero(t, got.results[0].TotalChecked)
+	assert.Equal(t, 1, got.results[0].IncompleteCount)
+}

@@ -92,6 +92,56 @@ func TestFACORECHG005ReleaseProbeCancellationInterruptsSilentStatMany(t *testing
 	assert.Zero(t, incomplete.Completed)
 }
 
+func TestFACORECHG005ReleaseProbeTimeoutInterruptsSilentStatMany(t *testing.T) {
+	source := make(chan nntppool.StatManyResult)
+	called := make(chan struct{})
+	client := &facoreCHG005OpenFastFailClient{
+		Client: fakepool.New(),
+		source: source,
+		called: called,
+	}
+
+	type callResult struct {
+		missing bool
+		err     error
+	}
+	done := make(chan callResult, 1)
+	go func() {
+		missing, err := FastFailReleaseProbe(
+			context.Background(),
+			[]FastFailFile{{Filename: "movie.mkv", Segments: makeTestSegments("timeout", 1)}},
+			fastFailPoolManager{client: client},
+			100,
+			1,
+			20*time.Millisecond,
+		)
+		done <- callResult{missing: missing, err: err}
+	}()
+
+	facoreCHG005AwaitFastFailSignal(t, called, "release-probe StatMany admission")
+	var got callResult
+	returnedBeforeClose := false
+	select {
+	case got = <-done:
+		returnedBeforeClose = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(source)
+	if !returnedBeforeClose {
+		got = <-done
+	}
+
+	require.True(t, returnedBeforeClose,
+		"configured STAT timeout must interrupt a silent open result channel")
+	assert.False(t, got.missing, "timed-out work must never become hard absence")
+	require.Error(t, got.err)
+	var incomplete *usenet.IncompleteError
+	require.ErrorAs(t, got.err, &incomplete)
+	assert.ErrorIs(t, got.err, context.DeadlineExceeded)
+	assert.Equal(t, 1, incomplete.Expected)
+	assert.Zero(t, incomplete.Completed)
+}
+
 func TestFACORECHG005FileProbeCancellationInterruptsOpenStatMany(t *testing.T) {
 	source := make(chan nntppool.StatManyResult)
 	called := make(chan struct{})
@@ -156,5 +206,59 @@ func TestFACORECHG005FileProbeCancellationInterruptsOpenStatMany(t *testing.T) {
 	require.Len(t, got.results, 1)
 	assert.False(t, got.results[0].Broken,
 		"cancelled or omitted work must never mark a file broken")
+	assert.Empty(t, got.results[0].MissingSegmentIDs)
+}
+
+func TestFACORECHG005FileProbeTimeoutInterruptsSilentStatMany(t *testing.T) {
+	source := make(chan nntppool.StatManyResult)
+	called := make(chan struct{})
+	client := &facoreCHG005OpenFastFailClient{
+		Client: fakepool.New(),
+		source: source,
+		called: called,
+	}
+
+	type callResult struct {
+		results []FastFailFileResult
+		err     error
+	}
+	done := make(chan callResult, 1)
+	go func() {
+		results, err := FastFailCheckFiles(
+			context.Background(),
+			[]FastFailFile{{Filename: "movie.mkv", Segments: makeTestSegments("timeout", 1)}},
+			fastFailPoolManager{client: client},
+			100,
+			1,
+			20*time.Millisecond,
+			nil,
+		)
+		done <- callResult{results: results, err: err}
+	}()
+
+	facoreCHG005AwaitFastFailSignal(t, called, "per-file StatMany admission")
+	var got callResult
+	returnedBeforeClose := false
+	select {
+	case got = <-done:
+		returnedBeforeClose = true
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(source)
+	if !returnedBeforeClose {
+		got = <-done
+	}
+
+	require.True(t, returnedBeforeClose,
+		"configured STAT timeout must interrupt a silent open per-file result channel")
+	require.Error(t, got.err)
+	var incomplete *usenet.IncompleteError
+	require.ErrorAs(t, got.err, &incomplete)
+	assert.ErrorIs(t, got.err, context.DeadlineExceeded)
+	assert.Equal(t, 1, incomplete.Expected)
+	assert.Zero(t, incomplete.Completed)
+	require.Len(t, got.results, 1)
+	assert.False(t, got.results[0].Broken,
+		"timed-out or omitted work must never mark a file broken")
 	assert.Empty(t, got.results[0].MissingSegmentIDs)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/javi11/altmount/internal/database"
 	"github.com/javi11/altmount/internal/testsupport/fakepool"
@@ -49,6 +50,31 @@ func healthClaimAuditCount(t *testing.T, env *repairTestEnv, filePath string) in
 	return count
 }
 
+func requirePendingHealthReschedule(
+	t *testing.T,
+	env *repairTestEnv,
+	filePath string,
+	cycleStarted time.Time,
+) *database.FileHealth {
+	t.Helper()
+
+	row, err := env.healthRepo.GetFileHealth(context.Background(), filePath)
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	require.Equal(t, database.HealthStatusPending, row.Status)
+	require.NotNil(t, row.ScheduledCheckAt,
+		"inconclusive work must be given a durable next attempt")
+
+	cycleFinished := time.Now().UTC()
+	assert.True(t, row.ScheduledCheckAt.After(cycleFinished),
+		"next attempt %s must remain in the future after the cycle finished at %s",
+		row.ScheduledCheckAt, cycleFinished)
+	assert.False(t, row.ScheduledCheckAt.After(cycleStarted.Add(16*time.Minute)),
+		"zero-retry reschedule %s exceeded the bounded 15-minute backoff",
+		row.ScheduledCheckAt)
+	return row
+}
+
 func TestCHG005TemporaryChecksStayPendingWithoutConsumingRetryBudget(t *testing.T) {
 	client := fakepool.New()
 	client.SetDefaultBehavior(fakepool.SegmentBehavior{
@@ -65,16 +91,18 @@ func TestCHG005TemporaryChecksStayPendingWithoutConsumingRetryBudget(t *testing.
 	writeHealthyFile(t, env, filePath)
 	insertFileHealth(t, env.db, filePath, "", 0, maxRetries)
 
+	var row *database.FileHealth
 	for cycle := 0; cycle < maxRetries+1; cycle++ {
-		if cycle > 0 {
+		cycleStarted := time.Now().UTC()
+		require.NoError(t, env.hw.runHealthCheckCycle(context.Background()), "cycle %d", cycle)
+		row = requirePendingHealthReschedule(t, env, filePath, cycleStarted)
+		assert.Zero(t, row.RetryCount,
+			"temporary/inconclusive cycle %d consumed the conclusive retry budget", cycle)
+		if cycle < maxRetries {
 			forceHealthCheckDue(t, env, filePath)
 		}
-		require.NoError(t, env.hw.runHealthCheckCycle(context.Background()), "cycle %d", cycle)
 	}
 
-	row, err := env.healthRepo.GetFileHealth(context.Background(), filePath)
-	require.NoError(t, err)
-	require.NotNil(t, row)
 	assert.Equal(t, database.HealthStatusPending, row.Status)
 	assert.Zero(t, row.RetryCount,
 		"temporary/inconclusive checks must not consume the conclusive retry budget")
@@ -92,16 +120,18 @@ func TestCHG005RemovedChecksRescheduleAndRemainRetryable(t *testing.T) {
 	insertFileHealth(t, env.db, filePath, "", 0, maxRetries)
 	installHealthClaimAudit(t, env)
 
+	var row *database.FileHealth
 	for cycle := 0; cycle < maxRetries+1; cycle++ {
-		if cycle > 0 {
+		cycleStarted := time.Now().UTC()
+		require.NoError(t, env.hw.runHealthCheckCycle(context.Background()), "cycle %d", cycle)
+		row = requirePendingHealthReschedule(t, env, filePath, cycleStarted)
+		assert.Zero(t, row.RetryCount,
+			"missing-metadata cycle %d consumed the conclusive retry budget", cycle)
+		if cycle < maxRetries {
 			forceHealthCheckDue(t, env, filePath)
 		}
-		require.NoError(t, env.hw.runHealthCheckCycle(context.Background()), "cycle %d", cycle)
 	}
 
-	row, err := env.healthRepo.GetFileHealth(context.Background(), filePath)
-	require.NoError(t, err)
-	require.NotNil(t, row)
 	assert.Equal(t, database.HealthStatusPending, row.Status)
 	assert.Zero(t, row.RetryCount,
 		"missing metadata is inconclusive and must not consume a retry")

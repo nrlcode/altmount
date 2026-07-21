@@ -32,16 +32,15 @@ func TestFACOREF009TriggerFileRescanWaiterCancellationIsIndependent(t *testing.T
 	}()
 	waitForBlockedARRRequest(t, fixture.transport)
 
-	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
-	waiterInvoked := make(chan struct{})
+	waiterBaseCtx, cancelWaiter := context.WithCancel(context.Background())
+	waiterCtx := newObservedRescanContext(waiterBaseCtx)
 	waiterDone := make(chan error, 1)
 	go func() {
-		close(waiterInvoked)
 		waiterDone <- fixture.manager.TriggerFileRescan(
 			waiterCtx, fixture.path, fixture.relativePath, &fixture.metadata,
 		)
 	}()
-	<-waiterInvoked
+	waitForRescanJoin(t, waiterCtx)
 	cancelWaiter()
 
 	waiterErr, waiterReturned := awaitRescanCall(waiterDone, time.Second)
@@ -70,6 +69,9 @@ func TestFACOREF009TriggerFileRescanWaiterCancellationIsIndependent(t *testing.T
 			t.Error("waiter did not settle after cleanup release")
 		}
 	}
+	if got := fixture.transport.calls.Load(); got != 1 {
+		t.Errorf("ARR calls after same-key calls settled = %d, want 1", got)
+	}
 }
 
 func TestFACOREF009TriggerFileRescanLeaderCancellationDoesNotCancelWaiter(t *testing.T) {
@@ -88,15 +90,14 @@ func TestFACOREF009TriggerFileRescanLeaderCancellationDoesNotCancelWaiter(t *tes
 	}()
 	waitForBlockedARRRequest(t, fixture.transport)
 
-	waiterInvoked := make(chan struct{})
+	waiterCtx := newObservedRescanContext(context.Background())
 	waiterDone := make(chan error, 1)
 	go func() {
-		close(waiterInvoked)
 		waiterDone <- fixture.manager.TriggerFileRescan(
-			context.Background(), fixture.path, fixture.relativePath, &fixture.metadata,
+			waiterCtx, fixture.path, fixture.relativePath, &fixture.metadata,
 		)
 	}()
-	<-waiterInvoked
+	waitForRescanJoin(t, waiterCtx)
 	cancelLeader()
 
 	leaderErr, leaderReturned := awaitRescanCall(leaderDone, time.Second)
@@ -128,6 +129,36 @@ func TestFACOREF009TriggerFileRescanLeaderCancellationDoesNotCancelWaiter(t *tes
 		if _, ok := awaitRescanCall(leaderDone, 2*time.Second); !ok {
 			t.Error("leader did not settle after cleanup release")
 		}
+	}
+	if got := fixture.transport.calls.Load(); got != 1 {
+		t.Errorf("ARR calls after same-key calls settled = %d, want 1", got)
+	}
+}
+
+// observedRescanContext reports when TriggerFileRescan evaluates Done after
+// registering its DoChan result. That is the first deterministic point at
+// which the test knows the same-key caller has joined the shared flight.
+type observedRescanContext struct {
+	context.Context
+	joined chan struct{}
+	once   sync.Once
+}
+
+func newObservedRescanContext(ctx context.Context) *observedRescanContext {
+	return &observedRescanContext{Context: ctx, joined: make(chan struct{})}
+}
+
+func (c *observedRescanContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.joined) })
+	return c.Context.Done()
+}
+
+func waitForRescanJoin(t *testing.T, ctx *observedRescanContext) {
+	t.Helper()
+	select {
+	case <-ctx.joined:
+	case <-time.After(2 * time.Second):
+		t.Fatal("same-key rescan caller did not join the shared flight")
 	}
 }
 
