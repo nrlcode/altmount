@@ -314,7 +314,7 @@ func (m *Manager) TriggerFileRescan(ctx context.Context, pathForRescan string, r
 	}
 	key := fmt.Sprintf("rescan:%s:%s", pathForRescan, hasMeta)
 
-	res, err, _ := m.sf.Do(key, func() (interface{}, error) {
+	resultCh := m.sf.DoChan(key, func() (interface{}, error) {
 		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 
@@ -409,13 +409,18 @@ func (m *Manager) TriggerFileRescan(ctx context.Context, pathForRescan string, r
 		}
 	})
 
-	if err != nil {
-		return err
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case result := <-resultCh:
+		if result.Err != nil {
+			return result.Err
+		}
+		if result.Val != nil {
+			return result.Val.(error)
+		}
+		return nil
 	}
-	if res != nil {
-		return res.(error)
-	}
-	return nil
 }
 
 // TriggerScanForFile finds the ARR instance managing the file and triggers a download scan on it.

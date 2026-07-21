@@ -84,8 +84,7 @@ func (c *Config) GetCheckAllSegments() bool {
 }
 
 // GetPauseHealthDuringPlayback gates the temporary PR3 admission safeguard.
-// It defaults on and pauses only new ordinary health sweeps; PR6 replaces it
-// with adaptive admission and recovery-aware routing.
+// It defaults on and pauses only new ordinary health sweeps.
 func (c *Config) GetPauseHealthDuringPlayback() bool {
 	if c.Health.PauseDuringPlayback == nil {
 		return true

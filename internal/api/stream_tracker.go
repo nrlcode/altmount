@@ -25,12 +25,13 @@ type StreamChangeNotifier interface {
 
 // StreamTracker tracks active streams
 type StreamTracker struct {
-	streams        sync.Map
-	history        []nzbfilesystem.ActiveStream
-	done           chan struct{}
-	mu             sync.Mutex // For history protection
-	timeout        time.Duration
-	metricsTracker usenet.MetricsTracker
+	streams         sync.Map
+	history         []nzbfilesystem.ActiveStream
+	done            chan struct{}
+	mu              sync.Mutex // For history protection
+	healthAdmission sync.RWMutex
+	timeout         time.Duration
+	metricsTracker  usenet.MetricsTracker
 
 	// activeCount is the exact number of entries currently in the streams map.
 	// Maintained as an int64 counter so ActiveStreams() is O(1) and safe to
@@ -268,8 +269,10 @@ func (t *StreamTracker) AddStream(filePath, source, userName, clientIP, userAgen
 		lastReadAt:   now,
 		samples:      make([]streamSample, 0, 30), // Preallocate for 1 minute of samples (every 2s)
 	}
+	t.healthAdmission.Lock()
 	t.streams.Store(id, internal)
 	t.activeCount.Add(1)
+	t.healthAdmission.Unlock()
 	t.notifyChange()
 	return stream
 }
@@ -284,6 +287,21 @@ func (t *StreamTracker) SetChangeNotifier(n StreamChangeNotifier) {
 // Implements pool.StreamActivitySource (structurally).
 func (t *StreamTracker) ActiveStreams() int {
 	return int(t.activeCount.Load())
+}
+
+// AcquireHealthAdmission prevents a playback start from crossing an admitted
+// automatic health cycle. Playback already active at the boundary wins.
+func (t *StreamTracker) AcquireHealthAdmission() (release func(), admitted bool) {
+	t.healthAdmission.RLock()
+	if t.activeCount.Load() > 0 {
+		t.healthAdmission.RUnlock()
+		return func() {}, false
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(t.healthAdmission.RUnlock)
+	}, true
 }
 
 func (t *StreamTracker) notifyChange() {
@@ -358,7 +376,14 @@ func (t *StreamTracker) Remove(id string) {
 	// Claim the entry atomically. Normal close, file close, and stale cleanup
 	// can race to remove the same stream; only the winner may cancel it, add a
 	// history row, decrement activeCount, or notify admission waiters.
-	if val, ok := t.streams.LoadAndDelete(id); ok {
+	t.healthAdmission.Lock()
+	val, ok := t.streams.LoadAndDelete(id)
+	if ok {
+		t.activeCount.Add(-1)
+	}
+	t.healthAdmission.Unlock()
+
+	if ok {
 		internal := valueToInternal(val)
 
 		// Cancel the context to stop underlying readers and release resources
@@ -382,7 +407,6 @@ func (t *StreamTracker) Remove(id string) {
 		t.history = append(t.history, finalStream)
 		t.mu.Unlock()
 
-		t.activeCount.Add(-1)
 		t.notifyChange()
 	}
 }

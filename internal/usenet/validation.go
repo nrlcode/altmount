@@ -197,7 +197,23 @@ func ValidateSegmentAvailabilityTargetsBatch(
 
 	var firstIncomplete error
 	unexpectedResults := 0
-	for r := range usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections}) {
+	statResults := usenetPool.StatMany(statCtx, ids, nntppool.StatManyOptions{Concurrency: maxConnections})
+receiveResults:
+	for {
+		var r nntppool.StatManyResult
+		var ok bool
+		select {
+		case <-statCtx.Done():
+			if firstIncomplete == nil {
+				firstIncomplete = statCtx.Err()
+			}
+			break receiveResults
+		case r, ok = <-statResults:
+			if !ok {
+				break receiveResults
+			}
+		}
+
 		ownerQueue := owners[r.MessageID]
 		if len(ownerQueue) == 0 {
 			unexpectedResults++
