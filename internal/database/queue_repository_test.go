@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -193,6 +195,43 @@ func TestAddToQueueReturnsExistingRowIDForNoopConflict(t *testing.T) {
 	require.EqualValues(t, 1, item.ID,
 		"a no-op conflict must return the authoritative existing row ID, not last_insert_rowid")
 	requireNoopConflictRowUnchanged(t, db, "active.nzb", QueueStatusProcessing)
+}
+
+func TestAddToQueueResolvesIDBeforeCommit(t *testing.T) {
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "queue.db"))
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	setupQueueSchema(t, db)
+
+	var committed atomic.Bool
+	conn, err := db.Conn(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, conn.Raw(func(driverConn any) error {
+		sqliteConn := driverConn.(*sqlite3.SQLiteConn)
+		sqliteConn.RegisterCommitHook(func() int {
+			committed.Store(true)
+			return 0
+		})
+		sqliteConn.RegisterAuthorizer(func(operation int, table, _, _ string) int {
+			if operation == sqlite3.SQLITE_READ && table == "import_queue" && committed.Load() {
+				return sqlite3.SQLITE_DENY
+			}
+			return sqlite3.SQLITE_OK
+		})
+		return nil
+	}))
+	require.NoError(t, conn.Close())
+
+	repo := NewQueueRepository(db, DialectSQLite)
+	item := &ImportQueueItem{
+		NzbPath: "atomic/id.nzb", Status: QueueStatusPending,
+		Priority: QueuePriorityNormal, MaxRetries: 3,
+	}
+	require.NoError(t, repo.AddToQueue(context.Background(), item),
+		"the authoritative ID lookup must complete in the insert transaction")
+	require.NotZero(t, item.ID)
 }
 
 func TestAddBatchToQueueReturnsExistingRowIDForNoopConflict(t *testing.T) {
