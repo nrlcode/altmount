@@ -67,15 +67,19 @@ func TestPerformBackgroundCheckClaimsSynchronouslyAndRejectsDuplicate(t *testing
 		waitForHealthContract(t, func() bool { return client.InFlight() == 2 },
 			"timed out waiting for the duplicate STAT")
 	}
-	assert.Error(t, err, "a second start must be rejected while the first claim is active")
+	assert.ErrorIs(t, err, ErrHealthCheckAdmissionConflict,
+		"a second start must report an admission conflict while the first claim is active")
 	assert.Equal(t, int64(1), client.StatCalls(), "the rejected start cannot dispatch a second STAT")
 
 	close(release)
 	released = true
 	waitForHealthContract(t, func() bool {
-		row, getErr := env.healthRepo.GetFileHealth(context.Background(), filePath)
-		return getErr == nil && row != nil && row.Status != database.HealthStatusChecking && !env.hw.IsCheckActive(filePath)
+		return !env.hw.IsCheckActive(filePath)
 	}, "timed out waiting for background health check completion")
+	completed, err := env.healthRepo.GetFileHealth(context.Background(), filePath)
+	require.NoError(t, err)
+	require.NotNil(t, completed)
+	require.Equal(t, database.HealthStatusHealthy, completed.Status)
 }
 
 func TestWorkerAdmissionFailurePerformsNoCheckEffectOrPublication(t *testing.T) {
