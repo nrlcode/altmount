@@ -274,7 +274,7 @@ func TestPostgresNoopQueueConflictsReturnAuthoritativeIDs(t *testing.T) {
 			ctx := context.Background()
 			path := fmt.Sprintf("fbase/noop-%d-%d.nzb", time.Now().UnixNano(), i)
 			protectedCategory := "protected"
-			protectedMetadata := "protected"
+			protectedMetadata := `{"value":"protected"}`
 			seed := &ImportQueueItem{
 				NzbPath: path, Status: QueueStatusPending, Priority: QueuePriorityNormal,
 				MaxRetries: 3, Category: &protectedCategory, Metadata: &protectedMetadata,
@@ -285,7 +285,7 @@ func TestPostgresNoopQueueConflictsReturnAuthoritativeIDs(t *testing.T) {
 			t.Cleanup(func() { _ = repo.RemoveFromQueue(context.Background(), seed.ID) })
 
 			incomingCategory := "incoming"
-			incomingMetadata := "incoming"
+			incomingMetadata := `{"value":"incoming"}`
 			incoming := &ImportQueueItem{
 				NzbPath: path, Status: QueueStatusPending, Priority: QueuePriorityNormal,
 				MaxRetries: 3, Category: &incomingCategory, Metadata: &incomingMetadata,
