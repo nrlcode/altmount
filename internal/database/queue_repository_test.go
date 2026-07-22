@@ -164,6 +164,50 @@ func TestGetQueueItemByNzbPath(t *testing.T) {
 	assert.Nil(t, notFound)
 }
 
+func TestAddToQueueReturnsExistingRowIDForNoopConflict(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	setupQueueSchema(t, db)
+	insertQueueItemWithTime(t, db, 1, "active.nzb", "pending", time.Now())
+	insertQueueItemWithTime(t, db, 2, "last-insert.nzb", "failed", time.Now())
+
+	repo := NewQueueRepository(db, DialectSQLite)
+	item := &ImportQueueItem{
+		NzbPath:    "active.nzb",
+		Status:     QueueStatusPending,
+		Priority:   QueuePriorityNormal,
+		MaxRetries: 3,
+	}
+
+	require.NoError(t, repo.AddToQueue(context.Background(), item))
+	require.EqualValues(t, 1, item.ID,
+		"a no-op conflict must return the authoritative existing row ID, not last_insert_rowid")
+}
+
+func TestAddBatchToQueueReturnsExistingRowIDForNoopConflict(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	setupQueueSchema(t, db)
+	insertQueueItemWithTime(t, db, 1, "completed.nzb", "completed", time.Now())
+	insertQueueItemWithTime(t, db, 2, "last-insert.nzb", "failed", time.Now())
+
+	repo := NewQueueRepository(db, DialectSQLite)
+	item := &ImportQueueItem{
+		NzbPath:    "completed.nzb",
+		Status:     QueueStatusPending,
+		Priority:   QueuePriorityNormal,
+		MaxRetries: 3,
+	}
+
+	require.NoError(t, repo.AddBatchToQueue(context.Background(), []*ImportQueueItem{item}))
+	require.EqualValues(t, 1, item.ID,
+		"a no-op batch conflict must return the authoritative existing row ID, not last_insert_rowid")
+}
+
 func TestResetStaleItems_UpdatedAtFieldUpdated(t *testing.T) {
 	// Setup
 	db, err := sql.Open("sqlite3", ":memory:")

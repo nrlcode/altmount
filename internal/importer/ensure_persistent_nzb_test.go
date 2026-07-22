@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -16,12 +17,19 @@ import (
 
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/metadata"
 )
 
 // newMinimalServiceForPersistTest builds just enough of *Service to exercise
 // ensurePersistentNzb. It uses an in-memory SQLite database so no disk paths
 // are required.
 func newMinimalServiceForPersistTest(t *testing.T) *Service {
+	t.Helper()
+	service, _ := newMinimalServiceForPersistTestWithDB(t)
+	return service
+}
+
+func newMinimalServiceForPersistTestWithDB(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
 
 	// Open in-memory SQLite and run the minimal queue schema.
@@ -64,25 +72,25 @@ func newMinimalServiceForPersistTest(t *testing.T) *Service {
 	dbWrapper := &database.DB{}
 	dbWrapper.Repository = repo
 
-	// Minimal configGetter — only Database.Path is used in the OLD code.
-	// After the change it is no longer used inside the function, but we keep a
-	// valid value so any residual reference doesn't panic.
 	tmpCfgDir := t.TempDir()
-	cfgGetter := config.ConfigGetter(func() *config.Config {
-		return &config.Config{
-			Database: config.DatabaseConfig{
-				Path: filepath.Join(tmpCfgDir, "test.db"),
-			},
-		}
-	})
+	cfg := config.DefaultConfig(tmpCfgDir)
+	cfg.Database.Path = filepath.Join(tmpCfgDir, "test.db")
+	cfgGetter := config.ConfigGetter(func() *config.Config { return cfg })
+	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
+	require.NoError(t, metadataService.ConfigureCleanupRoots(
+		filepath.Join(tmpCfgDir, ".nzbs"),
+		filepath.Join(os.TempDir(), ".altmount-queue"),
+		filepath.Join(tmpCfgDir, ".nzbs"),
+	))
 
 	return &Service{
-		database:     dbWrapper,
-		configGetter: cfgGetter,
-		log:          slog.Default(),
-		cancelFuncs:  make(map[int64]context.CancelFunc),
-		mu:           sync.RWMutex{},
-	}
+		database:        dbWrapper,
+		configGetter:    cfgGetter,
+		metadataService: metadataService,
+		log:             slog.Default(),
+		cancelFuncs:     make(map[int64]context.CancelFunc),
+		mu:              sync.RWMutex{},
+	}, db
 }
 
 func TestEnsurePersistentNzb_UsesOSTempQueueDir(t *testing.T) {
@@ -135,4 +143,145 @@ func TestEnsurePersistentNzb_AlreadyInTempQueueDir_IsNoop(t *testing.T) {
 	// Assert: path unchanged
 	assert.Equal(t, existingPath, item.NzbPath,
 		"path should not change when already in OS temp queue dir")
+}
+
+func TestEnsurePersistentNzbRejectsSymlinkedTempQueueRoot(t *testing.T) {
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+
+	svc := newMinimalServiceForPersistTest(t)
+	outside := t.TempDir()
+	queueRoot := filepath.Join(tempRoot, ".altmount-queue")
+	require.NoError(t, os.Symlink(outside, queueRoot))
+
+	victim := filepath.Join(outside, "victim.nzb")
+	require.NoError(t, os.WriteFile(victim, []byte("<nzb/>"), 0o600))
+	item := &database.ImportQueueItem{ID: 101, NzbPath: filepath.Join(queueRoot, "victim.nzb")}
+
+	err := svc.ensurePersistentNzb(context.Background(), item)
+
+	require.Error(t, err, "a symlinked persistent queue root must never be trusted")
+	assert.FileExists(t, victim)
+}
+
+func TestAddToQueueNeverCommitsAnUnownedSourcePath(t *testing.T) {
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	svc, db := newMinimalServiceForPersistTestWithDB(t)
+
+	queueRoot := filepath.Join(tempRoot, ".altmount-queue")
+	installOwnedQueuePathTrigger(t, db, queueRoot)
+
+	stageDir := t.TempDir()
+	source := filepath.Join(stageDir, "admission.nzb")
+	require.NoError(t, os.WriteFile(source, []byte("<nzb/>"), 0o600))
+
+	item, err := svc.AddToQueue(context.Background(), source, nil, nil, nil, nil, nil, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, item)
+	require.NotZero(t, item.ID)
+	requireStrictChildPath(t, queueRoot, item.NzbPath)
+	assert.FileExists(t, item.NzbPath)
+}
+
+func installOwnedQueuePathTrigger(t *testing.T, db *sql.DB, queueRoot string) {
+	t.Helper()
+	queuePrefix := queueRoot + string(os.PathSeparator)
+	sqlPrefix := strings.ReplaceAll(queuePrefix, "'", "''")
+	_, err := db.Exec(`
+		CREATE TRIGGER reject_unowned_queue_path
+		BEFORE INSERT ON import_queue
+		WHEN substr(NEW.nzb_path, 1, ` + strconv.Itoa(len(queuePrefix)) + `) != '` + sqlPrefix + `'
+		BEGIN
+			SELECT RAISE(ABORT, 'unowned queue path');
+		END;
+	`)
+	require.NoError(t, err)
+}
+
+func requireQueueRowCount(t *testing.T, db *sql.DB, want int) {
+	t.Helper()
+	var got int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM import_queue`).Scan(&got))
+	require.Equal(t, want, got)
+}
+
+func requireStrictChildPath(t *testing.T, root, path string) string {
+	t.Helper()
+	rel, err := filepath.Rel(root, path)
+	require.NoError(t, err)
+	require.NotEqual(t, ".", rel)
+	require.True(t, filepath.IsLocal(rel), "%q must be a strict child of %q", path, root)
+	return rel
+}
+
+func TestAddToQueueRejectsSymlinkedOwnedAncestor(t *testing.T) {
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	svc, db := newMinimalServiceForPersistTestWithDB(t)
+	queueRoot := filepath.Join(tempRoot, ".altmount-queue")
+	require.NoError(t, os.MkdirAll(queueRoot, 0o755))
+
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.nzb")
+	require.NoError(t, os.WriteFile(victim, []byte("<nzb/>"), 0o600))
+	require.NoError(t, os.Symlink(outside, filepath.Join(queueRoot, "escape")))
+
+	item, err := svc.AddToQueue(
+		context.Background(), filepath.Join(queueRoot, "escape", "victim.nzb"),
+		nil, nil, nil, nil, nil, nil,
+	)
+
+	require.Error(t, err)
+	require.Nil(t, item)
+	assert.FileExists(t, victim)
+	requireQueueRowCount(t, db, 0)
+}
+
+func TestAddToQueueAcceptsAlreadyOwnedRegularFile(t *testing.T) {
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	svc, db := newMinimalServiceForPersistTestWithDB(t)
+	queueRoot := filepath.Join(tempRoot, ".altmount-queue")
+	require.NoError(t, os.MkdirAll(queueRoot, 0o755))
+	installOwnedQueuePathTrigger(t, db, queueRoot)
+
+	source := filepath.Join(queueRoot, "already-owned.nzb")
+	require.NoError(t, os.WriteFile(source, []byte("<nzb/>"), 0o600))
+	item, err := svc.AddToQueue(context.Background(), source, nil, nil, nil, nil, nil, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, item)
+	assert.Equal(t, source, item.NzbPath)
+	assert.FileExists(t, source)
+	requireQueueRowCount(t, db, 1)
+}
+
+func TestAddToQueueRollsBackRootedCopyWhenPathUpdateFails(t *testing.T) {
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	svc, db := newMinimalServiceForPersistTestWithDB(t)
+	_, err := db.Exec(`
+		CREATE TRIGGER reject_queue_path_update
+		BEFORE UPDATE OF nzb_path ON import_queue
+		BEGIN
+			SELECT RAISE(ABORT, 'injected path update failure');
+		END;
+	`)
+	require.NoError(t, err)
+
+	source := filepath.Join(t.TempDir(), "rollback.nzb")
+	require.NoError(t, os.WriteFile(source, []byte("<nzb/>"), 0o600))
+	item, err := svc.AddToQueue(context.Background(), source, nil, nil, nil, nil, nil, nil)
+
+	require.Error(t, err)
+	require.Nil(t, item)
+	assert.FileExists(t, source, "a failed DB publication must retain the caller-owned source")
+	requireQueueRowCount(t, db, 0)
+	entries, readErr := os.ReadDir(filepath.Join(tempRoot, ".altmount-queue"))
+	if !os.IsNotExist(readErr) {
+		require.NoError(t, readErr)
+		assert.Empty(t, entries, "a rolled-back admission must not leak a rooted copy")
+	}
 }

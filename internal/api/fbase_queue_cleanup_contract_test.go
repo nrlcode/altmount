@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,6 +103,19 @@ func (e *queueCleanupTestEnv) addSymlinkEscapedItem(
 	require.NoError(t, os.Symlink(outside, filepath.Join(e.ownedRoot, "escape")))
 	item := e.addItem(t, filepath.Join(e.ownedRoot, "escape", "victim.nzb"), status, downloadID...)
 	return item, victim
+}
+
+func (e *queueCleanupTestEnv) addNonEmptyDirectoryItem(
+	t *testing.T,
+	status database.QueueStatus,
+	downloadID ...string,
+) (*database.ImportQueueItem, string) {
+	t.Helper()
+	target := filepath.Join(e.ownedRoot, fmt.Sprintf("non-empty-%d.nzb", time.Now().UnixNano()))
+	require.NoError(t, os.MkdirAll(target, 0o755))
+	child := filepath.Join(target, "keep")
+	require.NoError(t, os.WriteFile(child, []byte("keep"), 0o600))
+	return e.addItem(t, target, status, downloadID...), child
 }
 
 func (e *queueCleanupTestEnv) addHistory(t *testing.T, item *database.ImportQueueItem, nzbName string) {
@@ -209,16 +224,13 @@ func TestQueueBulkDeleteCleansOwnedFiles(t *testing.T) {
 }
 
 func TestQueueBulkDeleteStopsAfterOwnedCleanupFailure(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("symlink authority test requires Unix symlink semantics")
-	}
 	env := newQueueCleanupTestEnv(t)
 	require.NoError(t, os.MkdirAll(env.ownedRoot, 0o755))
 
 	ownedPath := filepath.Join(env.ownedRoot, "first-owned.nzb")
 	require.NoError(t, os.WriteFile(ownedPath, []byte("delete"), 0o600))
 	owned := env.addItem(t, ownedPath, database.QueueStatusPending)
-	failing, victim := env.addSymlinkEscapedItem(t, database.QueueStatusFailed)
+	failing, child := env.addNonEmptyDirectoryItem(t, database.QueueStatusFailed)
 	require.Less(t, owned.ID, failing.ID, "fixture IDs must preserve request order")
 
 	app := fiber.New()
@@ -232,7 +244,7 @@ func TestQueueBulkDeleteStopsAfterOwnedCleanupFailure(t *testing.T) {
 
 	assert.NoFileExists(t, ownedPath, "the earlier owned item completes before the later failure")
 	requireQueueItemExists(t, env.repo, owned.ID, false)
-	assert.FileExists(t, victim)
+	assert.FileExists(t, child)
 	requireQueueItemStatus(t, env.repo, failing.ID, database.QueueStatusFailed)
 }
 
@@ -248,11 +260,8 @@ func TestQueueStatusClearPreservesOwnershipWhenCleanupFails(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if runtime.GOOS == "windows" {
-				t.Skip("symlink authority test requires Unix symlink semantics")
-			}
 			env := newQueueCleanupTestEnv(t)
-			item, victim := env.addSymlinkEscapedItem(t, tt.status)
+			item, child := env.addNonEmptyDirectoryItem(t, tt.status)
 
 			app := fiber.New()
 			switch tt.status {
@@ -266,41 +275,35 @@ func TestQueueStatusClearPreservesOwnershipWhenCleanupFails(t *testing.T) {
 			resp, err := app.Test(httptest.NewRequest("DELETE", tt.path, nil))
 			require.NoError(t, err)
 			assert.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
-			assert.FileExists(t, victim)
+			assert.FileExists(t, child)
 			requireQueueItemStatus(t, env.repo, item.ID, tt.status)
 		})
 	}
 }
 
 func TestSystemCleanupRetainsCompletedRowWhenCleanupFails(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("symlink authority test requires Unix symlink semantics")
-	}
 	env := newQueueCleanupTestEnv(t)
-	item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusCompleted)
+	item, child := env.addNonEmptyDirectoryItem(t, database.QueueStatusCompleted)
 
 	app := fiber.New()
 	app.Post("/system/cleanup", env.server.handleSystemCleanup)
 	resp, err := app.Test(httptest.NewRequest("POST", "/system/cleanup", nil))
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
-	assert.FileExists(t, victim)
+	assert.FileExists(t, child)
 	requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusCompleted)
 }
 
 func TestResetSystemStatsSurfacesQueueCleanupFailure(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("symlink authority test requires Unix symlink semantics")
-	}
 	env := newQueueCleanupTestEnv(t)
-	item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusFailed)
+	item, child := env.addNonEmptyDirectoryItem(t, database.QueueStatusFailed)
 
 	app := fiber.New()
 	app.Post("/system/stats/reset", env.server.handleResetSystemStats)
 	resp, err := app.Test(httptest.NewRequest("POST", "/system/stats/reset?reset_queue=true", nil))
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
-	assert.FileExists(t, victim)
+	assert.FileExists(t, child)
 	requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusFailed)
 }
 
@@ -333,9 +336,6 @@ func TestSABQueueDeletionCleansOwnedFileForEveryIdentifier(t *testing.T) {
 }
 
 func TestSABQueueDeletionReportsCleanupFailureForEveryIdentifier(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("symlink authority test requires Unix symlink semantics")
-	}
 	tests := []struct {
 		name       string
 		downloadID string
@@ -347,23 +347,20 @@ func TestSABQueueDeletionReportsCleanupFailureForEveryIdentifier(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			env := newQueueCleanupTestEnv(t)
-			item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusPending, tt.downloadID)
+			item, child := env.addNonEmptyDirectoryItem(t, database.QueueStatusPending, tt.downloadID)
 
 			app := fiber.New()
 			app.Get("/sab", env.server.handleSABnzbdQueueDelete)
 			resp, err := app.Test(httptest.NewRequest("GET", "/sab?value="+tt.value(item), nil))
 			require.NoError(t, err)
 			requireSABDeleteResponse(t, resp, false)
-			assert.FileExists(t, victim)
+			assert.FileExists(t, child)
 			requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusPending)
 		})
 	}
 }
 
 func TestSABHistoryDeletionReportsQueueCleanupFailureForEveryIdentifier(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("symlink authority test requires Unix symlink semantics")
-	}
 	tests := []struct {
 		name       string
 		downloadID string
@@ -375,7 +372,7 @@ func TestSABHistoryDeletionReportsQueueCleanupFailureForEveryIdentifier(t *testi
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			env := newQueueCleanupTestEnv(t)
-			item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusCompleted, tt.downloadID)
+			item, child := env.addNonEmptyDirectoryItem(t, database.QueueStatusCompleted, tt.downloadID)
 			env.addHistory(t, item, "queue-backed.nzb")
 
 			app := fiber.New()
@@ -383,7 +380,7 @@ func TestSABHistoryDeletionReportsQueueCleanupFailureForEveryIdentifier(t *testi
 			resp, err := app.Test(httptest.NewRequest("GET", "/sab-history?value="+tt.value(item), nil))
 			require.NoError(t, err)
 			requireSABDeleteResponse(t, resp, false)
-			assert.FileExists(t, victim)
+			assert.FileExists(t, child)
 			requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusCompleted)
 			history, historyErr := env.repo.GetImportHistoryByNzbID(context.Background(), item.ID)
 			require.NoError(t, historyErr)
@@ -415,4 +412,76 @@ func TestSABHistoryOnlyDeletionDoesNotTreatNzbNameAsPathAuthority(t *testing.T) 
 	history, historyErr := env.repo.GetImportHistoryByDownloadID(context.Background(), downloadID)
 	require.NoError(t, historyErr)
 	require.Nil(t, history)
+}
+
+func TestManualImportFilePublishesOnlyRootedQueueAuthority(t *testing.T) {
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	configDir := filepath.Join(tempRoot, "config")
+	require.NoError(t, os.MkdirAll(configDir, 0o755))
+	cfg := config.DefaultConfig(configDir)
+	cfg.Database.Path = filepath.Join(configDir, "altmount.db")
+	cfg.Metadata.RootPath = filepath.Join(configDir, "metadata")
+	apiKey := strings.Repeat("k", 32)
+	cfg.API.KeyOverride = apiKey
+
+	db, err := database.NewDB(database.Config{DatabasePath: cfg.Database.Path})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	queueRoot := filepath.Join(tempRoot, ".altmount-queue")
+	storeRoot := filepath.Join(configDir, ".nzbs")
+	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
+	require.NoError(t, metadataService.ConfigureCleanupRoots(storeRoot, queueRoot, storeRoot))
+	cfgGetter := config.ConfigGetter(func() *config.Config { return cfg })
+	importService, err := importer.NewService(
+		importer.ServiceConfig{Workers: 1}, metadataService, db, nil, nil, cfgGetter,
+		nil, nil, nil,
+	)
+	require.NoError(t, err)
+
+	queuePrefix := queueRoot + string(os.PathSeparator)
+	sqlPrefix := strings.ReplaceAll(queuePrefix, "'", "''")
+	_, err = db.Connection().Exec(`
+		CREATE TRIGGER reject_unowned_manual_import_path
+		BEFORE INSERT ON import_queue
+		WHEN substr(NEW.nzb_path, 1, ` + strconv.Itoa(len(queuePrefix)) + `) != '` + sqlPrefix + `'
+		BEGIN
+			SELECT RAISE(ABORT, 'unowned manual import path');
+		END;
+	`)
+	require.NoError(t, err)
+
+	server := &Server{
+		queueRepo:       database.NewRepository(db.Connection(), db.Dialect()),
+		configManager:   &mockConfigManager{cfg: cfg},
+		importerService: importService,
+		metadataService: metadataService,
+	}
+	source := filepath.Join(t.TempDir(), "manual-import.nzb")
+	require.NoError(t, os.WriteFile(source, []byte("<nzb/>"), 0o600))
+	body := fmt.Sprintf(`{"file_path":%q}`, source)
+	app := fiber.New()
+	app.Post("/import/file", server.handleManualImportFile)
+	req := httptest.NewRequest("POST", "/import/file?apikey="+apiKey, bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	defer resp.Body.Close()
+	var envelope struct {
+		Success bool                 `json:"success"`
+		Data    ManualImportResponse `json:"data"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&envelope))
+	require.True(t, envelope.Success)
+	require.NotZero(t, envelope.Data.QueueID)
+
+	item, err := db.Repository.GetQueueItem(context.Background(), envelope.Data.QueueID)
+	require.NoError(t, err)
+	require.NotNil(t, item)
+	rel, err := filepath.Rel(queueRoot, item.NzbPath)
+	require.NoError(t, err)
+	require.NotEqual(t, ".", rel)
+	require.True(t, filepath.IsLocal(rel), "persisted path must be a strict queue-root child")
+	assert.FileExists(t, item.NzbPath)
 }
