@@ -118,6 +118,7 @@ type HealthRun struct {
 	Stage                     string
 	CurrentProviderID         *string
 	CurrentProviderGeneration *int64
+	CursorSequence            int64
 	CursorSegment             int64
 	PauseRequested            bool
 	CancelRequested           bool
@@ -193,6 +194,8 @@ type HealthChunkCommit struct {
 	CorruptBitmap          []byte
 	TemporaryBitmap        []byte
 	InconclusiveBitmap     []byte
+	ResolvedBitmap         []byte
+	CursorSequence         int64
 	CursorSegment          int64
 	ResolvedDelta          int64
 	ProviderChecksDelta    int64

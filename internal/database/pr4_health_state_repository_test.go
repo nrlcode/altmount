@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -280,6 +281,27 @@ func pr4Commit(f pr4Fixture, chunkID string, token int64, owner string, start in
 	}
 }
 
+// These reflection helpers keep the tests-only CHG-009 checkpoint buildable on
+// its exact parent while allowing retained PR4 cases to state the additive
+// progress-identity contract once the model fields exist.
+func pr4SetCHG009ProgressIdentity(commit *HealthChunkCommit, sequence int64, resolved []byte) {
+	value := reflect.ValueOf(commit).Elem()
+	if field := value.FieldByName("CursorSequence"); field.IsValid() {
+		field.SetInt(sequence)
+	}
+	if field := value.FieldByName("ResolvedBitmap"); field.IsValid() {
+		field.SetBytes(append([]byte(nil), resolved...))
+	}
+}
+
+func pr4CHG009CursorSequence(run *HealthRun) (int64, bool) {
+	field := reflect.ValueOf(run).Elem().FieldByName("CursorSequence")
+	if !field.IsValid() {
+		return 0, false
+	}
+	return field.Int(), true
+}
+
 func TestPR4RunTotalMustMatchBoundFileRevision(t *testing.T) {
 	f := newPR4RunFixture(t)
 	snapshot, err := f.repo.CaptureActiveProviderSnapshot(context.Background(), f.now)
@@ -386,6 +408,7 @@ func TestPR4ChunkCommitIsFencedAtomicAndIdempotent(t *testing.T) {
 
 	conflict := fresh
 	conflict.ResolvedDelta = 2
+	pr4SetCHG009ProgressIdentity(&conflict, 0, []byte{0b00000011})
 	_, err = f.repo.CommitHealthChunk(ctx, conflict)
 	require.ErrorIs(t, err, ErrHealthChunkConflict)
 }
@@ -396,7 +419,13 @@ func TestPR4WeakOrSTATPresenceDoesNotClearCorruptBodyEvidence(t *testing.T) {
 	lease, err := f.repo.AcquireRunLease(ctx, f.run.ID, "worker", 10*time.Minute)
 	require.NoError(t, err)
 
-	commitOutcome := func(id, stage string, kind HealthObservationKind, present, corrupt, temporary byte, at time.Time) {
+	commitOutcome := func(
+		id, stage string,
+		sequence int64,
+		kind HealthObservationKind,
+		present, corrupt, temporary byte,
+		at time.Time,
+	) {
 		commit := HealthChunkCommit{
 			ChunkID: id, RunID: f.run.ID, LeaseOwner: "worker", FencingToken: lease.FencingToken,
 			ProviderID: f.providerID, ProviderGeneration: 1, Stage: stage, ObservationKind: kind,
@@ -414,13 +443,14 @@ func TestPR4WeakOrSTATPresenceDoesNotClearCorruptBodyEvidence(t *testing.T) {
 		if temporary != 0 {
 			commit.InconclusiveDelta = 1
 		}
+		pr4SetCHG009ProgressIdentity(&commit, sequence, []byte{present})
 		_, err := f.repo.CommitHealthChunk(ctx, commit)
 		require.NoError(t, err)
 	}
 
-	commitOutcome("corrupt-body", "body_revalidation", HealthObservationValidatedBody, 0, 1, 0, f.now.Add(time.Minute))
-	commitOutcome("temporary-stat", "stat_temporary", HealthObservationSTAT, 0, 0, 1, f.now.Add(2*time.Minute))
-	commitOutcome("present-stat", "stat_present", HealthObservationSTAT, 1, 0, 0, f.now.Add(3*time.Minute))
+	commitOutcome("corrupt-body", "body_revalidation", 0, HealthObservationValidatedBody, 0, 1, 0, f.now.Add(time.Minute))
+	commitOutcome("temporary-stat", "stat_temporary", 2, HealthObservationSTAT, 0, 0, 1, f.now.Add(2*time.Minute))
+	commitOutcome("present-stat", "stat_present", 3, HealthObservationSTAT, 1, 0, 0, f.now.Add(3*time.Minute))
 
 	var outcome string
 	require.NoError(t, f.db.Connection().QueryRow(`
@@ -430,7 +460,7 @@ func TestPR4WeakOrSTATPresenceDoesNotClearCorruptBodyEvidence(t *testing.T) {
 	assert.Equal(t, "corrupt_body", outcome,
 		"temporary rechecks and STAT presence cannot erase validated corruption evidence")
 
-	commitOutcome("recovered-body", "body_recovered", HealthObservationValidatedBody, 1, 0, 0, f.now.Add(4*time.Minute))
+	commitOutcome("recovered-body", "body_recovered", 4, HealthObservationValidatedBody, 1, 0, 0, f.now.Add(4*time.Minute))
 	err = f.db.Connection().QueryRow(`
 		SELECT outcome FROM health_segment_exceptions
 		WHERE file_revision_id = ? AND provider_id = ? AND provider_generation = 1 AND segment_index = 0
@@ -438,7 +468,7 @@ func TestPR4WeakOrSTATPresenceDoesNotClearCorruptBodyEvidence(t *testing.T) {
 	require.ErrorIs(t, err, sql.ErrNoRows, "only a validated BODY may clear corrupt-body evidence")
 }
 
-func TestPR4OlderCrossRunObservationCannotOverwriteNewerProviderState(t *testing.T) {
+func TestPR4LaterDatabaseCommitClearsEarlierCorruptionDespiteBackdatedCallerTime(t *testing.T) {
 	f := newPR4RunFixture(t)
 	ctx := context.Background()
 	otherRun, err := f.repo.CreateHealthRun(ctx, HealthRunSpec{
@@ -452,7 +482,7 @@ func TestPR4OlderCrossRunObservationCannotOverwriteNewerProviderState(t *testing
 	olderLease, err := f.repo.AcquireRunLease(ctx, otherRun.ID, "older-worker", 10*time.Minute)
 	require.NoError(t, err)
 
-	newer := HealthChunkCommit{
+	first := HealthChunkCommit{
 		ChunkID: "newer-corrupt", RunID: f.run.ID, LeaseOwner: "newer-worker", FencingToken: newerLease.FencingToken,
 		ProviderID: f.providerID, ProviderGeneration: 1, Stage: "body_revalidation",
 		ObservationKind: HealthObservationValidatedBody,
@@ -461,10 +491,10 @@ func TestPR4OlderCrossRunObservationCannotOverwriteNewerProviderState(t *testing
 		CursorSegment: 1, ProviderChecksDelta: 1, MissingCandidatesDelta: 1,
 		CommittedAt: f.now.Add(2 * time.Minute),
 	}
-	_, err = f.repo.CommitHealthChunk(ctx, newer)
+	_, err = f.repo.CommitHealthChunk(ctx, first)
 	require.NoError(t, err)
 
-	older := HealthChunkCommit{
+	backdatedSecond := HealthChunkCommit{
 		ChunkID: "older-valid-body", RunID: otherRun.ID, LeaseOwner: "older-worker", FencingToken: olderLease.FencingToken,
 		ProviderID: f.providerID, ProviderGeneration: 1, Stage: "body_delivery",
 		ObservationKind: HealthObservationValidatedBody,
@@ -473,19 +503,19 @@ func TestPR4OlderCrossRunObservationCannotOverwriteNewerProviderState(t *testing
 		CursorSegment: 1, ResolvedDelta: 1, ProviderChecksDelta: 1,
 		CommittedAt: f.now.Add(time.Minute),
 	}
-	_, err = f.repo.CommitHealthChunk(ctx, older)
+	_, err = f.repo.CommitHealthChunk(ctx, backdatedSecond)
 	require.NoError(t, err)
 
 	var outcome string
-	require.NoError(t, f.db.Connection().QueryRow(`
+	err = f.db.Connection().QueryRow(`
 		SELECT outcome FROM health_segment_exceptions
 		WHERE file_revision_id = ? AND provider_id = ? AND provider_generation = 1 AND segment_index = 0
-	`, f.run.FileRevisionID, f.providerID).Scan(&outcome))
-	assert.Equal(t, "corrupt_body", outcome,
-		"commit order cannot let an older observation erase newer provider evidence from another run")
+	`, f.run.FileRevisionID, f.providerID).Scan(&outcome)
+	require.ErrorIs(t, err, sql.ErrNoRows,
+		"the later database commit must clear earlier corruption despite its backdated caller time")
 }
 
-func TestPR4OlderNegativeCannotReappearAfterNewerValidatedBody(t *testing.T) {
+func TestPR4LaterDatabaseCommitRecordsNegativeDespiteBackdatedCallerTime(t *testing.T) {
 	f := newPR4RunFixture(t)
 	ctx := context.Background()
 	otherRun, err := f.repo.CreateHealthRun(ctx, HealthRunSpec{
@@ -499,7 +529,7 @@ func TestPR4OlderNegativeCannotReappearAfterNewerValidatedBody(t *testing.T) {
 	olderLease, err := f.repo.AcquireRunLease(ctx, otherRun.ID, "older-worker", 10*time.Minute)
 	require.NoError(t, err)
 
-	newer := HealthChunkCommit{
+	first := HealthChunkCommit{
 		ChunkID: "newer-valid-body", RunID: f.run.ID, LeaseOwner: "newer-worker", FencingToken: newerLease.FencingToken,
 		ProviderID: f.providerID, ProviderGeneration: 1, Stage: "body_delivery",
 		ObservationKind: HealthObservationValidatedBody,
@@ -508,10 +538,10 @@ func TestPR4OlderNegativeCannotReappearAfterNewerValidatedBody(t *testing.T) {
 		CursorSegment: 1, ResolvedDelta: 1, ProviderChecksDelta: 1,
 		CommittedAt: f.now.Add(2 * time.Minute),
 	}
-	_, err = f.repo.CommitHealthChunk(ctx, newer)
+	_, err = f.repo.CommitHealthChunk(ctx, first)
 	require.NoError(t, err)
 
-	older := HealthChunkCommit{
+	backdatedSecond := HealthChunkCommit{
 		ChunkID: "older-corrupt-body", RunID: otherRun.ID, LeaseOwner: "older-worker", FencingToken: olderLease.FencingToken,
 		ProviderID: f.providerID, ProviderGeneration: 1, Stage: "body_revalidation",
 		ObservationKind: HealthObservationValidatedBody,
@@ -520,16 +550,16 @@ func TestPR4OlderNegativeCannotReappearAfterNewerValidatedBody(t *testing.T) {
 		CursorSegment: 1, ProviderChecksDelta: 1, MissingCandidatesDelta: 1,
 		CommittedAt: f.now.Add(time.Minute),
 	}
-	_, err = f.repo.CommitHealthChunk(ctx, older)
+	_, err = f.repo.CommitHealthChunk(ctx, backdatedSecond)
 	require.NoError(t, err)
 
 	var outcome string
-	err = f.db.Connection().QueryRow(`
+	require.NoError(t, f.db.Connection().QueryRow(`
 		SELECT outcome FROM health_segment_exceptions
 		WHERE file_revision_id = ? AND provider_id = ? AND provider_generation = 1 AND segment_index = 0
-	`, f.run.FileRevisionID, f.providerID).Scan(&outcome)
-	require.ErrorIs(t, err, sql.ErrNoRows,
-		"an older negative observation cannot reappear after newer validated BODY recovery")
+	`, f.run.FileRevisionID, f.providerID).Scan(&outcome))
+	assert.Equal(t, "corrupt_body", outcome,
+		"the later database commit must record corruption despite its backdated caller time")
 }
 
 func TestPR4StageTransitionUsesItsOwnCommittedCursor(t *testing.T) {
@@ -543,10 +573,14 @@ func TestPR4StageTransitionUsesItsOwnCommittedCursor(t *testing.T) {
 
 	fallback := pr4Commit(f, "fallback-early-range", lease.FencingToken, "worker", 0)
 	fallback.Stage = "later_primary_stat"
+	pr4SetCHG009ProgressIdentity(&fallback, 2, []byte{0b00000111})
 	fallback.CommittedAt = f.now.Add(time.Minute + time.Second)
 	after, err := f.repo.CommitHealthChunk(ctx, fallback)
 	require.NoError(t, err)
 	assert.Equal(t, fallback.Stage, after.Stage)
+	if sequence, ok := pr4CHG009CursorSequence(after); ok {
+		assert.Equal(t, int64(2), sequence)
+	}
 	assert.Equal(t, int64(4), after.CursorSegment,
 		"changing provider stage must not retain the previous stage's later cursor")
 }
