@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -17,12 +18,18 @@ import (
 
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/metadata"
 )
 
 // newMoveToFailedTestService builds a minimal *Service with a real SQLite DB so that
 // MoveToFailedFolder can call UpdateQueueItemNzbPath without panicking. The config
 // is wired so that GetFailedNzbFolder() returns <configDir>/.nzbs/failed/.
 func newMoveToFailedTestService(t *testing.T) *Service {
+	service, _ := newMoveToFailedTestServiceWithDB(t)
+	return service
+}
+
+func newMoveToFailedTestServiceWithDB(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
 
 	configDir := t.TempDir()
@@ -68,21 +75,20 @@ func newMoveToFailedTestService(t *testing.T) *Service {
 	dbWrapper := &database.DB{}
 	dbWrapper.Repository = repo
 
-	cfgGetter := config.ConfigGetter(func() *config.Config {
-		return &config.Config{
-			Database: config.DatabaseConfig{
-				Path: filepath.Join(configDir, "altmount.db"),
-			},
-		}
-	})
+	cfg := config.DefaultConfig(configDir)
+	storeRoot := filepath.Join(configDir, ".nzbs")
+	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
+	require.NoError(t, metadataService.ConfigureCleanupRoots(storeRoot, storeRoot))
+	cfgGetter := config.ConfigGetter(func() *config.Config { return cfg })
 
 	return &Service{
-		database:     dbWrapper,
-		configGetter: cfgGetter,
-		log:          slog.Default(),
-		cancelFuncs:  make(map[int64]context.CancelFunc),
-		mu:           sync.RWMutex{},
-	}
+		database:        dbWrapper,
+		configGetter:    cfgGetter,
+		metadataService: metadataService,
+		log:             slog.Default(),
+		cancelFuncs:     make(map[int64]context.CancelFunc),
+		mu:              sync.RWMutex{},
+	}, db
 }
 
 // TestHandleFailure_MovesToFailedDir verifies that MoveToFailedFolder moves an .nzb
@@ -153,11 +159,14 @@ func TestHandleFailure_SourceMissing_IsNoop(t *testing.T) {
 	assert.NoError(t, err, "missing source NZB should not be treated as an error")
 }
 
-// TestCleanupFailedItems_RemovesNzbFile verifies that cleanupFailedItems deletes the
-// on-disk NZB after the DB record is purged, regardless of whether the file lived in
-// the OS temp queue dir or the failed/ directory.
+// TestCleanupFailedItems_RemovesNzbFile verifies that cleanupFailedItems removes
+// an owned NZB before purging its queue row.
 func TestCleanupFailedItems_RemovesNzbFile(t *testing.T) {
-	svc := newMoveToFailedTestService(t)
+	svc, db := newMoveToFailedTestServiceWithDB(t)
+	retentionHours := 1
+	cfg := svc.configGetter()
+	cfg.Import.FailedItemRetentionHours = &retentionHours
+	svc.configGetter = func() *config.Config { return cfg }
 
 	// Create a temp "failed" NZB file on disk.
 	failedDir := svc.GetFailedNzbFolder()
@@ -174,20 +183,49 @@ func TestCleanupFailedItems_RemovesNzbFile(t *testing.T) {
 
 	errMsg := "simulated failure"
 	require.NoError(t, svc.database.Repository.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusFailed, &errMsg))
-
-	// Use DeleteFailedItemsOlderThan with a far-future cutoff to delete the record.
-	futureTime := time.Now().Add(24 * time.Hour)
-	deleted, err := svc.database.Repository.DeleteFailedItemsOlderThan(ctx, futureTime)
+	_, err := db.Exec(`UPDATE import_queue SET updated_at = '2000-01-01 00:00:00' WHERE id = ?`, item.ID)
 	require.NoError(t, err)
-	require.Len(t, deleted, 1, "should have deleted one failed item")
 
-	// Simulate what cleanupFailedItems does: remove the file.
-	for _, di := range deleted {
-		if di.NzbPath != "" {
-			rmErr := os.Remove(di.NzbPath)
-			assert.NoError(t, rmErr)
-		}
-	}
+	svc.cleanupFailedItems(ctx)
 
 	assert.NoFileExists(t, nzbPath, "failed NZB should be removed by cleanup")
+	remaining, err := svc.database.Repository.GetQueueItem(ctx, item.ID)
+	require.NoError(t, err)
+	assert.Nil(t, remaining, "queue ownership should be removed after successful file cleanup")
+}
+
+func TestCleanupFailedItemsPreservesOwnershipWhenRootedCleanupFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
+	svc, db := newMoveToFailedTestServiceWithDB(t)
+	retentionHours := 1
+	cfg := svc.configGetter()
+	cfg.Import.FailedItemRetentionHours = &retentionHours
+	svc.configGetter = func() *config.Config { return cfg }
+
+	failedDir := svc.GetFailedNzbFolder()
+	require.NoError(t, os.MkdirAll(failedDir, 0o755))
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.nzb")
+	require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
+	require.NoError(t, os.Symlink(outside, filepath.Join(failedDir, "escape")))
+
+	ctx := context.Background()
+	item := &database.ImportQueueItem{
+		NzbPath:    filepath.Join(failedDir, "escape", "victim.nzb"),
+		Status:     database.QueueStatusFailed,
+		MaxRetries: 3,
+		CreatedAt:  time.Now().Add(-2 * time.Hour),
+	}
+	require.NoError(t, svc.database.Repository.AddToQueue(ctx, item))
+	_, err := db.Exec(`UPDATE import_queue SET updated_at = '2000-01-01 00:00:00' WHERE id = ?`, item.ID)
+	require.NoError(t, err)
+
+	svc.cleanupFailedItems(ctx)
+
+	assert.FileExists(t, victim)
+	remaining, err := svc.database.Repository.GetQueueItem(ctx, item.ID)
+	require.NoError(t, err)
+	require.NotNil(t, remaining, "failed file cleanup must retain the queue row for retry")
 }
