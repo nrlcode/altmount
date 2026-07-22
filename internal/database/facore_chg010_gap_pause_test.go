@@ -338,6 +338,51 @@ func TestFACORECHG010GapConcurrentCanonicalizationAndClientReplay(t *testing.T) 
 	})
 }
 
+func TestFACORECHG010GapCanonicalReplayIgnoresLaterProposalOwner(t *testing.T) {
+	forEachFACORECHG009RepositoryBackend(t, func(t *testing.T, dialect Dialect) {
+		f := newCHG009Fixture(t, 8, dialect)
+		ctx := context.Background()
+		canonicalWrite := GapRangeWrite{
+			ID: "canonical-replay-gap", FileRevisionID: f.run.FileRevisionID,
+			Kind: GapKindConfirmedAbsent, StartSegment: 0, SegmentCount: 2,
+			Status: GapStatusActive, CreatedAt: f.now,
+		}
+		canonical, err := f.repo.UpsertGapRange(ctx, canonicalWrite)
+		require.NoError(t, err)
+
+		proposal := canonicalWrite
+		proposal.ID = "discarded-gap-proposal"
+		proposal.CreatedAt = f.now.Add(time.Minute)
+		_, err = f.repo.UpsertGapRange(ctx, proposal) // response is intentionally discarded
+		require.NoError(t, err)
+
+		ownerRevision, err := f.repo.EnsureFileRevision(ctx, FileRevisionSpec{
+			FilePath: "chg010/proposal-owner.mkv", LayoutFingerprint: "sha256:chg010-proposal-owner",
+			VirtualSize: 800, SegmentCount: 8,
+		})
+		require.NoError(t, err)
+		owner, err := f.repo.UpsertGapRange(ctx, GapRangeWrite{
+			ID: proposal.ID, FileRevisionID: ownerRevision.ID, Kind: GapKindProvisional,
+			StartSegment: 4, SegmentCount: 1, Status: GapStatusActive, CreatedAt: f.now,
+		})
+		require.NoError(t, err)
+
+		replay, err := f.repo.UpsertGapRange(ctx, proposal)
+		require.NoError(t, err,
+			"the natural key must recover a lost canonical response after its discarded proposal is reused")
+		assert.Equal(t, canonical.ID, replay.ID)
+		assert.True(t, replay.CreatedAt.Equal(canonical.CreatedAt))
+		retainedOwner, err := f.repo.UpsertGapRange(ctx, GapRangeWrite{
+			ID: owner.ID, FileRevisionID: owner.FileRevisionID, Kind: owner.Kind,
+			StartSegment: owner.StartSegment, SegmentCount: owner.SegmentCount,
+			Status: owner.Status, CreatedAt: owner.CreatedAt,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, owner, retainedOwner,
+			"canonical replay must not rebind or mutate the retained proposal owner")
+	})
+}
+
 func TestFACORECHG010PauseMethodAndAcquireOrdering(t *testing.T) {
 	forEachFACORECHG009RepositoryBackend(t, func(t *testing.T, dialect Dialect) {
 		f := newCHG009Fixture(t, 8, dialect)
