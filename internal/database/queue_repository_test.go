@@ -185,6 +185,23 @@ func TestIsFileInQueueMatchesRootedBasename(t *testing.T) {
 	require.True(t, found, "rooted directory staging must preserve basename duplicate detection")
 }
 
+func TestIsFileInQueueRejectsDistinctSuffixBasename(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	setupQueueSchema(t, db)
+	repo := NewQueueRepository(db, DialectSQLite)
+	item := &ImportQueueItem{
+		NzbPath: "/queue/authority-token/Series-Movie.nzb", Status: QueueStatusPending,
+		Priority: QueuePriorityNormal, MaxRetries: 3,
+	}
+	require.NoError(t, repo.AddToQueue(context.Background(), item))
+
+	found, err := repo.IsFileInQueue(context.Background(), "/incoming/Movie.nzb")
+	require.NoError(t, err)
+	require.False(t, found, "a distinct suffix basename is not the same queued source")
+}
+
 func TestAddToQueueReturnsExistingRowIDForNoopConflict(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
