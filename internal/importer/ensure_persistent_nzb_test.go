@@ -134,6 +134,8 @@ func TestEnsurePersistentNzb_UsesOSTempQueueDir(t *testing.T) {
 		"expected OS temp queue dir prefix %q, got %q", expected, item.NzbPath)
 	assert.False(t, strings.Contains(item.NzbPath, ".nzbs"),
 		"should not be in .nzbs/ directory, got %q", item.NzbPath)
+	assert.Equal(t, "movie.nzb", filepath.Base(item.NzbPath),
+		"rooted staging must not leak an authority token into release identity")
 
 	// Assert: the file actually exists at the new path
 	_, statErr := os.Stat(item.NzbPath)
