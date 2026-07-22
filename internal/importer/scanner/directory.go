@@ -193,6 +193,11 @@ func (d *DirectoryScanner) performScan(ctx context.Context, scanPath string) {
 
 		if err := d.queueAdder.AddToQueue(ctx, path, &scanPath, nil); err != nil {
 			d.log.ErrorContext(ctx, "Failed to add file to queue during scan", "file", path, "error", err)
+			d.mu.Lock()
+			errMsg := err.Error()
+			d.info.LastError = &errMsg
+			d.mu.Unlock()
+			return nil
 		}
 
 		d.mu.Lock()

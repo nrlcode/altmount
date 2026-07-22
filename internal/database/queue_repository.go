@@ -173,12 +173,18 @@ func (r *QueueRepository) RestartQueueItemsBulk(ctx context.Context, ids []int64
 
 // AddToQueue adds a new NZB file to the import queue
 func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem) error {
+	return r.withQueueTransaction(ctx, func(txRepo *QueueRepository) error {
+		return txRepo.addToQueue(ctx, item)
+	})
+}
+
+func (r *QueueRepository) addToQueue(ctx context.Context, item *ImportQueueItem) error {
 	query := `
 		INSERT INTO import_queue (download_id, nzb_path, relative_path, category, priority, status, retry_count, max_retries, batch_id, metadata, file_size, target_path, skip_arr_notification, skip_post_import_links, indexer, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
 		ON CONFLICT(nzb_path) DO UPDATE SET
 		download_id = COALESCE(excluded.download_id, import_queue.download_id),
-		priority = CASE WHEN excluded.priority < priority THEN excluded.priority ELSE priority END,
+		priority = CASE WHEN excluded.priority < import_queue.priority THEN excluded.priority ELSE import_queue.priority END,
 		category = excluded.category,
 		batch_id = excluded.batch_id,
 		metadata = excluded.metadata,
@@ -190,7 +196,7 @@ func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem)
 		started_at = NULL,
 		updated_at = datetime('now'),
 		relative_path = excluded.relative_path
-		WHERE status NOT IN ('processing', 'pending')
+		WHERE import_queue.status NOT IN ('processing', 'pending')
 	`
 
 	args := []any{item.DownloadID, item.NzbPath, item.RelativePath, item.Category, item.Priority, item.Status,
@@ -198,23 +204,34 @@ func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem)
 
 	if r.dialect.IsPostgres() {
 		err := r.db.QueryRowContext(ctx, query+" RETURNING id", args...).Scan(&item.ID)
-		if err != nil && err != sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
+			item.ID, err = r.queueItemIDByPath(ctx, item.NzbPath)
+		}
+		if err != nil {
 			return fmt.Errorf("failed to add queue item: %w", err)
 		}
 	} else {
-		result, err := r.db.ExecContext(ctx, query, args...)
+		_, err := r.db.ExecContext(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("failed to add queue item: %w", err)
 		}
-		item.ID, err = result.LastInsertId()
+		item.ID, err = r.queueItemIDByPath(ctx, item.NzbPath)
 		if err != nil {
-			return fmt.Errorf("failed to get last insert ID: %w", err)
+			return fmt.Errorf("failed to get authoritative queue item ID: %w", err)
 		}
 	}
 
 	item.CreatedAt = time.Now()
 	item.UpdatedAt = time.Now()
 	return nil
+}
+
+func (r *QueueRepository) queueItemIDByPath(ctx context.Context, nzbPath string) (int64, error) {
+	var id int64
+	if err := r.db.QueryRowContext(ctx, `SELECT id FROM import_queue WHERE nzb_path = ?`, nzbPath).Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 func (r *QueueRepository) AddStoragePath(ctx context.Context, itemID int64, storagePath string) error {
@@ -233,26 +250,30 @@ func (r *QueueRepository) AddStoragePath(ctx context.Context, itemID int64, stor
 }
 
 // IsFileInQueue checks if a file is already in the queue (pending, processing, or paused).
-// It matches by exact nzb_path first, and also by filename suffix to handle the case where
-// ensurePersistentNzb has already moved the file and updated nzb_path from the temp path to
-// the persistent storage path (e.g. /tmp/altmount-uploads/x.nzb → /.nzbs/stremio/42-x.nzb).
-// The LIKE pattern uses "%-filename" (dash wildcard) rather than "%/filename" so it also
-// matches the "<id>-<base>.nzb" naming that ensurePersistentNzb applies on collision.
+// It matches exact paths, rooted basename paths, and legacy ID-prefixed names.
 func (r *QueueRepository) IsFileInQueue(ctx context.Context, filePath string) (bool, error) {
 	filename := filepath.Base(filePath)
-	query := `SELECT 1 FROM import_queue WHERE (nzb_path = ? OR nzb_path LIKE ?) AND status IN ('pending', 'processing', 'paused') LIMIT 1`
-	likePattern := "%-" + filename
+	query := `SELECT id, nzb_path FROM import_queue WHERE (nzb_path = ? OR nzb_path LIKE ? ESCAPE '\' OR nzb_path LIKE ? ESCAPE '\') AND status IN ('pending', 'processing', 'paused')`
+	legacyPattern := "%-" + escapeLikePattern(filename)
+	rootedPattern := "%" + escapeLikePattern(string(filepath.Separator)+filename)
 
-	var exists int
-	err := r.db.QueryRowContext(ctx, query, filePath, likePattern).Scan(&exists)
+	rows, err := r.db.QueryContext(ctx, query, filePath, legacyPattern, rootedPattern)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return false, nil
-		}
 		return false, fmt.Errorf("failed to check if file in queue: %w", err)
 	}
-
-	return true, nil
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var queuedPath string
+		if err := rows.Scan(&id, &queuedPath); err != nil {
+			return false, fmt.Errorf("scan queued file candidate: %w", err)
+		}
+		queuedName := filepath.Base(queuedPath)
+		if queuedPath == filePath || queuedName == filename || queuedName == fmt.Sprintf("%d-%s", id, filename) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // ClaimNextQueueItem atomically claims and returns the next available queue item
@@ -691,13 +712,13 @@ func (r *QueueRepository) AddBatchToQueue(ctx context.Context, items []*ImportQu
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
 			ON CONFLICT(nzb_path) DO UPDATE SET
 			download_id = COALESCE(excluded.download_id, import_queue.download_id),
-			priority = CASE WHEN excluded.priority < priority THEN excluded.priority ELSE priority END,
+			priority = CASE WHEN excluded.priority < import_queue.priority THEN excluded.priority ELSE import_queue.priority END,
 			category = excluded.category,
 			batch_id = excluded.batch_id,
 			metadata = excluded.metadata,
 			file_size = excluded.file_size,
 			updated_at = datetime('now')
-			WHERE status NOT IN ('processing', 'completed')
+			WHERE import_queue.status NOT IN ('processing', 'completed')
 		`
 
 		// The statement is identical for every item, so prepare it once and reuse
@@ -726,17 +747,21 @@ func (r *QueueRepository) AddBatchToQueue(ctx context.Context, items []*ImportQu
 				item.RetryCount, item.MaxRetries, item.BatchID, item.Metadata, item.FileSize, item.SkipArrNotification, item.SkipPostImportLinks}
 
 			if isPostgres {
-				if err := stmt.QueryRowContext(ctx, args...).Scan(&item.ID); err != nil && err != sql.ErrNoRows {
+				err := stmt.QueryRowContext(ctx, args...).Scan(&item.ID)
+				if errors.Is(err, sql.ErrNoRows) {
+					item.ID, err = txRepo.queueItemIDByPath(ctx, item.NzbPath)
+				}
+				if err != nil {
 					return fmt.Errorf("failed to insert queue item %s: %w", item.NzbPath, err)
 				}
 			} else {
-				result, err := stmt.ExecContext(ctx, args...)
+				_, err := stmt.ExecContext(ctx, args...)
 				if err != nil {
 					return fmt.Errorf("failed to insert queue item %s: %w", item.NzbPath, err)
 				}
-				item.ID, err = result.LastInsertId()
+				item.ID, err = txRepo.queueItemIDByPath(ctx, item.NzbPath)
 				if err != nil {
-					return fmt.Errorf("failed to get last insert ID for %s: %w", item.NzbPath, err)
+					return fmt.Errorf("failed to get authoritative queue item ID for %s: %w", item.NzbPath, err)
 				}
 			}
 			item.CreatedAt = now
@@ -825,56 +850,33 @@ func (r *QueueRepository) withQueueTransaction(ctx context.Context, fn func(*Que
 	return nil
 }
 
-// DeleteFailedItemsOlderThan deletes failed queue items older than the given time.
-// Returns the deleted items so the caller can clean up associated NZB files.
-func (r *QueueRepository) DeleteFailedItemsOlderThan(ctx context.Context, olderThan time.Time) ([]*ImportQueueItem, error) {
-	var deletedItems []*ImportQueueItem
-
-	err := r.withQueueTransaction(ctx, func(txRepo *QueueRepository) error {
-		// Select failed items older than the threshold
-		selectQuery := `SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
-			started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, skip_arr_notification, skip_post_import_links, indexer
-			FROM import_queue WHERE status = 'failed' AND updated_at < ?`
-
-		rows, err := txRepo.db.QueryContext(ctx, selectQuery, olderThan)
-		if err != nil {
-			return fmt.Errorf("failed to select old failed items: %w", err)
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var item ImportQueueItem
-			if err := rows.Scan(
-				&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
-				&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
-				&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.SkipArrNotification, &item.SkipPostImportLinks, &item.Indexer,
-			); err != nil {
-				return fmt.Errorf("failed to scan failed queue item: %w", err)
-			}
-			deletedItems = append(deletedItems, &item)
-		}
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("failed to iterate failed queue items: %w", err)
-		}
-
-		if len(deletedItems) == 0 {
-			return nil
-		}
-
-		// Single ranged DELETE — uses idx_queue_status_updated.
-		const deleteQuery = `DELETE FROM import_queue WHERE status = 'failed' AND updated_at < ?`
-		if _, err := txRepo.db.ExecContext(ctx, deleteQuery, olderThan); err != nil {
-			return fmt.Errorf("failed to delete failed queue items: %w", err)
-		}
-
-		return nil
-	})
-
+// ListFailedItemsOlderThan returns retry-owned rows without deleting them.
+func (r *QueueRepository) ListFailedItemsOlderThan(ctx context.Context, olderThan time.Time) ([]*ImportQueueItem, error) {
+	selectQuery := `SELECT id, download_id, nzb_path, relative_path, category, priority, status, created_at, updated_at,
+		started_at, completed_at, retry_count, max_retries, error_message, batch_id, metadata, file_size, storage_path, target_path, skip_arr_notification, skip_post_import_links, indexer
+		FROM import_queue WHERE status = 'failed' AND updated_at < ?`
+	rows, err := r.db.QueryContext(ctx, selectQuery, olderThan)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to select old failed items: %w", err)
 	}
+	defer rows.Close()
 
-	return deletedItems, nil
+	var items []*ImportQueueItem
+	for rows.Next() {
+		var item ImportQueueItem
+		if err := rows.Scan(
+			&item.ID, &item.DownloadID, &item.NzbPath, &item.RelativePath, &item.Category, &item.Priority, &item.Status,
+			&item.CreatedAt, &item.UpdatedAt, &item.StartedAt, &item.CompletedAt,
+			&item.RetryCount, &item.MaxRetries, &item.ErrorMessage, &item.BatchID, &item.Metadata, &item.FileSize, &item.StoragePath, &item.TargetPath, &item.SkipArrNotification, &item.SkipPostImportLinks, &item.Indexer,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan failed queue item: %w", err)
+		}
+		items = append(items, &item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate failed queue items: %w", err)
+	}
+	return items, nil
 }
 
 // DeleteImportHistoryOlderThan deletes import_history records completed before olderThan.

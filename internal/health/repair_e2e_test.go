@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
@@ -111,8 +112,11 @@ type repairTestEnv struct {
 func newRepairTestEnv(t *testing.T, tempDir string, arrsErr error, configure ...func(*config.Config)) *repairTestEnv {
 	t.Helper()
 
-	db, err := sql.Open("sqlite3", "file::memory:?cache=shared&mode=memory")
+	databasePath := filepath.Join(t.TempDir(), "health.db")
+	db, err := sql.Open("sqlite3", databasePath+"?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-32000&_temp_store=MEMORY&_busy_timeout=30000&_foreign_keys=on&_txlock=immediate")
 	require.NoError(t, err)
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(3)
 	t.Cleanup(func() { db.Close() })
 
 	_, err = db.Exec(`

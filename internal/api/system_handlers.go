@@ -14,6 +14,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/javi11/altmount/internal/config"
+	"github.com/javi11/altmount/internal/database"
 )
 
 // lastMissingWarnTime tracks the last time a missing article warning was logged per provider.
@@ -147,12 +148,12 @@ func (s *Server) handleSystemCleanup(c *fiber.Ctx) error {
 
 	// Clean up queue items
 	if !req.DryRun {
-		var paths []string
-		paths, queueItemsRemoved, err = s.queueRepo.ClearCompletedQueueItems(c.Context())
+		queueItemsRemoved, err = s.clearOwnedQueueItemsByStatus(
+			c.Context(), database.QueueStatusCompleted, req.QueueOlderThan,
+		)
 		if err != nil {
 			return RespondInternalError(c, "Failed to cleanup queue items", err.Error())
 		}
-		s.removeQueueNzbFiles(c, paths)
 	} else {
 		// For dry run, we could count what would be removed
 		// For now, we'll just return 0
@@ -285,17 +286,11 @@ func (s *Server) handleResetSystemStats(c *fiber.Ctx) error {
 
 		// Optional: Clear completed/failed queue items too if requested
 		if resetQueue {
-			completedPaths, _, err := s.queueRepo.ClearCompletedQueueItems(ctx)
-			if err != nil {
-				slog.ErrorContext(ctx, "Failed to clear completed queue items during reset", "error", err)
-			} else {
-				s.removeQueueNzbFiles(c, completedPaths)
+			if _, err := s.clearOwnedQueueItemsByStatus(ctx, database.QueueStatusCompleted, nil); err != nil {
+				return RespondInternalError(c, "Failed to clear completed queue items during reset", err.Error())
 			}
-			failedPaths, _, err := s.queueRepo.ClearFailedQueueItems(ctx)
-			if err != nil {
-				slog.ErrorContext(ctx, "Failed to clear failed queue items during reset", "error", err)
-			} else {
-				s.removeQueueNzbFiles(c, failedPaths)
+			if _, err := s.clearOwnedQueueItemsByStatus(ctx, database.QueueStatusFailed, nil); err != nil {
+				return RespondInternalError(c, "Failed to clear failed queue items during reset", err.Error())
 			}
 		}
 	}

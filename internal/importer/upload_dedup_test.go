@@ -10,6 +10,7 @@ import (
 
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/metadata"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,9 +32,13 @@ func newDedupTestService(t *testing.T) (*Service, string) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
+	metadataService := metadata.NewMetadataService(filepath.Join(configDir, "metadata"))
+	storeRoot := filepath.Join(configDir, ".nzbs")
+	require.NoError(t, metadataService.ConfigureCleanupRoots(storeRoot, filepath.Join(os.TempDir(), ".altmount-queue"), storeRoot))
 	s := &Service{
-		log:      slog.Default(),
-		database: db,
+		log:             slog.Default(),
+		database:        db,
+		metadataService: metadataService,
 		configGetter: func() *config.Config {
 			return &config.Config{
 				Database: config.DatabaseConfig{Path: dbPath},
@@ -123,4 +128,16 @@ func TestReuploadDifferentFileIsNotDeduped(t *testing.T) {
 
 	rows := countQueueRows(t, dbPath)
 	require.Len(t, rows, 2, "distinct files must each get their own queue entry")
+}
+
+func TestReuploadSuffixNameIsNotDeduped(t *testing.T) {
+	s, configDir := newDedupTestService(t)
+	uploadDir := filepath.Join(configDir, "altmount-uploads")
+
+	first := uploadViaHandlerFlow(t, s, uploadDir, "Series-Movie.nzb", nil)
+	second := uploadViaHandlerFlow(t, s, uploadDir, "Movie.nzb", nil)
+
+	require.NotEqual(t, first.ID, second.ID,
+		"a staged prefix must not turn a distinct suffix filename into the same upload")
+	require.Len(t, countQueueRows(t, filepath.Join(configDir, "altmount.db")), 2)
 }
