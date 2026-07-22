@@ -15,6 +15,8 @@ import (
 	"github.com/google/uuid"
 )
 
+var ErrAmbiguousLegacyHealthChunk = errors.New("legacy health chunk has ambiguous resolved progress")
+
 func (r *HealthStateRepository) CreateHealthRun(ctx context.Context, spec HealthRunSpec) (*HealthRun, error) {
 	if spec.FileRevisionID == "" || spec.ProviderSnapshotID == "" || spec.Trigger == "" || spec.Mode == "" {
 		return nil, fmt.Errorf("revision, provider snapshot, trigger, and mode are required")
@@ -59,7 +61,7 @@ const healthRunSelect = `
 	SELECT id, file_revision_id, provider_snapshot_id, trigger, mode, status,
 	       lease_owner, lease_expires_at, fencing_token, total_segments,
 	       resolved_segments, provider_checks, missing_candidates, inconclusive_count,
-	       stage, current_provider_id, current_provider_generation, cursor_segment,
+	       stage, current_provider_id, current_provider_generation, cursor_sequence, cursor_segment,
 	       pause_requested, cancel_requested, created_at, started_at, updated_at, completed_at
 	FROM health_runs
 `
@@ -69,7 +71,7 @@ func scanHealthRun(row rowScanner, run *HealthRun) error {
 		&run.Mode, &run.Status, &run.LeaseOwner, &run.LeaseExpiresAt, &run.FencingToken,
 		&run.TotalSegments, &run.ResolvedSegments, &run.ProviderChecks,
 		&run.MissingCandidates, &run.InconclusiveCount, &run.Stage,
-		&run.CurrentProviderID, &run.CurrentProviderGeneration, &run.CursorSegment,
+		&run.CurrentProviderID, &run.CurrentProviderGeneration, &run.CursorSequence, &run.CursorSegment,
 		&run.PauseRequested, &run.CancelRequested, &run.CreatedAt, &run.StartedAt,
 		&run.UpdatedAt, &run.CompletedAt)
 }
@@ -102,7 +104,7 @@ func (r *HealthStateRepository) AcquireRunLease(ctx context.Context, runID, owne
 		RETURNING id, file_revision_id, provider_snapshot_id, trigger, mode, status,
 		          lease_owner, lease_expires_at, fencing_token, total_segments,
 		          resolved_segments, provider_checks, missing_candidates, inconclusive_count,
-		          stage, current_provider_id, current_provider_generation, cursor_segment,
+		          stage, current_provider_id, current_provider_generation, cursor_sequence, cursor_segment,
 		          pause_requested, cancel_requested, created_at, started_at, updated_at, completed_at
 	`
 	var run HealthRun
@@ -134,6 +136,68 @@ func (r *HealthStateRepository) GetFileRevisionForRun(ctx context.Context, runID
 	return &revision, nil
 }
 
+func prepareHealthChunk(commit HealthChunkCommit) (HealthChunkCommit, error) {
+	commit.TestedBitmap = append([]byte(nil), commit.TestedBitmap...)
+	commit.PresentBitmap = append([]byte(nil), commit.PresentBitmap...)
+	commit.AbsentBitmap = append([]byte(nil), commit.AbsentBitmap...)
+	commit.CorruptBitmap = append([]byte(nil), commit.CorruptBitmap...)
+	commit.TemporaryBitmap = append([]byte(nil), commit.TemporaryBitmap...)
+	commit.InconclusiveBitmap = append([]byte(nil), commit.InconclusiveBitmap...)
+	if commit.ResolvedBitmap != nil {
+		resolved := make([]byte, len(commit.ResolvedBitmap))
+		copy(resolved, commit.ResolvedBitmap)
+		commit.ResolvedBitmap = resolved
+	}
+	commit.CommittedAt = commit.CommittedAt.UTC()
+	commit.Attempts = append([]HealthAttemptEvidence(nil), commit.Attempts...)
+	for i := range commit.Attempts {
+		commit.Attempts[i].ObservedAt = commit.Attempts[i].ObservedAt.UTC()
+		if commit.Attempts[i].ResponseCode != nil {
+			code := *commit.Attempts[i].ResponseCode
+			commit.Attempts[i].ResponseCode = &code
+		}
+	}
+	commit.Confirmations = append([]HealthConfirmationEvent(nil), commit.Confirmations...)
+	for i := range commit.Confirmations {
+		commit.Confirmations[i].ObservedAt = commit.Confirmations[i].ObservedAt.UTC()
+	}
+	if commit.Retry != nil {
+		retry := *commit.Retry
+		retry.NextAttemptAt = retry.NextAttemptAt.UTC()
+		commit.Retry = &retry
+	}
+
+	if commit.CursorSequence == 0 && commit.ResolvedBitmap == nil &&
+		commit.SegmentCount > 0 && commit.SegmentCount <= int64(math.MaxInt)/8 &&
+		commit.SegmentCount <= math.MaxInt64-7 {
+		bitmapBytes := int((commit.SegmentCount + 7) / 8)
+		base := [][]byte{
+			commit.TestedBitmap, commit.PresentBitmap, commit.AbsentBitmap,
+			commit.CorruptBitmap, commit.TemporaryBitmap, commit.InconclusiveBitmap,
+		}
+		validLengths := true
+		for _, bitmap := range base {
+			validLengths = validLengths && len(bitmap) == bitmapBytes
+		}
+		if validLengths {
+			conclusive := make([]byte, bitmapBytes)
+			for i := range conclusive {
+				conclusive[i] = commit.TestedBitmap[i] &^ (commit.TemporaryBitmap[i] | commit.InconclusiveBitmap[i])
+			}
+			switch {
+			case commit.ResolvedDelta == 0:
+				commit.ResolvedBitmap = make([]byte, bitmapBytes)
+			case commit.ResolvedDelta == bitmapPopulation(conclusive):
+				commit.ResolvedBitmap = conclusive
+			}
+		}
+	}
+	if err := validateHealthChunk(commit); err != nil {
+		return HealthChunkCommit{}, err
+	}
+	return commit, nil
+}
+
 func validateHealthChunk(commit HealthChunkCommit) error {
 	if commit.ChunkID == "" || commit.RunID == "" || commit.LeaseOwner == "" ||
 		commit.ProviderID == "" || commit.Stage == "" || commit.CommittedAt.IsZero() {
@@ -149,7 +213,7 @@ func validateHealthChunk(commit HealthChunkCommit) error {
 		return fmt.Errorf("chunk segment range overflows")
 	}
 	segmentEnd := commit.SegmentStart + commit.SegmentCount
-	if commit.CursorSegment < 0 || commit.ResolvedDelta < 0 || commit.ProviderChecksDelta < 0 ||
+	if commit.CursorSequence < 0 || commit.CursorSegment < 0 || commit.ResolvedDelta < 0 || commit.ProviderChecksDelta < 0 ||
 		commit.MissingCandidatesDelta < 0 || commit.InconclusiveDelta < 0 {
 		return fmt.Errorf("chunk progress deltas must be non-negative")
 	}
@@ -205,6 +269,24 @@ func validateHealthChunk(commit HealthChunkCommit) error {
 	if commit.ResolvedDelta > conclusiveCount {
 		return fmt.Errorf("chunk progress exceeds segment range")
 	}
+	if len(commit.ResolvedBitmap) != bitmapBytes {
+		return fmt.Errorf("resolved bitmap length does not match segment range")
+	}
+	if remainder := commit.SegmentCount % 8; remainder != 0 {
+		allowed := byte((1 << remainder) - 1)
+		if commit.ResolvedBitmap[len(commit.ResolvedBitmap)-1]&^allowed != 0 {
+			return fmt.Errorf("resolved bitmap sets bits outside segment range")
+		}
+	}
+	for i := range bitmapBytes {
+		conclusive := commit.TestedBitmap[i] &^ (commit.TemporaryBitmap[i] | commit.InconclusiveBitmap[i])
+		if commit.ResolvedBitmap[i]&^conclusive != 0 {
+			return fmt.Errorf("resolved bitmap contains an inconclusive or untested position")
+		}
+	}
+	if bitmapPopulation(commit.ResolvedBitmap) != commit.ResolvedDelta {
+		return fmt.Errorf("resolved bitmap population does not match progress delta")
+	}
 	for _, attempt := range commit.Attempts {
 		if attempt.IdempotencyKey == "" || attempt.Operation == "" || attempt.Outcome == "" ||
 			attempt.BodyValidation == "" || attempt.ObservedAt.IsZero() ||
@@ -250,6 +332,8 @@ func bitmapPopulation(bitmap []byte) int64 {
 }
 
 func healthChunkDigest(commit HealthChunkCommit) (string, error) {
+	commit.LeaseOwner = ""
+	commit.FencingToken = 0
 	encoded, err := json.Marshal(commit)
 	if err != nil {
 		return "", fmt.Errorf("encode health chunk digest: %w", err)
@@ -258,29 +342,229 @@ func healthChunkDigest(commit HealthChunkCommit) (string, error) {
 	return "sha256:" + hex.EncodeToString(digest[:]), nil
 }
 
-func (r *HealthStateRepository) CommitHealthChunk(ctx context.Context, commit HealthChunkCommit) (*HealthRun, error) {
-	if err := validateHealthChunk(commit); err != nil {
-		return nil, err
+func normalizeHealthCursor(
+	commit *HealthChunkCommit,
+	stage string,
+	providerID sql.NullString,
+	providerGeneration sql.NullInt64,
+	storedSequence int64,
+	storedCursor int64,
+) (int64, error) {
+	if storedSequence < 0 || storedCursor < 0 {
+		return 0, fmt.Errorf("stored health cursor is invalid")
 	}
-	commit.CommittedAt = commit.CommittedAt.UTC()
-	digest, err := healthChunkDigest(commit)
+	established := stage != "" || providerID.Valid || providerGeneration.Valid
+	if !established {
+		if commit.CursorSequence == 0 {
+			commit.CursorSequence = 1
+		}
+		if commit.CursorSequence != 1 {
+			return 0, fmt.Errorf("initial health cursor sequence must be one")
+		}
+		return commit.CursorSegment, nil
+	}
+	if stage == "" || !providerID.Valid || !providerGeneration.Valid {
+		return 0, fmt.Errorf("stored health cursor tuple is incomplete")
+	}
+
+	currentSequence := storedSequence
+	if currentSequence == 0 {
+		currentSequence = 1
+	}
+	sameTuple := stage == commit.Stage && providerID.Valid && providerID.String == commit.ProviderID &&
+		providerGeneration.Valid && providerGeneration.Int64 == commit.ProviderGeneration
+	if sameTuple {
+		if commit.CursorSequence == 0 {
+			commit.CursorSequence = currentSequence
+		}
+		if commit.CursorSequence != currentSequence {
+			return 0, fmt.Errorf("health cursor sequence does not match the active tuple")
+		}
+		if storedCursor > commit.CursorSegment {
+			return storedCursor, nil
+		}
+		return commit.CursorSegment, nil
+	}
+	if commit.CursorSequence == 0 || currentSequence == math.MaxInt64 ||
+		commit.CursorSequence != currentSequence+1 {
+		return 0, fmt.Errorf("health cursor tuple transition requires the next sequence")
+	}
+	return commit.CursorSegment, nil
+}
+
+func storedResolvedBitmap(
+	chunkID string,
+	segmentCount int64,
+	tested, temporary, inconclusive []byte,
+	resolvedDelta int64,
+	resolved []byte,
+) ([]byte, error) {
+	if segmentCount <= 0 || segmentCount > int64(math.MaxInt)/8 || segmentCount > math.MaxInt64-7 {
+		return nil, fmt.Errorf("stored health chunk %s has an invalid segment range", chunkID)
+	}
+	bitmapBytes := int((segmentCount + 7) / 8)
+	for _, bitmap := range [][]byte{tested, temporary, inconclusive} {
+		if len(bitmap) != bitmapBytes {
+			return nil, fmt.Errorf("stored health chunk %s has an invalid bitmap length", chunkID)
+		}
+	}
+	if remainder := segmentCount % 8; remainder != 0 {
+		allowed := byte((1 << remainder) - 1)
+		for _, bitmap := range [][]byte{tested, temporary, inconclusive} {
+			if bitmap[len(bitmap)-1]&^allowed != 0 {
+				return nil, fmt.Errorf("stored health chunk %s sets bits outside its range", chunkID)
+			}
+		}
+	}
+	conclusive := make([]byte, bitmapBytes)
+	for i := range bitmapBytes {
+		if temporary[i]&inconclusive[i] != 0 ||
+			(temporary[i]|inconclusive[i])&^tested[i] != 0 {
+			return nil, fmt.Errorf("stored health chunk %s has invalid inconclusive outcomes", chunkID)
+		}
+		conclusive[i] = tested[i] &^ (temporary[i] | inconclusive[i])
+	}
+	if resolved == nil {
+		switch {
+		case resolvedDelta == 0:
+			return make([]byte, bitmapBytes), nil
+		case resolvedDelta == bitmapPopulation(conclusive):
+			return conclusive, nil
+		default:
+			return nil, fmt.Errorf("%w: %s", ErrAmbiguousLegacyHealthChunk, chunkID)
+		}
+	}
+	if len(resolved) != bitmapBytes {
+		return nil, fmt.Errorf("stored health chunk %s has an invalid resolved bitmap length", chunkID)
+	}
+	if remainder := segmentCount % 8; remainder != 0 {
+		allowed := byte((1 << remainder) - 1)
+		if resolved[len(resolved)-1]&^allowed != 0 {
+			return nil, fmt.Errorf("stored health chunk %s has resolved bits outside its range", chunkID)
+		}
+	}
+	for i := range bitmapBytes {
+		if resolved[i]&^conclusive[i] != 0 {
+			return nil, fmt.Errorf("stored health chunk %s resolves an inconclusive or untested position", chunkID)
+		}
+	}
+	if resolvedDelta < 0 || bitmapPopulation(resolved) != resolvedDelta {
+		return nil, fmt.Errorf("stored health chunk %s has inconsistent resolved progress", chunkID)
+	}
+	return resolved, nil
+}
+
+func healthRunResolvedCount(
+	ctx context.Context,
+	tx *dialectAwareTx,
+	runID string,
+	totalSegments int64,
+	pending HealthChunkCommit,
+) (int64, error) {
+	resolvedPositions := make(map[int64]struct{})
+	add := func(start, count int64, bitmap []byte) error {
+		if start < 0 || count <= 0 || start > math.MaxInt64-count ||
+			count > totalSegments || start > totalSegments-count {
+			return fmt.Errorf("stored health chunk range exceeds run total")
+		}
+		for byteIndex, value := range bitmap {
+			for value != 0 {
+				bit := bits.TrailingZeros8(value)
+				relative := int64(byteIndex*8 + bit)
+				if relative >= count {
+					return fmt.Errorf("stored health chunk resolved bit exceeds its range")
+				}
+				resolvedPositions[start+relative] = struct{}{}
+				value &= value - 1
+			}
+		}
+		return nil
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, segment_start, segment_count, tested_bitmap, temporary_bitmap,
+		       inconclusive_bitmap, resolved_delta, resolved_bitmap
+		FROM health_run_chunks
+		WHERE run_id = ?
+	`, runID)
+	if err != nil {
+		return 0, fmt.Errorf("read health run resolved progress: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var chunkID string
+		var start, count, resolvedDelta int64
+		var tested, temporary, inconclusive, resolved []byte
+		if err := rows.Scan(&chunkID, &start, &count, &tested, &temporary,
+			&inconclusive, &resolvedDelta, &resolved); err != nil {
+			return 0, fmt.Errorf("scan health run resolved progress: %w", err)
+		}
+		bitmap, err := storedResolvedBitmap(
+			chunkID, count, tested, temporary, inconclusive, resolvedDelta, resolved,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if err := add(start, count, bitmap); err != nil {
+			return 0, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate health run resolved progress: %w", err)
+	}
+	if err := add(pending.SegmentStart, pending.SegmentCount, pending.ResolvedBitmap); err != nil {
+		return 0, err
+	}
+	return int64(len(resolvedPositions)), nil
+}
+
+func healthStatementTime(ctx context.Context, tx *dialectAwareTx) (time.Time, error) {
+	if tx.dialect.IsPostgres() {
+		var at time.Time
+		if err := tx.QueryRowContext(ctx, `SELECT statement_timestamp()`).Scan(&at); err != nil {
+			return time.Time{}, fmt.Errorf("read database health commit time: %w", err)
+		}
+		return at.UTC(), nil
+	}
+	var encoded string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+	).Scan(&encoded); err != nil {
+		return time.Time{}, fmt.Errorf("read database health commit time: %w", err)
+	}
+	at, err := time.Parse(time.RFC3339Nano, encoded)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse database health commit time: %w", err)
+	}
+	return at, nil
+}
+
+func (r *HealthStateRepository) CommitHealthChunk(ctx context.Context, commit HealthChunkCommit) (*HealthRun, error) {
+	prepared, err := prepareHealthChunk(commit)
 	if err != nil {
 		return nil, err
 	}
+	commit = prepared
 	var result HealthRun
 	err = r.withTransaction(ctx, func(tx *dialectAwareTx) error {
 		var revisionID, snapshotID string
-		var totalSegments int64
+		var totalSegments, storedSequence, storedCursor int64
 		var leaseExpiresAt time.Time
+		var stage string
+		var providerID sql.NullString
+		var providerGeneration sql.NullInt64
 		// A conditional write both locks the run row and proves that this exact
 		// owner/token is still current and unexpired before idempotency is checked.
 		err := tx.QueryRowContext(ctx, `
 			UPDATE health_runs SET updated_at = updated_at
 			WHERE id = ? AND status = 'running' AND lease_owner = ?
 			  AND fencing_token = ?
-			RETURNING file_revision_id, provider_snapshot_id, total_segments, lease_expires_at
+			RETURNING file_revision_id, provider_snapshot_id, total_segments, lease_expires_at,
+			          stage, current_provider_id, current_provider_generation,
+			          cursor_sequence, cursor_segment
 		`, commit.RunID, commit.LeaseOwner, commit.FencingToken).Scan(
-			&revisionID, &snapshotID, &totalSegments, &leaseExpiresAt,
+			&revisionID, &snapshotID, &totalSegments, &leaseExpiresAt, &stage,
+			&providerID, &providerGeneration, &storedSequence, &storedCursor,
 		)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrStaleHealthLease
@@ -300,6 +584,16 @@ func (r *HealthStateRepository) CommitHealthChunk(ctx context.Context, commit He
 		if commit.SegmentCount > totalSegments || commit.SegmentStart > totalSegments-commit.SegmentCount ||
 			commit.CursorSegment > totalSegments {
 			return fmt.Errorf("chunk range or cursor exceeds run total")
+		}
+		nextCursor, err := normalizeHealthCursor(
+			&commit, stage, providerID, providerGeneration, storedSequence, storedCursor,
+		)
+		if err != nil {
+			return err
+		}
+		digest, err := healthChunkDigest(commit)
+		if err != nil {
+			return err
 		}
 		var snapshotEntry int
 		err = tx.QueryRowContext(ctx, `
@@ -337,6 +631,16 @@ func (r *HealthStateRepository) CommitHealthChunk(ctx context.Context, commit He
 		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("read logical health chunk identity: %w", err)
 		}
+		resolvedSegments, err := healthRunResolvedCount(ctx, tx, commit.RunID, totalSegments, commit)
+		if err != nil {
+			return err
+		}
+		applyTime, err := healthStatementTime(ctx, tx)
+		if err != nil {
+			return err
+		}
+		appliedCommit := commit
+		appliedCommit.CommittedAt = applyTime
 
 		var retryJSON any
 		if commit.Retry != nil {
@@ -350,17 +654,17 @@ func (r *HealthStateRepository) CommitHealthChunk(ctx context.Context, commit He
 			INSERT INTO health_run_chunks
 				(id, run_id, provider_id, provider_generation, stage, observation_kind, segment_start,
 				 segment_count, tested_bitmap, present_bitmap, absent_bitmap, corrupt_bitmap,
-				 temporary_bitmap, inconclusive_bitmap, retry_state, commit_digest,
+				 temporary_bitmap, inconclusive_bitmap, resolved_bitmap, retry_state, commit_digest,
 				 fencing_token, resolved_delta, provider_checks_delta, missing_candidates_delta,
 				 inconclusive_delta, committed_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, commit.ChunkID, commit.RunID, commit.ProviderID, commit.ProviderGeneration,
 			commit.Stage, commit.ObservationKind, commit.SegmentStart, commit.SegmentCount, commit.TestedBitmap,
 			commit.PresentBitmap, commit.AbsentBitmap, commit.CorruptBitmap,
-			commit.TemporaryBitmap, commit.InconclusiveBitmap, retryJSON, digest,
+			commit.TemporaryBitmap, commit.InconclusiveBitmap, commit.ResolvedBitmap, retryJSON, digest,
 			commit.FencingToken, commit.ResolvedDelta, commit.ProviderChecksDelta,
 			commit.MissingCandidatesDelta, commit.InconclusiveDelta,
-			commit.CommittedAt)
+			applyTime)
 		if err != nil {
 			return fmt.Errorf("insert health run chunk: %w", err)
 		}
@@ -372,50 +676,46 @@ func (r *HealthStateRepository) CommitHealthChunk(ctx context.Context, commit He
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, uuid.NewString(), revisionID, commit.ProviderID, commit.ProviderGeneration,
 			commit.ObservationKind, commit.SegmentStart, commit.SegmentCount, commit.TestedBitmap,
-			commit.PresentBitmap, commit.ChunkID, commit.CommittedAt)
+			commit.PresentBitmap, commit.ChunkID, applyTime)
 		if err != nil {
 			return fmt.Errorf("insert provider coverage: %w", err)
 		}
 
-		if err := persistChunkExceptions(ctx, tx, revisionID, commit); err != nil {
+		if err := persistChunkExceptions(ctx, tx, revisionID, appliedCommit); err != nil {
 			return err
 		}
-		if err := persistAttemptEvidence(ctx, tx, revisionID, commit); err != nil {
+		if err := persistAttemptEvidence(ctx, tx, revisionID, appliedCommit); err != nil {
 			return err
 		}
-		if err := persistConfirmationEvents(ctx, tx, revisionID, commit); err != nil {
+		if err := persistConfirmationEvents(ctx, tx, revisionID, appliedCommit); err != nil {
 			return err
 		}
-		if err := persistRetryState(ctx, tx, revisionID, commit); err != nil {
+		if err := persistRetryState(ctx, tx, revisionID, appliedCommit); err != nil {
 			return err
 		}
 
 		update := `
 			UPDATE health_runs
-			SET resolved_segments = resolved_segments + ?,
+			SET resolved_segments = ?,
 			    provider_checks = provider_checks + ?,
 			    missing_candidates = missing_candidates + ?,
 			    inconclusive_count = inconclusive_count + ?,
-			    cursor_segment = CASE
-			      WHEN stage = ? THEN CASE WHEN cursor_segment > ? THEN cursor_segment ELSE ? END
-			      ELSE ?
-			    END,
+			    cursor_sequence = ?, cursor_segment = ?,
 			    stage = ?, current_provider_id = ?, current_provider_generation = ?,
 			    updated_at = ?
 			WHERE id = ? AND lease_owner = ? AND fencing_token = ?
-			  AND resolved_segments + ? <= total_segments
+			  AND ? <= total_segments
 			RETURNING id, file_revision_id, provider_snapshot_id, trigger, mode, status,
 			          lease_owner, lease_expires_at, fencing_token, total_segments,
 			          resolved_segments, provider_checks, missing_candidates, inconclusive_count,
-			          stage, current_provider_id, current_provider_generation, cursor_segment,
+			          stage, current_provider_id, current_provider_generation, cursor_sequence, cursor_segment,
 			          pause_requested, cancel_requested, created_at, started_at, updated_at, completed_at
 		`
 		err = scanHealthRun(tx.QueryRowContext(ctx, update,
-			commit.ResolvedDelta, commit.ProviderChecksDelta, commit.MissingCandidatesDelta,
-			commit.InconclusiveDelta, commit.Stage, commit.CursorSegment, commit.CursorSegment,
-			commit.CursorSegment,
-			commit.Stage, commit.ProviderID, commit.ProviderGeneration, commit.CommittedAt,
-			commit.RunID, commit.LeaseOwner, commit.FencingToken, commit.ResolvedDelta,
+			resolvedSegments, commit.ProviderChecksDelta, commit.MissingCandidatesDelta,
+			commit.InconclusiveDelta, commit.CursorSequence, nextCursor,
+			commit.Stage, commit.ProviderID, commit.ProviderGeneration, applyTime,
+			commit.RunID, commit.LeaseOwner, commit.FencingToken, resolvedSegments,
 		), &result)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("health chunk progress violates active run bounds")
@@ -518,7 +818,7 @@ func hasNewerApplicablePresence(
 		SELECT observation_kind, segment_start, present_bitmap
 		FROM health_provider_coverage
 		WHERE file_revision_id = ? AND provider_id = ? AND provider_generation = ?
-		  AND observed_at >= ? AND segment_start <= ? AND segment_start + segment_count > ?
+		  AND observed_at > ? AND segment_start <= ? AND segment_start + segment_count > ?
 	`, revisionID, commit.ProviderID, commit.ProviderGeneration, commit.CommittedAt,
 		segmentIndex, segmentIndex)
 	if err != nil {
