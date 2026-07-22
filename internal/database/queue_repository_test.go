@@ -175,12 +175,12 @@ func TestIsFileInQueueMatchesRootedBasename(t *testing.T) {
 	setupQueueSchema(t, db)
 	repo := NewQueueRepository(db, DialectSQLite)
 	item := &ImportQueueItem{
-		NzbPath: "/queue/authority-token/movie.nzb", Status: QueueStatusPending,
+		NzbPath: filepath.Join("queue", "authority-token", "movie.nzb"), Status: QueueStatusPending,
 		Priority: QueuePriorityNormal, MaxRetries: 3,
 	}
 	require.NoError(t, repo.AddToQueue(context.Background(), item))
 
-	found, err := repo.IsFileInQueue(context.Background(), "/incoming/movie.nzb")
+	found, err := repo.IsFileInQueue(context.Background(), filepath.Join("incoming", "movie.nzb"))
 	require.NoError(t, err)
 	require.True(t, found, "rooted directory staging must preserve basename duplicate detection")
 }
@@ -192,12 +192,12 @@ func TestIsFileInQueueRejectsDistinctSuffixBasename(t *testing.T) {
 	setupQueueSchema(t, db)
 	repo := NewQueueRepository(db, DialectSQLite)
 	item := &ImportQueueItem{
-		NzbPath: "/queue/authority-token/Series-Movie.nzb", Status: QueueStatusPending,
+		NzbPath: filepath.Join("queue", "authority-token", "Series-Movie.nzb"), Status: QueueStatusPending,
 		Priority: QueuePriorityNormal, MaxRetries: 3,
 	}
 	require.NoError(t, repo.AddToQueue(context.Background(), item))
 
-	found, err := repo.IsFileInQueue(context.Background(), "/incoming/Movie.nzb")
+	found, err := repo.IsFileInQueue(context.Background(), filepath.Join("incoming", "Movie.nzb"))
 	require.NoError(t, err)
 	require.False(t, found, "a distinct suffix basename is not the same queued source")
 }
@@ -265,7 +265,11 @@ func TestAddToQueueResolvesIDBeforeCommit(t *testing.T) {
 	}
 	require.NoError(t, repo.AddToQueue(context.Background(), item),
 		"the authoritative ID lookup must complete in the insert transaction")
+	require.True(t, committed.Load(), "the regression guard must observe the transaction commit")
 	require.NotZero(t, item.ID)
+	var count int
+	err = db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM import_queue`).Scan(&count)
+	require.Error(t, err, "the guard must reject import_queue reads after commit")
 }
 
 func TestAddBatchToQueueReturnsExistingRowIDForNoopConflict(t *testing.T) {

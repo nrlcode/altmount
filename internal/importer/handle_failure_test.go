@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -100,10 +99,11 @@ func newMoveToFailedTestServiceWithDB(t *testing.T) (*Service, *sql.DB) {
 func TestHandleFailure_MovesToFailedDir(t *testing.T) {
 	svc := newMoveToFailedTestService(t)
 
-	// Write a .nzb in the OS temp queue dir (simulating post-ensurePersistentNzb state).
+	// Write a .nzb under a token directory, matching ensurePersistentNzb output.
 	tmpQueue := filepath.Join(os.TempDir(), ".altmount-queue")
-	require.NoError(t, os.MkdirAll(tmpQueue, 0755))
-	nzbPath := filepath.Join(tmpQueue, "42-show.s01e01.nzb")
+	tokenDir := filepath.Join(tmpQueue, "success-token")
+	require.NoError(t, os.MkdirAll(tokenDir, 0o755))
+	nzbPath := filepath.Join(tokenDir, "42-show.s01e01.nzb")
 	require.NoError(t, os.WriteFile(nzbPath, []byte("<nzb/>"), 0644))
 	t.Cleanup(func() { os.Remove(nzbPath) }) // safety net if test fails mid-way
 
@@ -119,27 +119,14 @@ func TestHandleFailure_MovesToFailedDir(t *testing.T) {
 	require.NoError(t, moveErr)
 
 	failedDir := svc.GetFailedNzbFolder()
+	destination := filepath.Join(failedDir, filepath.Base(nzbPath))
+	t.Cleanup(func() { _ = os.Remove(destination) })
 
-	// Assert: the file is in the failed directory.
-	entries, err := os.ReadDir(failedDir)
-	require.NoError(t, err)
-	found := false
-	var movedName string
-	for _, e := range entries {
-		if strings.Contains(e.Name(), "show") {
-			found = true
-			movedName = e.Name()
-			t.Cleanup(func() { os.Remove(filepath.Join(failedDir, movedName)) })
-		}
-	}
-	assert.True(t, found, "failed .nzb should be moved to failed dir; got entries: %v", entries)
-
-	// Assert: original temp file is gone.
+	assert.FileExists(t, destination, "failed .nzb should retain its basename in the failed directory")
 	assert.NoFileExists(t, nzbPath, "original temp file should be removed after failure move")
+	assert.NoDirExists(t, tokenDir, "the empty queue token directory should be pruned")
 
-	// Assert: item struct path is updated to the new location.
-	assert.True(t, strings.HasPrefix(item.NzbPath, failedDir),
-		"item.NzbPath should point to failed dir after move, got %q", item.NzbPath)
+	assert.Equal(t, destination, item.NzbPath, "item.NzbPath should preserve the release basename")
 
 	// Assert: DB record is updated to the new path.
 	dbItem, err := svc.database.Repository.GetQueueItem(ctx, item.ID)
@@ -216,8 +203,9 @@ func TestMoveToFailedFolderRejectsUnownedLegacySource(t *testing.T) {
 func TestMoveToFailedFolderRollsBackCopyWhenPathUpdateFails(t *testing.T) {
 	svc, db := newMoveToFailedTestServiceWithDB(t)
 	queueRoot := filepath.Join(os.TempDir(), ".altmount-queue")
-	require.NoError(t, os.MkdirAll(queueRoot, 0o755))
-	source := filepath.Join(queueRoot, "update-rollback.nzb")
+	tokenDir := filepath.Join(queueRoot, "rollback-token")
+	require.NoError(t, os.MkdirAll(tokenDir, 0o755))
+	source := filepath.Join(tokenDir, "update-rollback.nzb")
 	require.NoError(t, os.WriteFile(source, []byte("keep"), 0o600))
 	item := &database.ImportQueueItem{
 		NzbPath: source, Status: database.QueueStatusFailed, MaxRetries: 3,
@@ -237,6 +225,7 @@ func TestMoveToFailedFolderRollsBackCopyWhenPathUpdateFails(t *testing.T) {
 
 	require.Error(t, err)
 	assert.FileExists(t, source, "a rejected path publication must retain the prior owned source")
+	assert.DirExists(t, tokenDir, "rollback must recreate a pruned queue token directory")
 	assert.NoFileExists(t, destination, "a rejected path publication must not leak the staged destination")
 	stored, getErr := svc.database.Repository.GetQueueItem(context.Background(), item.ID)
 	require.NoError(t, getErr)
