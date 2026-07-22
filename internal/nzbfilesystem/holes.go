@@ -141,53 +141,6 @@ func (mvf *MetadataVirtualFile) recordDegradedPad(total, longest, totalSegments 
 	}
 }
 
-// classifyStreamingFailure builds the playback-impact summary for a stream
-// that FAILED on a missing article (hooks absent, or pad caps exceeded).
-// Returns nil for ineligible files or non-hole failures (yEnc corruption,
-// pool errors), which follow the plain corruption path.
-func (mvf *MetadataVirtualFile) classifyStreamingFailure(dcErr *usenet.DataCorruptionError) *holes.Impact {
-	if !mvf.holeEligible() || !usenet.IsArticleNotFound(dcErr.UnderlyingErr) {
-		return nil
-	}
-
-	var acc holes.Accumulator
-	mvf.holeMu.Lock()
-	if mvf.holeAcc != nil {
-		acc.Load(mvf.holeAcc.Runs())
-	}
-	mvf.holeMu.Unlock()
-
-	idx := mvf.initSegmentIndex()
-	if idx == nil {
-		return &holes.Impact{Verdict: holes.VerdictFailed, TotalSegments: len(mvf.meta.SegmentData)}
-	}
-
-	// Fold in the failing segment when its position is known.
-	if dcErr.FileOffset >= 0 {
-		if segIdx := idx.findSegmentForOffset(dcErr.FileOffset); segIdx >= 0 {
-			acc.Add(segIdx)
-		}
-	}
-
-	totalSegments := len(mvf.meta.SegmentData)
-	paddedBytes, ok := paddedBytesForRuns(acc.Runs(), idx)
-	if !ok {
-		return &holes.Impact{
-			Verdict:       holes.VerdictFailed,
-			TotalMissing:  acc.Total(),
-			LongestRun:    acc.LongestRun(),
-			TotalSegments: totalSegments,
-		}
-	}
-	return &holes.Impact{
-		Verdict:       holes.Classify(acc.Runs(), mvf.meta.FileSize, paddedBytes),
-		TotalMissing:  acc.Total(),
-		LongestRun:    acc.LongestRun(),
-		TotalSegments: totalSegments,
-		PaddedRatio:   paddedRatio(paddedBytes, mvf.meta.FileSize),
-	}
-}
-
 func paddedBytesForRuns(runs []holes.Run, idx *segmentOffsetIndex) (int64, bool) {
 	if idx == nil {
 		return 0, false
