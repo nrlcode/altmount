@@ -10,6 +10,7 @@ import (
 
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/metadata"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,9 +32,13 @@ func newDedupTestService(t *testing.T) (*Service, string) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
+	metadataService := metadata.NewMetadataService(filepath.Join(configDir, "metadata"))
+	storeRoot := filepath.Join(configDir, ".nzbs")
+	require.NoError(t, metadataService.ConfigureCleanupRoots(storeRoot, filepath.Join(os.TempDir(), ".altmount-queue"), storeRoot))
 	s := &Service{
-		log:      slog.Default(),
-		database: db,
+		log:             slog.Default(),
+		database:        db,
+		metadataService: metadataService,
 		configGetter: func() *config.Config {
 			return &config.Config{
 				Database: config.DatabaseConfig{Path: dbPath},
