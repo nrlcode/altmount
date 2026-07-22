@@ -58,13 +58,26 @@ func chg008ReadExpandedMetadata(extentCount, segmentCount int) *metapb.FileMetad
 	return meta
 }
 
-func chg008LegacyExpandedMetadata(extentCount, segmentCount int) *metapb.FileMetadata {
+func chg008SharedAliasMetadata(extentCount, segmentCount int) *metapb.FileMetadata {
 	meta := chg008ReadExpandedMetadata(extentCount, segmentCount)
 	meta.SharedOuterSources = nil
 	for _, source := range meta.NestedSources {
 		source.SharedOuterSourceIndex = 0
 	}
 	return meta
+}
+
+func chg008LegacyExpandedMetadata(extentCount, segmentCount int) *metapb.FileMetadata {
+	meta := chg008SharedAliasMetadata(extentCount, segmentCount)
+	encoded, err := proto.Marshal(meta)
+	if err != nil {
+		panic(err)
+	}
+	decoded := &metapb.FileMetadata{}
+	if err := proto.Unmarshal(encoded, decoded); err != nil {
+		panic(err)
+	}
+	return decoded
 }
 
 func chg008AssertSharedSegmentBacking(t testing.TB, meta *metapb.FileMetadata) {
@@ -77,6 +90,23 @@ func chg008AssertSharedSegmentBacking(t testing.TB, meta *metapb.FileMetadata) {
 		require.NotEmpty(t, source.Segments)
 		assert.Same(t, first, &source.Segments[0], "nested source %d lost shared segment backing", i+1)
 	}
+}
+
+func chg008AssertDistinctSegmentBacking(t testing.TB, meta *metapb.FileMetadata) {
+	t.Helper()
+	require.NotEmpty(t, meta.NestedSources)
+	for i, source := range meta.NestedSources {
+		require.NotNil(t, source)
+		require.NotEmpty(t, source.Segments)
+		for j := 0; j < i; j++ {
+			assert.NotSame(t, &meta.NestedSources[j].Segments[0], &source.Segments[0],
+				"legacy sources %d and %d unexpectedly share segment backing", j, i)
+		}
+	}
+}
+
+func TestFACORECHG008FingerprintEncodingUsesV2(t *testing.T) {
+	assert.Equal(t, "altmount-segment-layout-v2", segmentLayoutFingerprintVersion)
 }
 
 func TestFACORECHG008NestedFingerprintIgnoresValidMainLayout(t *testing.T) {
@@ -200,6 +230,12 @@ func TestFACORECHG008NestedFingerprintDiscriminatesEffectiveLayout(t *testing.T)
 			meta.NestedSources[0].InnerLength++
 			meta.NestedSources[1].InnerLength--
 		}},
+		{name: "inherited inner volume size", mutate: func(meta *metapb.FileMetadata) {
+			meta.SharedOuterSources[0].InnerVolumeSize++
+		}},
+		{name: "extent inner volume override", mutate: func(meta *metapb.FileMetadata) {
+			meta.NestedSources[1].InnerVolumeSize = meta.SharedOuterSources[0].InnerVolumeSize - 1
+		}},
 		{name: "segment identity", mutate: func(meta *metapb.FileMetadata) {
 			meta.SharedOuterSources[0].Segments[0].Id = "changed-effective-segment@example.invalid"
 		}},
@@ -221,13 +257,16 @@ func TestFACORECHG008NestedFingerprintDiscriminatesEffectiveLayout(t *testing.T)
 func TestFACORECHG008NestedFingerprintNormalizesStorageShapesWithoutMutation(t *testing.T) {
 	compact := chg008CompactNestedMetadata(3, 4)
 	readExpanded := chg008ReadExpandedMetadata(3, 4)
+	sharedAlias := chg008SharedAliasMetadata(3, 4)
 	legacyExpanded := chg008LegacyExpandedMetadata(3, 4)
 
 	chg008AssertSharedSegmentBacking(t, readExpanded)
-	chg008AssertSharedSegmentBacking(t, legacyExpanded)
+	chg008AssertSharedSegmentBacking(t, sharedAlias)
+	chg008AssertDistinctSegmentBacking(t, legacyExpanded)
 	snapshots := []*metapb.FileMetadata{
 		proto.Clone(compact).(*metapb.FileMetadata),
 		proto.Clone(readExpanded).(*metapb.FileMetadata),
+		proto.Clone(sharedAlias).(*metapb.FileMetadata),
 		proto.Clone(legacyExpanded).(*metapb.FileMetadata),
 	}
 
@@ -235,16 +274,20 @@ func TestFACORECHG008NestedFingerprintNormalizesStorageShapesWithoutMutation(t *
 	require.NoError(t, err)
 	readFingerprint, err := CanonicalSegmentLayoutFingerprint(readExpanded)
 	require.NoError(t, err)
+	aliasFingerprint, err := CanonicalSegmentLayoutFingerprint(sharedAlias)
+	require.NoError(t, err)
 	legacyFingerprint, err := CanonicalSegmentLayoutFingerprint(legacyExpanded)
 	require.NoError(t, err)
 	assert.Equal(t, compactFingerprint, readFingerprint)
+	assert.Equal(t, compactFingerprint, aliasFingerprint)
 	assert.Equal(t, compactFingerprint, legacyFingerprint)
 
-	for i, candidate := range []*metapb.FileMetadata{compact, readExpanded, legacyExpanded} {
+	for i, candidate := range []*metapb.FileMetadata{compact, readExpanded, sharedAlias, legacyExpanded} {
 		assert.True(t, proto.Equal(snapshots[i], candidate), "storage shape %d was mutated", i)
 	}
 	chg008AssertSharedSegmentBacking(t, readExpanded)
-	chg008AssertSharedSegmentBacking(t, legacyExpanded)
+	chg008AssertSharedSegmentBacking(t, sharedAlias)
+	chg008AssertDistinctSegmentBacking(t, legacyExpanded)
 }
 
 func TestFACORECHG008ReadExpandedFingerprintAllocationsDoNotMultiplyByExtents(t *testing.T) {
@@ -254,27 +297,34 @@ func TestFACORECHG008ReadExpandedFingerprintAllocationsDoNotMultiplyByExtents(t 
 		measurementRuns         = 3
 		maxAllocsPerAddedExtent = 8
 	)
-	oneExtent := chg008ReadExpandedMetadata(1, segmentCount)
-	manyExtents := chg008ReadExpandedMetadata(manyExtentCount, segmentCount)
-
-	measure := func(meta *metapb.FileMetadata) float64 {
-		return testing.AllocsPerRun(measurementRuns, func() {
-			var err error
-			chg008FingerprintResult, err = CanonicalSegmentLayoutFingerprint(meta)
-			if err != nil {
-				panic(err)
+	shapes := []struct {
+		name  string
+		build func(int, int) *metapb.FileMetadata
+	}{
+		{name: "read-expanded-index", build: chg008ReadExpandedMetadata},
+		{name: "expanded-shared-alias", build: chg008SharedAliasMetadata},
+	}
+	for _, shape := range shapes {
+		t.Run(shape.name, func(t *testing.T) {
+			measure := func(meta *metapb.FileMetadata) float64 {
+				return testing.AllocsPerRun(measurementRuns, func() {
+					var err error
+					chg008FingerprintResult, err = CanonicalSegmentLayoutFingerprint(meta)
+					if err != nil {
+						panic(err)
+					}
+				})
+			}
+			oneExtentAllocs := measure(shape.build(1, segmentCount))
+			manyExtentAllocs := measure(shape.build(manyExtentCount, segmentCount))
+			maxAllocs := oneExtentAllocs + float64((manyExtentCount-1)*maxAllocsPerAddedExtent)
+			if manyExtentAllocs > maxAllocs {
+				t.Fatalf(
+					"fingerprint allocations multiplied with shared extents: one extent %.0f, %d extents %.0f, want <= %.0f (one-extent baseline plus %d bookkeeping allocations per added extent)",
+					oneExtentAllocs, manyExtentCount, manyExtentAllocs, maxAllocs, maxAllocsPerAddedExtent,
+				)
 			}
 		})
-	}
-	oneExtentAllocs := measure(oneExtent)
-	manyExtentAllocs := measure(manyExtents)
-	maxAllocs := oneExtentAllocs + float64((manyExtentCount-1)*maxAllocsPerAddedExtent)
-
-	if manyExtentAllocs > maxAllocs {
-		t.Fatalf(
-			"read-expanded fingerprint allocations multiplied with shared extents: one extent %.0f, %d extents %.0f, want <= %.0f (one-extent baseline plus %d bookkeeping allocations per added extent)",
-			oneExtentAllocs, manyExtentCount, manyExtentAllocs, maxAllocs, maxAllocsPerAddedExtent,
-		)
 	}
 }
 
@@ -296,6 +346,10 @@ func BenchmarkFACORECHG008CanonicalFingerprintCompactShared(b *testing.B) {
 
 func BenchmarkFACORECHG008CanonicalFingerprintReadExpandedShared(b *testing.B) {
 	benchmarkFACORECHG008CanonicalFingerprint(b, chg008ReadExpandedMetadata)
+}
+
+func BenchmarkFACORECHG008CanonicalFingerprintExpandedSharedAlias(b *testing.B) {
+	benchmarkFACORECHG008CanonicalFingerprint(b, chg008SharedAliasMetadata)
 }
 
 func benchmarkFACORECHG008CanonicalFingerprint(
