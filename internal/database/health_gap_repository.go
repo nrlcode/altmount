@@ -40,10 +40,12 @@ func (r *HealthStateRepository) UpsertGapRange(ctx context.Context, write GapRan
 	if err := validateGapWrite(write); err != nil {
 		return nil, err
 	}
-	if write.ID == "" {
-		write.ID = uuid.NewString()
-	}
+	requestedID := write.ID
 	write.CreatedAt = write.CreatedAt.UTC()
+	clearedAt := write.ClearedAt
+	if write.Status == GapStatusActive {
+		clearedAt = nil
+	}
 	var gap HealthGapRange
 	err := r.withTransaction(ctx, func(tx *dialectAwareTx) error {
 		var revisionSegments int64
@@ -56,56 +58,48 @@ func (r *HealthStateRepository) UpsertGapRange(ctx context.Context, write GapRan
 		if write.SegmentCount > revisionSegments || write.StartSegment > revisionSegments-write.SegmentCount {
 			return fmt.Errorf("gap range exceeds file revision segment count")
 		}
-		var existingRevision string
-		var existingKind GapKind
-		var existingStart, existingCount int64
-		var existingCreated time.Time
-		err := tx.QueryRowContext(ctx, `
-			SELECT file_revision_id, kind, start_segment, segment_count, created_at
-			FROM health_gap_ranges WHERE id = ?
-		`, write.ID).Scan(&existingRevision, &existingKind, &existingStart, &existingCount, &existingCreated)
-		switch {
-		case err == nil:
-			if existingRevision != write.FileRevisionID || existingKind != write.Kind ||
-				existingStart != write.StartSegment || existingCount != write.SegmentCount ||
-				!existingCreated.Equal(write.CreatedAt) {
-				return ErrHealthChunkConflict
+		if requestedID != "" {
+			var existingRevision string
+			var existingKind GapKind
+			var existingStart, existingCount int64
+			var existingCreated time.Time
+			err := tx.QueryRowContext(ctx, `
+				SELECT file_revision_id, kind, start_segment, segment_count, created_at
+				FROM health_gap_ranges WHERE id = ?
+			`, requestedID).Scan(&existingRevision, &existingKind, &existingStart, &existingCount, &existingCreated)
+			switch {
+			case err == nil:
+				if existingRevision != write.FileRevisionID || existingKind != write.Kind ||
+					existingStart != write.StartSegment || existingCount != write.SegmentCount ||
+					!existingCreated.Equal(write.CreatedAt) {
+					return ErrHealthChunkConflict
+				}
+			case !errors.Is(err, sql.ErrNoRows):
+				return fmt.Errorf("read health gap identity: %w", err)
 			}
-		case !errors.Is(err, sql.ErrNoRows):
-			return fmt.Errorf("read health gap identity: %w", err)
+		} else {
+			write.ID = uuid.NewString()
 		}
 
-		_, err = tx.ExecContext(ctx, `
+		var canonicalID string
+		err := tx.QueryRowContext(ctx, `
 			INSERT INTO health_gap_ranges
 				(id, file_revision_id, kind, start_segment, segment_count, status,
 				 created_at, confirmed_at, cleared_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET
-				status = CASE
-					WHEN health_gap_ranges.status = 'cleared' OR excluded.status = 'cleared' THEN 'cleared'
-					WHEN health_gap_ranges.status = 'dormant' AND excluded.status = 'active' THEN 'dormant'
-					ELSE excluded.status END,
-				confirmed_at = COALESCE(health_gap_ranges.confirmed_at, excluded.confirmed_at),
-				cleared_at = COALESCE(health_gap_ranges.cleared_at, excluded.cleared_at)
+			ON CONFLICT(file_revision_id, kind, start_segment, segment_count) DO UPDATE SET
+				status = excluded.status,
+				confirmed_at = CASE
+					WHEN excluded.confirmed_at IS NOT NULL THEN excluded.confirmed_at
+					ELSE health_gap_ranges.confirmed_at END,
+				cleared_at = CASE
+					WHEN excluded.status = 'active' THEN NULL
+					ELSE COALESCE(health_gap_ranges.cleared_at, excluded.cleared_at) END
+			RETURNING id
 		`, write.ID, write.FileRevisionID, write.Kind, write.StartSegment,
-			write.SegmentCount, write.Status, write.CreatedAt, write.ConfirmedAt, write.ClearedAt)
+			write.SegmentCount, write.Status, write.CreatedAt, write.ConfirmedAt, clearedAt).Scan(&canonicalID)
 		if err != nil {
 			return fmt.Errorf("upsert health gap range: %w", err)
-		}
-		var retainedRevision string
-		var retainedKind GapKind
-		var retainedStart, retainedCount int64
-		var retainedCreated time.Time
-		if err := tx.QueryRowContext(ctx, `
-			SELECT file_revision_id, kind, start_segment, segment_count, created_at
-			FROM health_gap_ranges WHERE id = ?
-		`, write.ID).Scan(&retainedRevision, &retainedKind, &retainedStart, &retainedCount, &retainedCreated); err != nil {
-			return fmt.Errorf("verify health gap identity: %w", err)
-		}
-		if retainedRevision != write.FileRevisionID || retainedKind != write.Kind ||
-			retainedStart != write.StartSegment || retainedCount != write.SegmentCount ||
-			!retainedCreated.Equal(write.CreatedAt) {
-			return ErrHealthChunkConflict
 		}
 		for _, cause := range write.Causes {
 			var confirmedAt any
@@ -122,14 +116,17 @@ func (r *HealthStateRepository) UpsertGapRange(ctx context.Context, write GapRan
 						  OR (excluded.confirmed_at IS NOT NULL AND health_gap_provider_causes.confirmed_at <= excluded.confirmed_at)
 						THEN excluded.cause ELSE health_gap_provider_causes.cause END,
 					confirmation_count = CASE
-						WHEN health_gap_provider_causes.cause = excluded.cause
-						  AND health_gap_provider_causes.confirmation_count > excluded.confirmation_count
-						THEN health_gap_provider_causes.confirmation_count ELSE excluded.confirmation_count END,
+						WHEN health_gap_provider_causes.cause = excluded.cause THEN
+							CASE WHEN health_gap_provider_causes.confirmation_count > excluded.confirmation_count
+								THEN health_gap_provider_causes.confirmation_count ELSE excluded.confirmation_count END
+						WHEN health_gap_provider_causes.confirmed_at IS NULL
+						  OR (excluded.confirmed_at IS NOT NULL AND health_gap_provider_causes.confirmed_at <= excluded.confirmed_at)
+						THEN excluded.confirmation_count ELSE health_gap_provider_causes.confirmation_count END,
 					confirmed_at = CASE
 						WHEN health_gap_provider_causes.confirmed_at IS NULL
 						  OR (excluded.confirmed_at IS NOT NULL AND health_gap_provider_causes.confirmed_at <= excluded.confirmed_at)
 						THEN excluded.confirmed_at ELSE health_gap_provider_causes.confirmed_at END
-			`, write.ID, cause.ProviderID, cause.ProviderGeneration, cause.Cause,
+			`, canonicalID, cause.ProviderID, cause.ProviderGeneration, cause.Cause,
 				cause.ConfirmationCount, confirmedAt)
 			if err != nil {
 				return fmt.Errorf("insert health gap provider cause: %w", err)
@@ -139,7 +136,7 @@ func (r *HealthStateRepository) UpsertGapRange(ctx context.Context, write GapRan
 			SELECT id, file_revision_id, kind, start_segment, segment_count, status,
 			       created_at, confirmed_at, cleared_at
 			FROM health_gap_ranges WHERE id = ?
-		`, write.ID).Scan(&gap.ID, &gap.FileRevisionID, &gap.Kind, &gap.StartSegment,
+		`, canonicalID).Scan(&gap.ID, &gap.FileRevisionID, &gap.Kind, &gap.StartSegment,
 			&gap.SegmentCount, &gap.Status, &gap.CreatedAt, &gap.ConfirmedAt, &gap.ClearedAt); err != nil {
 			return fmt.Errorf("read persisted health gap: %w", err)
 		}
@@ -147,7 +144,7 @@ func (r *HealthStateRepository) UpsertGapRange(ctx context.Context, write GapRan
 			SELECT provider_id, provider_generation, cause, confirmation_count, confirmed_at
 			FROM health_gap_provider_causes WHERE gap_id = ?
 			ORDER BY provider_id, provider_generation
-		`, write.ID)
+		`, canonicalID)
 		if err != nil {
 			return fmt.Errorf("read persisted health gap causes: %w", err)
 		}

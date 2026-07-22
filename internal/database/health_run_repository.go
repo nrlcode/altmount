@@ -98,7 +98,8 @@ func (r *HealthStateRepository) AcquireRunLease(ctx context.Context, runID, owne
 		SET lease_owner = ?, lease_expires_at = ?, fencing_token = fencing_token + 1,
 		    status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
 		WHERE id = ?
-		  AND status IN ('pending', 'running', 'paused')
+		  AND status IN ('pending', 'running')
+		  AND pause_requested = FALSE
 		  AND cancel_requested = FALSE
 		  AND (lease_owner IS NULL OR lease_expires_at <= ? OR lease_owner = ?)
 		RETURNING id, file_revision_id, provider_snapshot_id, trigger, mode, status,
@@ -996,7 +997,15 @@ func sameOptionalTime(existing *time.Time, desired time.Time) bool {
 }
 
 func (r *HealthStateRepository) RequestRunPause(ctx context.Context, runID string, requested bool, at time.Time) error {
-	result, err := r.db.ExecContext(ctx, `UPDATE health_runs SET pause_requested = ?, updated_at = ? WHERE id = ?`, requested, at.UTC(), runID)
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE health_runs
+		SET pause_requested = ?,
+		    status = CASE WHEN ? = FALSE AND status = 'paused' THEN 'pending' ELSE status END,
+		    updated_at = ?
+		WHERE id = ?
+		  AND status IN ('pending', 'running', 'paused')
+		  AND cancel_requested = FALSE
+	`, requested, requested, at.UTC(), runID)
 	if err != nil {
 		return fmt.Errorf("request run pause: %w", err)
 	}
@@ -1004,6 +1013,52 @@ func (r *HealthStateRepository) RequestRunPause(ctx context.Context, runID strin
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+func (r *HealthStateRepository) AcknowledgeRunPause(
+	ctx context.Context,
+	runID, owner string,
+	token int64,
+	at time.Time,
+) (*HealthRun, error) {
+	if runID == "" || owner == "" || token <= 0 {
+		return nil, fmt.Errorf("run ID, lease owner, and positive fencing token are required")
+	}
+	query := `
+		UPDATE health_runs
+		SET status = 'paused', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+		WHERE id = ? AND status = 'running' AND pause_requested = TRUE
+		  AND cancel_requested = FALSE AND lease_owner = ? AND fencing_token = ?
+		  AND lease_expires_at > ?
+		RETURNING id, file_revision_id, provider_snapshot_id, trigger, mode, status,
+		          lease_owner, lease_expires_at, fencing_token, total_segments,
+		          resolved_segments, provider_checks, missing_candidates, inconclusive_count,
+		          stage, current_provider_id, current_provider_generation, cursor_sequence, cursor_segment,
+		          pause_requested, cancel_requested, created_at, started_at, updated_at, completed_at
+	`
+	var run HealthRun
+	err := scanHealthRun(r.db.QueryRowContext(
+		ctx, query, at.UTC(), runID, owner, token, r.now().UTC(),
+	), &run)
+	if err == nil {
+		return &run, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("acknowledge health run pause: %w", err)
+	}
+
+	err = scanHealthRun(r.db.QueryRowContext(ctx, healthRunSelect+`
+		WHERE id = ? AND status = 'paused' AND pause_requested = TRUE
+		  AND cancel_requested = FALSE AND lease_owner IS NULL
+		  AND lease_expires_at IS NULL AND fencing_token = ?
+	`, runID, token), &run)
+	if err == nil {
+		return &run, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("read acknowledged health run pause: %w", err)
+	}
+	return nil, ErrStaleHealthLease
 }
 
 func (r *HealthStateRepository) RequestRunCancel(ctx context.Context, runID string, at time.Time) error {
