@@ -168,6 +168,23 @@ func TestGetQueueItemByNzbPath(t *testing.T) {
 	assert.Nil(t, notFound)
 }
 
+func TestIsFileInQueueMatchesRootedBasename(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	setupQueueSchema(t, db)
+	repo := NewQueueRepository(db, DialectSQLite)
+	item := &ImportQueueItem{
+		NzbPath: "/queue/authority-token/movie.nzb", Status: QueueStatusPending,
+		Priority: QueuePriorityNormal, MaxRetries: 3,
+	}
+	require.NoError(t, repo.AddToQueue(context.Background(), item))
+
+	found, err := repo.IsFileInQueue(context.Background(), "/incoming/movie.nzb")
+	require.NoError(t, err)
+	require.True(t, found, "rooted directory staging must preserve basename duplicate detection")
+}
+
 func TestAddToQueueReturnsExistingRowIDForNoopConflict(t *testing.T) {
 	db, err := sql.Open("sqlite3", ":memory:")
 	require.NoError(t, err)
