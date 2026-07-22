@@ -30,12 +30,12 @@ type Manager struct {
 	logger        *slog.Logger
 	ctx           context.Context
 	cancel        context.CancelFunc
-	httpClient     *http.Client
-	serverReady    chan struct{}
-	processExited  chan struct{}
-	serverStarted  bool
-	mu             sync.RWMutex
-	cfg            *config.Manager
+	httpClient    *http.Client
+	serverReady   chan struct{}
+	processExited chan struct{}
+	serverStarted bool
+	mu            sync.RWMutex
+	cfg           *config.Manager
 
 	// readyAt is stamped when the RC server first becomes ready (serverReady
 	// closed). Guarded by mu. Used to enforce a startup grace period before
@@ -98,13 +98,13 @@ func NewManager(cfm *config.Manager) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	m := &Manager{
-		cfg:         cfm,
-		rcPort:      rcPort,
-		rcloneDir:   rcloneDir,
-		mounts:      make(map[string]*MountInfo),
-		logger:      logger,
-		ctx:         ctx,
-		cancel:      cancel,
+		cfg:           cfm,
+		rcPort:        rcPort,
+		rcloneDir:     rcloneDir,
+		mounts:        make(map[string]*MountInfo),
+		logger:        logger,
+		ctx:           ctx,
+		cancel:        cancel,
 		httpClient:    httpclient.New(httpclient.WithTimeout(0)),
 		serverReady:   make(chan struct{}),
 		processExited: make(chan struct{}),

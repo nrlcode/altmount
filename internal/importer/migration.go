@@ -67,4 +67,3 @@ func migrateNzbsToGz(ctx context.Context, nzbDir, sentinelPath string, updater f
 	}
 	return nil
 }
-

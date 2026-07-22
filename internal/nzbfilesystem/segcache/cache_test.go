@@ -162,4 +162,3 @@ func TestCacheCatalogSurvivesMissingSegFiles(t *testing.T) {
 	assert.True(t, c2.Has("good@msg"))
 	assert.False(t, c2.Has("bad@msg"), "entry with missing seg file should be dropped on reload")
 }
-

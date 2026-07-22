@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-
 func TestDeleteFileMetadataWithSourceNzb_RemovesMetadata(t *testing.T) {
 	root := t.TempDir()
 	ms := NewMetadataService(root)

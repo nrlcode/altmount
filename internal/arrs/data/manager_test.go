@@ -16,7 +16,7 @@ func TestManager_ClearCaches(t *testing.T) {
 	m.movieCache["radarr1"] = []*radarr.Movie{{ID: 1}}
 	m.seriesCache["sonarr1"] = []*sonarr.Series{{ID: 2}}
 	m.episodeFilesCache["sonarr_episode_files_sonarr1_10"] = []*sonarr.EpisodeFile{{ID: 3}}
-	
+
 	m.cacheExpiry["radarr1"] = time.Now().Add(10 * time.Minute)
 	m.cacheExpiry["sonarr1"] = time.Now().Add(10 * time.Minute)
 	m.cacheExpiry["sonarr_episode_files_sonarr1_10"] = time.Now().Add(10 * time.Minute)

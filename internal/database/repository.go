@@ -1419,7 +1419,7 @@ func (r *Repository) GetProviderHistoricalStats(ctx context.Context, days int, i
 		if err := rows.Scan(&tsRaw, &stat.ProviderID, &stat.BytesDownloaded); err != nil {
 			return nil, fmt.Errorf("failed to scan provider historical stat: %w", err)
 		}
-		
+
 		switch v := tsRaw.(type) {
 		case time.Time:
 			stat.Timestamp = v

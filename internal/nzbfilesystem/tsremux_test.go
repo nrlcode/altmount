@@ -68,7 +68,7 @@ func setPCR(p []byte, pcrBase int64) []byte {
 	b[1] = byte(pcrBase >> 17)
 	b[2] = byte(pcrBase >> 9)
 	b[3] = byte(pcrBase >> 1)
-	b[4] = byte((pcrBase&0x01)<<7) // ext = 0
+	b[4] = byte((pcrBase & 0x01) << 7) // ext = 0
 	b[5] = 0x00
 	return p
 }

@@ -17,12 +17,12 @@ type SymlinkLookup interface {
 
 // RewriteReport summarizes results of a symlink rewrite operation.
 type RewriteReport struct {
-	Scanned             int
-	Matched             int
-	Rewritten           int
-	SkippedWrongPrefix  int      // symlinks whose target didn't point at sourceMountPath/.ids/ — usually a misconfigured mount path
-	Unmatched           []string // symlink paths that had no matching migration row
-	Errors              []string // errors encountered (non-fatal)
+	Scanned            int
+	Matched            int
+	Rewritten          int
+	SkippedWrongPrefix int      // symlinks whose target didn't point at sourceMountPath/.ids/ — usually a misconfigured mount path
+	Unmatched          []string // symlink paths that had no matching migration row
+	Errors             []string // errors encountered (non-fatal)
 }
 
 // RewriteLibrarySymlinks walks libraryPath, finds symlinks (real OS symlinks or

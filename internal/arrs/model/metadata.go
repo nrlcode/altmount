@@ -63,4 +63,3 @@ type WebhookMetadata struct {
 	Book         *BookMetadata        `json:"book,omitempty"`
 	BookFile     *BookFileMetadata    `json:"bookFile,omitempty"`
 }
-

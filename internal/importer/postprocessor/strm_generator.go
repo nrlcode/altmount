@@ -200,4 +200,3 @@ func (c *Coordinator) CreateSingleStrmFile(ctx context.Context, strmResultingPat
 
 	return nil
 }
-

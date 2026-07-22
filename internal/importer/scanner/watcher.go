@@ -20,7 +20,6 @@ type WatchQueueAdder interface {
 	IsFileInQueue(ctx context.Context, filePath string) (bool, error)
 }
 
-
 // Watcher handles monitoring a directory for new NZB files
 type Watcher struct {
 	queueAdder   WatchQueueAdder

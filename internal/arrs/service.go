@@ -290,7 +290,6 @@ func (s *Service) ClearInstanceCache(ctx context.Context, instanceName string) {
 	s.data.ClearSeriesCache(instanceName)
 }
 
-
 // DiscoverFileMetadata attempts to discover the rich metadata for a file through the appropriate ARR instance
 func (s *Service) DiscoverFileMetadata(ctx context.Context, filePath, relativePath, nzbName, libraryPath string) (*model.WebhookMetadata, error) {
 	return s.scanner.DiscoverFileMetadata(ctx, filePath, relativePath, nzbName, libraryPath)

@@ -28,9 +28,9 @@ type RepairCoalescer struct {
 	rclone       rclonecli.RcloneRcClient
 	configGetter config.ConfigGetter
 
-	debounceTTL  time.Duration
-	flushDelay   time.Duration
-	refreshTO    time.Duration
+	debounceTTL time.Duration
+	flushDelay  time.Duration
+	refreshTO   time.Duration
 
 	mu      sync.Mutex
 	seen    map[string]time.Time
