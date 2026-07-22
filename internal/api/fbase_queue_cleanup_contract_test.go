@@ -3,7 +3,9 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -78,6 +80,58 @@ func requireQueueItemExists(t *testing.T, repo *database.Repository, id int64, w
 	}
 }
 
+func requireQueueItemStatus(t *testing.T, repo *database.Repository, id int64, want database.QueueStatus) {
+	t.Helper()
+	item, err := repo.GetQueueItem(context.Background(), id)
+	require.NoError(t, err)
+	require.NotNil(t, item)
+	assert.Equal(t, want, item.Status)
+}
+
+func (e *queueCleanupTestEnv) addSymlinkEscapedItem(
+	t *testing.T,
+	status database.QueueStatus,
+	downloadID ...string,
+) (*database.ImportQueueItem, string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(e.ownedRoot, 0o755))
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.nzb")
+	require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
+	require.NoError(t, os.Symlink(outside, filepath.Join(e.ownedRoot, "escape")))
+	item := e.addItem(t, filepath.Join(e.ownedRoot, "escape", "victim.nzb"), status, downloadID...)
+	return item, victim
+}
+
+func (e *queueCleanupTestEnv) addHistory(t *testing.T, item *database.ImportQueueItem, nzbName string) {
+	t.Helper()
+	nzbID := item.ID
+	require.NoError(t, e.repo.AddImportHistory(context.Background(), &database.ImportHistory{
+		DownloadID:  item.DownloadID,
+		NzbID:       &nzbID,
+		NzbName:     nzbName,
+		FileName:    "payload.mkv",
+		FileSize:    123,
+		VirtualPath: "/library/payload.mkv",
+		CompletedAt: time.Now(),
+	}))
+}
+
+func requireSABDeleteResponse(t *testing.T, resp *http.Response, wantStatus bool) {
+	t.Helper()
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	defer resp.Body.Close()
+	var body SABnzbdDeleteResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.Equal(t, wantStatus, body.Status)
+	if wantStatus {
+		assert.Nil(t, body.Error)
+		return
+	}
+	require.NotNil(t, body.Error)
+	assert.NotEmpty(t, *body.Error)
+}
+
 func TestQueueDeleteRejectsUnownedPersistedPathBeforeRowRemoval(t *testing.T) {
 	env := newQueueCleanupTestEnv(t)
 	unowned := filepath.Join(t.TempDir(), "operator-source.nzb")
@@ -98,12 +152,7 @@ func TestQueueDeleteRejectsSymlinkedOwnedParentBeforeRowRemoval(t *testing.T) {
 		t.Skip("symlink authority test requires Unix symlink semantics")
 	}
 	env := newQueueCleanupTestEnv(t)
-	require.NoError(t, os.MkdirAll(env.ownedRoot, 0o755))
-	outside := t.TempDir()
-	victim := filepath.Join(outside, "victim.nzb")
-	require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
-	require.NoError(t, os.Symlink(outside, filepath.Join(env.ownedRoot, "escape")))
-	item := env.addItem(t, filepath.Join(env.ownedRoot, "escape", "victim.nzb"), database.QueueStatusFailed)
+	item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusFailed)
 
 	app := fiber.New()
 	app.Delete("/queue/:id", env.server.handleDeleteQueue)
@@ -111,7 +160,25 @@ func TestQueueDeleteRejectsSymlinkedOwnedParentBeforeRowRemoval(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
 	assert.FileExists(t, victim)
-	requireQueueItemExists(t, env.repo, item.ID, true)
+	requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusFailed)
+}
+
+func TestQueueDeleteRetainsRowWhenContainedDirectoryCleanupFails(t *testing.T) {
+	env := newQueueCleanupTestEnv(t)
+	target := filepath.Join(env.ownedRoot, "non-empty.nzb")
+	require.NoError(t, os.MkdirAll(target, 0o755))
+	child := filepath.Join(target, "payload")
+	require.NoError(t, os.WriteFile(child, []byte("keep"), 0o600))
+	item := env.addItem(t, target, database.QueueStatusFailed)
+
+	app := fiber.New()
+	app.Delete("/queue/:id", env.server.handleDeleteQueue)
+	resp, err := app.Test(httptest.NewRequest("DELETE", fmt.Sprintf("/queue/%d", item.ID), nil))
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
+	assert.DirExists(t, target)
+	assert.FileExists(t, child)
+	requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusFailed)
 }
 
 func TestQueueBulkDeleteCleansOwnedFiles(t *testing.T) {
@@ -141,6 +208,34 @@ func TestQueueBulkDeleteCleansOwnedFiles(t *testing.T) {
 	}
 }
 
+func TestQueueBulkDeleteStopsAfterOwnedCleanupFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
+	env := newQueueCleanupTestEnv(t)
+	require.NoError(t, os.MkdirAll(env.ownedRoot, 0o755))
+
+	ownedPath := filepath.Join(env.ownedRoot, "first-owned.nzb")
+	require.NoError(t, os.WriteFile(ownedPath, []byte("delete"), 0o600))
+	owned := env.addItem(t, ownedPath, database.QueueStatusPending)
+	failing, victim := env.addSymlinkEscapedItem(t, database.QueueStatusFailed)
+	require.Less(t, owned.ID, failing.ID, "fixture IDs must preserve request order")
+
+	app := fiber.New()
+	app.Delete("/queue/bulk", env.server.handleDeleteQueueBulk)
+	body := fmt.Sprintf(`{"ids":[%d,%d]}`, owned.ID, failing.ID)
+	req := httptest.NewRequest("DELETE", "/queue/bulk", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
+
+	assert.NoFileExists(t, ownedPath, "the earlier owned item completes before the later failure")
+	requireQueueItemExists(t, env.repo, owned.ID, false)
+	assert.FileExists(t, victim)
+	requireQueueItemStatus(t, env.repo, failing.ID, database.QueueStatusFailed)
+}
+
 func TestQueueStatusClearPreservesOwnershipWhenCleanupFails(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -157,12 +252,7 @@ func TestQueueStatusClearPreservesOwnershipWhenCleanupFails(t *testing.T) {
 				t.Skip("symlink authority test requires Unix symlink semantics")
 			}
 			env := newQueueCleanupTestEnv(t)
-			require.NoError(t, os.MkdirAll(env.ownedRoot, 0o755))
-			outside := t.TempDir()
-			victim := filepath.Join(outside, "victim.nzb")
-			require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
-			require.NoError(t, os.Symlink(outside, filepath.Join(env.ownedRoot, "escape")))
-			item := env.addItem(t, filepath.Join(env.ownedRoot, "escape", "victim.nzb"), tt.status)
+			item, victim := env.addSymlinkEscapedItem(t, tt.status)
 
 			app := fiber.New()
 			switch tt.status {
@@ -177,9 +267,41 @@ func TestQueueStatusClearPreservesOwnershipWhenCleanupFails(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
 			assert.FileExists(t, victim)
-			requireQueueItemExists(t, env.repo, item.ID, true)
+			requireQueueItemStatus(t, env.repo, item.ID, tt.status)
 		})
 	}
+}
+
+func TestSystemCleanupRetainsCompletedRowWhenCleanupFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
+	env := newQueueCleanupTestEnv(t)
+	item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusCompleted)
+
+	app := fiber.New()
+	app.Post("/system/cleanup", env.server.handleSystemCleanup)
+	resp, err := app.Test(httptest.NewRequest("POST", "/system/cleanup", nil))
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
+	assert.FileExists(t, victim)
+	requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusCompleted)
+}
+
+func TestResetSystemStatsSurfacesQueueCleanupFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
+	env := newQueueCleanupTestEnv(t)
+	item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusFailed)
+
+	app := fiber.New()
+	app.Post("/system/stats/reset", env.server.handleResetSystemStats)
+	resp, err := app.Test(httptest.NewRequest("POST", "/system/stats/reset?reset_queue=true", nil))
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
+	assert.FileExists(t, victim)
+	requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusFailed)
 }
 
 func TestSABQueueDeletionCleansOwnedFileForEveryIdentifier(t *testing.T) {
@@ -208,4 +330,89 @@ func TestSABQueueDeletionCleansOwnedFileForEveryIdentifier(t *testing.T) {
 			requireQueueItemExists(t, env.repo, item.ID, false)
 		})
 	}
+}
+
+func TestSABQueueDeletionReportsCleanupFailureForEveryIdentifier(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
+	tests := []struct {
+		name       string
+		downloadID string
+		value      func(*database.ImportQueueItem) string
+	}{
+		{name: "numeric id", value: func(item *database.ImportQueueItem) string { return fmt.Sprint(item.ID) }},
+		{name: "download id", downloadID: "sab-queue-failure", value: func(item *database.ImportQueueItem) string { return *item.DownloadID }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newQueueCleanupTestEnv(t)
+			item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusPending, tt.downloadID)
+
+			app := fiber.New()
+			app.Get("/sab", env.server.handleSABnzbdQueueDelete)
+			resp, err := app.Test(httptest.NewRequest("GET", "/sab?value="+tt.value(item), nil))
+			require.NoError(t, err)
+			requireSABDeleteResponse(t, resp, false)
+			assert.FileExists(t, victim)
+			requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusPending)
+		})
+	}
+}
+
+func TestSABHistoryDeletionReportsQueueCleanupFailureForEveryIdentifier(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
+	tests := []struct {
+		name       string
+		downloadID string
+		value      func(*database.ImportQueueItem) string
+	}{
+		{name: "numeric queue id", downloadID: "sab-history-numeric", value: func(item *database.ImportQueueItem) string { return fmt.Sprint(item.ID) }},
+		{name: "download id", downloadID: "sab-history-download", value: func(item *database.ImportQueueItem) string { return *item.DownloadID }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newQueueCleanupTestEnv(t)
+			item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusCompleted, tt.downloadID)
+			env.addHistory(t, item, "queue-backed.nzb")
+
+			app := fiber.New()
+			app.Get("/sab-history", env.server.handleSABnzbdHistoryDelete)
+			resp, err := app.Test(httptest.NewRequest("GET", "/sab-history?value="+tt.value(item), nil))
+			require.NoError(t, err)
+			requireSABDeleteResponse(t, resp, false)
+			assert.FileExists(t, victim)
+			requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusCompleted)
+			history, historyErr := env.repo.GetImportHistoryByNzbID(context.Background(), item.ID)
+			require.NoError(t, historyErr)
+			require.NotNil(t, history, "cleanup failure must retain associated history")
+		})
+	}
+}
+
+func TestSABHistoryOnlyDeletionDoesNotTreatNzbNameAsPathAuthority(t *testing.T) {
+	env := newQueueCleanupTestEnv(t)
+	victim := filepath.Join(t.TempDir(), "history-name-is-not-authority.nzb")
+	require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
+	downloadID := "history-only-download"
+	require.NoError(t, env.repo.AddImportHistory(context.Background(), &database.ImportHistory{
+		DownloadID:  &downloadID,
+		NzbName:     victim,
+		FileName:    "payload.mkv",
+		FileSize:    123,
+		VirtualPath: "/library/history-only.mkv",
+		CompletedAt: time.Now(),
+	}))
+
+	app := fiber.New()
+	app.Get("/sab-history", env.server.handleSABnzbdHistoryDelete)
+	resp, err := app.Test(httptest.NewRequest("GET", "/sab-history?value="+downloadID, nil))
+	require.NoError(t, err)
+	requireSABDeleteResponse(t, resp, true)
+	assert.FileExists(t, victim, "history nzb_name is display metadata, not deletion authority")
+	history, historyErr := env.repo.GetImportHistoryByDownloadID(context.Background(), downloadID)
+	require.NoError(t, historyErr)
+	require.Nil(t, history)
 }
