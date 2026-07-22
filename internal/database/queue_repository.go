@@ -253,20 +253,27 @@ func (r *QueueRepository) AddStoragePath(ctx context.Context, itemID int64, stor
 // It matches exact paths, rooted basename paths, and legacy ID-prefixed names.
 func (r *QueueRepository) IsFileInQueue(ctx context.Context, filePath string) (bool, error) {
 	filename := filepath.Base(filePath)
-	query := `SELECT 1 FROM import_queue WHERE (nzb_path = ? OR nzb_path LIKE ? ESCAPE '\' OR nzb_path LIKE ? ESCAPE '\') AND status IN ('pending', 'processing', 'paused') LIMIT 1`
+	query := `SELECT id, nzb_path FROM import_queue WHERE (nzb_path = ? OR nzb_path LIKE ? ESCAPE '\' OR nzb_path LIKE ? ESCAPE '\') AND status IN ('pending', 'processing', 'paused')`
 	legacyPattern := "%-" + escapeLikePattern(filename)
 	rootedPattern := "%" + escapeLikePattern(string(filepath.Separator)+filename)
 
-	var exists int
-	err := r.db.QueryRowContext(ctx, query, filePath, legacyPattern, rootedPattern).Scan(&exists)
+	rows, err := r.db.QueryContext(ctx, query, filePath, legacyPattern, rootedPattern)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return false, nil
-		}
 		return false, fmt.Errorf("failed to check if file in queue: %w", err)
 	}
-
-	return true, nil
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var queuedPath string
+		if err := rows.Scan(&id, &queuedPath); err != nil {
+			return false, fmt.Errorf("scan queued file candidate: %w", err)
+		}
+		queuedName := filepath.Base(queuedPath)
+		if queuedPath == filePath || queuedName == filename || queuedName == fmt.Sprintf("%d-%s", id, filename) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // ClaimNextQueueItem atomically claims and returns the next available queue item
