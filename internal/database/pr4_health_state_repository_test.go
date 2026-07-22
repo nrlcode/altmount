@@ -76,39 +76,48 @@ func TestPR4ProviderRegistryAllowsAnonymousAccountIdentity(t *testing.T) {
 	assert.Empty(t, generations[0].Account)
 }
 
-func TestPR4ProviderRegistryDoesNotCollapseAmbiguousConfiguredIdentities(t *testing.T) {
-	_, repo := newPR4Repository(t)
-	providers, err := repo.ReconcileProviders(context.Background(), []ProviderSpec{
-		{DisplayName: "Account A", Endpoint: "shared.example.invalid", Port: 119, Account: "shared", Role: ProviderRolePrimary, Order: 0},
-		{DisplayName: "Account B", Endpoint: "shared.example.invalid", Port: 119, Account: "shared", Role: ProviderRolePrimary, Order: 1},
+func TestPR4ProviderRegistryRejectsDuplicateConfiguredIdentitiesBeforeMutation(t *testing.T) {
+	forEachFACORECHG007IdentityBackend(t, func(t *testing.T, backend chg007IdentityBackend) {
+		ctx := context.Background()
+		suffix := uuid.NewString()
+		_, err := backend.repo.ReconcileProviders(ctx, []ProviderSpec{{
+			StableID: "retained-provider-" + suffix, DisplayName: "Retained",
+			Endpoint: "retained-" + suffix + ".example.invalid", Port: 119, Account: "retained",
+			Role: ProviderRolePrimary, Order: 0,
+		}})
+		require.NoError(t, err)
+		before := chg007CapturePreexistingRegistryState(t, ctx, backend.db, backend.repo)
+
+		_, err = backend.repo.ReconcileProviders(ctx, []ProviderSpec{
+			{DisplayName: "Account A", Endpoint: " Shared-" + suffix + ".Example.Invalid. ", Port: 119, Account: " shared ", Role: ProviderRolePrimary, Order: 0},
+			{DisplayName: "Account B", Endpoint: "shared-" + suffix + ".example.invalid", Port: 119, Account: "shared", Role: ProviderRoleBackup, Order: 1},
+		})
+		assert.ErrorContains(t, err, "duplicate provider identity")
+		assertCHG007PreexistingRegistryStatePreserved(t, ctx, backend.db, backend.repo, before)
 	})
-	require.NoError(t, err)
-	require.Len(t, providers, 2)
-	assert.NotEqual(t, providers[0].ID, providers[1].ID,
-		"ambiguous configured identities need distinct stable records rather than accidental relinking")
-	assert.NoError(t, uuid.Validate(providers[0].ID))
-	assert.NoError(t, uuid.Validate(providers[1].ID))
 }
 
-func TestPR4ProviderRegistryDoesNotRelinkAnIdentityClaimedInSameReconcile(t *testing.T) {
-	_, repo := newPR4Repository(t)
-	ctx := context.Background()
-	initial, err := repo.ReconcileProviders(ctx, []ProviderSpec{
-		{StableID: "stable-provider", DisplayName: "Original", Endpoint: "old.example.invalid", Port: 119, Account: "account", Role: ProviderRolePrimary, Order: 0},
-	})
-	require.NoError(t, err)
-	require.Len(t, initial, 1)
+func TestPR4ProviderRegistryRejectsIdentityClaimedInSameReconcile(t *testing.T) {
+	forEachFACORECHG007IdentityBackend(t, func(t *testing.T, backend chg007IdentityBackend) {
+		ctx := context.Background()
+		suffix := uuid.NewString()
+		providerID := "stable-provider-" + suffix
+		initial, err := backend.repo.ReconcileProviders(ctx, []ProviderSpec{{
+			StableID: providerID, DisplayName: "Original",
+			Endpoint: "old-" + suffix + ".example.invalid", Port: 119, Account: "account",
+			Role: ProviderRolePrimary, Order: 0,
+		}})
+		require.NoError(t, err)
+		require.Len(t, initial, 1)
+		before := chg007CapturePreexistingRegistryState(t, ctx, backend.db, backend.repo)
 
-	reconciled, err := repo.ReconcileProviders(ctx, []ProviderSpec{
-		{StableID: "stable-provider", DisplayName: "Moved", Endpoint: "new.example.invalid", Port: 119, Account: "account", Role: ProviderRolePrimary, Order: 0},
-		{DisplayName: "Replacement", Endpoint: "old.example.invalid", Port: 119, Account: "account", Role: ProviderRolePrimary, Order: 1},
+		_, err = backend.repo.ReconcileProviders(ctx, []ProviderSpec{
+			{StableID: providerID, DisplayName: "Moved", Endpoint: "new-" + suffix + ".example.invalid", Port: 119, Account: "account", Role: ProviderRolePrimary, Order: 0},
+			{DisplayName: "Replacement", Endpoint: "old-" + suffix + ".example.invalid", Port: 119, Account: "account", Role: ProviderRolePrimary, Order: 1},
+		})
+		assert.ErrorContains(t, err, "retained provider identity")
+		assertCHG007PreexistingRegistryStatePreserved(t, ctx, backend.db, backend.repo, before)
 	})
-	require.NoError(t, err)
-	require.Len(t, reconciled, 2)
-	assert.Equal(t, "stable-provider", reconciled[0].ID)
-	assert.NotEqual(t, "stable-provider", reconciled[1].ID,
-		"historical identity lookup must not steal an ID explicitly claimed elsewhere in the same configuration")
-	assert.NoError(t, uuid.Validate(reconciled[1].ID))
 }
 
 func TestPR4ProviderHistoryCannotBeDeletedInsteadOfTombstoned(t *testing.T) {
