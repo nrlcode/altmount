@@ -8,10 +8,14 @@ import (
 	"hash"
 
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
-	"google.golang.org/protobuf/proto"
 )
 
-const segmentLayoutFingerprintVersion = "altmount-segment-layout-v1"
+const segmentLayoutFingerprintVersion = "altmount-segment-layout-v2"
+
+type fingerprintSegmentSliceKey struct {
+	first  **metapb.SegmentData
+	length int
+}
 
 // CanonicalSegmentLayoutFingerprint returns a representation-independent digest
 // of the final ordered article layout and virtual file size. Mutable health,
@@ -24,81 +28,99 @@ func CanonicalSegmentLayoutFingerprint(meta *metapb.FileMetadata) (string, error
 	if meta.FileSize < 0 {
 		return "", fmt.Errorf("virtual file size must be non-negative")
 	}
-	if err := validateResolvedFingerprintLayout(meta); err != nil {
-		return "", err
-	}
-
-	// Expansion happens on a clone so callers do not observe a storage-shape
-	// mutation. The canonical encoding ignores SharedOuterSourceIndex itself,
-	// making compact and already-expanded metadata structurally identical.
-	canonical := proto.Clone(meta).(*metapb.FileMetadata)
-	if err := ExpandSharedOuterSources(canonical); err != nil {
-		return "", fmt.Errorf("expand shared nested sources: %w", err)
-	}
 
 	digest := sha256.New()
 	writeFingerprintString(digest, segmentLayoutFingerprintVersion)
-	writeFingerprintInt64(digest, canonical.FileSize)
+	writeFingerprintInt64(digest, meta.FileSize)
 
-	writeFingerprintUint64(digest, uint64(len(canonical.SegmentData)))
-	for i, segment := range canonical.SegmentData {
-		if err := writeFingerprintSegment(digest, segment); err != nil {
-			return "", fmt.Errorf("segment %d: %w", i, err)
+	if len(meta.NestedSources) == 0 {
+		writeFingerprintString(digest, "main")
+		if err := validateResolvedSegmentStorage(meta.SegmentData, meta.SegmentRuns, meta.SegmentRefs); err != nil {
+			return "", fmt.Errorf("main segment layout: %w", err)
 		}
+		segmentDigest, err := fingerprintSegmentList(meta.SegmentData)
+		if err != nil {
+			return "", fmt.Errorf("main segment layout: %w", err)
+		}
+		_, _ = digest.Write(segmentDigest[:])
+		return "sha256:" + hex.EncodeToString(digest.Sum(nil)), nil
 	}
 
-	writeFingerprintUint64(digest, uint64(len(canonical.NestedSources)))
-	for i, source := range canonical.NestedSources {
+	writeFingerprintString(digest, "nested")
+	writeFingerprintUint64(digest, uint64(len(meta.NestedSources)))
+	segmentDigests := make(map[fingerprintSegmentSliceKey][sha256.Size]byte)
+	for i, source := range meta.NestedSources {
 		if source == nil {
 			return "", fmt.Errorf("nested source %d is nil", i)
 		}
-		if source.InnerOffset < 0 || source.InnerLength < 0 || source.InnerVolumeSize < 0 {
+
+		segments := source.Segments
+		refs := source.SegmentRefs
+		innerVolumeSize := source.InnerVolumeSize
+		if source.SharedOuterSourceIndex < 0 {
+			return "", fmt.Errorf("nested source %d has invalid shared source reference", i)
+		}
+		if source.SharedOuterSourceIndex > 0 {
+			sharedIndex := int(source.SharedOuterSourceIndex) - 1
+			if sharedIndex < 0 || sharedIndex >= len(meta.SharedOuterSources) {
+				return "", fmt.Errorf("nested source %d has invalid shared source reference", i)
+			}
+			shared := meta.SharedOuterSources[sharedIndex]
+			if shared == nil {
+				return "", fmt.Errorf("nested source %d references a nil shared source", i)
+			}
+			segments = shared.Segments
+			refs = shared.SegmentRefs
+			if innerVolumeSize == 0 {
+				innerVolumeSize = shared.InnerVolumeSize
+			}
+		}
+		if source.InnerOffset < 0 || source.InnerLength < 0 || innerVolumeSize < 0 {
 			return "", fmt.Errorf("nested source %d has negative layout bounds", i)
+		}
+		if err := validateResolvedSegmentStorage(segments, nil, refs); err != nil {
+			return "", fmt.Errorf("nested source %d: %w", i, err)
+		}
+
+		key := fingerprintSegmentListKey(segments)
+		segmentDigest, ok := segmentDigests[key]
+		if !ok {
+			var err error
+			segmentDigest, err = fingerprintSegmentList(segments)
+			if err != nil {
+				return "", fmt.Errorf("nested source %d: %w", i, err)
+			}
+			segmentDigests[key] = segmentDigest
 		}
 		writeFingerprintInt64(digest, source.InnerOffset)
 		writeFingerprintInt64(digest, source.InnerLength)
-		writeFingerprintInt64(digest, source.InnerVolumeSize)
-		writeFingerprintUint64(digest, uint64(len(source.Segments)))
-		for j, segment := range source.Segments {
-			if err := writeFingerprintSegment(digest, segment); err != nil {
-				return "", fmt.Errorf("nested source %d segment %d: %w", i, j, err)
-			}
-		}
+		writeFingerprintInt64(digest, innerVolumeSize)
+		_, _ = digest.Write(segmentDigest[:])
 	}
 
 	return "sha256:" + hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-func validateResolvedFingerprintLayout(meta *metapb.FileMetadata) error {
-	if err := validateResolvedSegmentStorage(meta.SegmentData, meta.SegmentRuns, meta.SegmentRefs); err != nil {
-		return fmt.Errorf("main segment layout: %w", err)
+func fingerprintSegmentListKey(segments []*metapb.SegmentData) fingerprintSegmentSliceKey {
+	key := fingerprintSegmentSliceKey{length: len(segments)}
+	if len(segments) != 0 {
+		key.first = &segments[0]
 	}
-	for i, shared := range meta.SharedOuterSources {
-		if shared == nil {
-			return fmt.Errorf("shared nested source %d is nil", i)
-		}
-		if err := validateResolvedSegmentStorage(shared.Segments, nil, shared.SegmentRefs); err != nil {
-			return fmt.Errorf("shared nested source %d: %w", i, err)
-		}
-	}
-	for i, source := range meta.NestedSources {
-		if source == nil {
-			return fmt.Errorf("nested source %d is nil", i)
-		}
-		if source.SharedOuterSourceIndex < 0 ||
-			int(source.SharedOuterSourceIndex) > len(meta.SharedOuterSources) {
-			return fmt.Errorf("nested source %d has invalid shared source reference", i)
-		}
-		if source.SharedOuterSourceIndex > 0 && meta.SharedOuterSources[source.SharedOuterSourceIndex-1] == nil {
-			return fmt.Errorf("nested source %d references a nil shared source", i)
-		}
-		if source.SharedOuterSourceIndex == 0 {
-			if err := validateResolvedSegmentStorage(source.Segments, nil, source.SegmentRefs); err != nil {
-				return fmt.Errorf("nested source %d: %w", i, err)
-			}
+	return key
+}
+
+func fingerprintSegmentList(segments []*metapb.SegmentData) ([sha256.Size]byte, error) {
+	digest := sha256.New()
+	writeFingerprintString(digest, segmentLayoutFingerprintVersion+"/segment-list")
+	writeFingerprintUint64(digest, uint64(len(segments)))
+	for i, segment := range segments {
+		if err := writeFingerprintSegment(digest, segment); err != nil {
+			return [sha256.Size]byte{}, fmt.Errorf("segment %d: %w", i, err)
 		}
 	}
-	return nil
+	var result [sha256.Size]byte
+	digest.Sum(result[:0])
+	return result, nil
 }
 
 func validateResolvedSegmentStorage(segments []*metapb.SegmentData, runs []*metapb.SegmentRun, refs []*metapb.SegmentRef) error {
