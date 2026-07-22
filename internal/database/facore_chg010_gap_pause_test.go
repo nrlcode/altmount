@@ -492,9 +492,9 @@ func TestFACORECHG010PausePreservesEvidenceAndSerializesCommit(t *testing.T) {
 			RetryKey: "pause-retry", SegmentStart: 2, SegmentCount: 1,
 			Outcome: "temporary_failure", Attempt: 1, NextAttemptAt: f.now.Add(time.Minute),
 		}
+		require.NoError(t, f.repo.RequestRunPause(ctx, f.run.ID, true, f.now.Add(2*time.Minute)))
 		before, err := f.repo.CommitHealthChunk(ctx, commit)
 		require.NoError(t, err)
-		require.NoError(t, f.repo.RequestRunPause(ctx, f.run.ID, true, f.now.Add(2*time.Minute)))
 		after, err := api.AcknowledgeRunPause(ctx, f.run.ID, "evidence-owner",
 			lease.FencingToken, f.now.Add(3*time.Minute))
 		require.NoError(t, err)
