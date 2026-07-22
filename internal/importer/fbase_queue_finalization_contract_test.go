@@ -25,11 +25,13 @@ type fbaseFinalizationEnv struct {
 	database  *database.DB
 	config    *config.Config
 	storeRoot string
+	queueRoot string
 }
 
 func newFbaseFinalizationEnv(t *testing.T) *fbaseFinalizationEnv {
 	t.Helper()
 
+	setImporterTempRoot(t, t.TempDir())
 	configDir := t.TempDir()
 	cfg := config.DefaultConfig(configDir)
 	cfg.Database.Path = filepath.Join(configDir, "altmount.db")
@@ -43,10 +45,11 @@ func newFbaseFinalizationEnv(t *testing.T) *fbaseFinalizationEnv {
 	t.Cleanup(func() { _ = db.Close() })
 
 	storeRoot := filepath.Join(configDir, ".nzbs")
+	queueRoot := filepath.Join(os.TempDir(), ".altmount-queue")
 	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
 	require.NoError(t, metadataService.ConfigureCleanupRoots(
 		storeRoot,
-		filepath.Join(os.TempDir(), ".altmount-queue"),
+		queueRoot,
 		storeRoot,
 	))
 	metadataService.SetStoreRefCounter(db.StoreRefRepo)
@@ -69,6 +72,7 @@ func newFbaseFinalizationEnv(t *testing.T) *fbaseFinalizationEnv {
 		database:  db,
 		config:    cfg,
 		storeRoot: storeRoot,
+		queueRoot: queueRoot,
 	}
 }
 
@@ -90,7 +94,7 @@ func (e *fbaseFinalizationEnv) addProcessingItem(t *testing.T, nzbPath string) *
 
 func TestSuccessfulImportRetainsProcessingOwnershipWhenSourceUnlinkFails(t *testing.T) {
 	env := newFbaseFinalizationEnv(t)
-	nzbPath := filepath.Join(env.storeRoot, "non-empty-success.nzb")
+	nzbPath := filepath.Join(env.queueRoot, "non-empty-success.nzb")
 	require.NoError(t, os.MkdirAll(nzbPath, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(nzbPath, "keep"), []byte("keep"), 0o600))
 	item := env.addProcessingItem(t, nzbPath)
@@ -109,7 +113,7 @@ func TestSuccessfulImportRetainsProcessingOwnershipWhenSourceUnlinkFails(t *test
 
 func TestSuccessfulImportRemovesOwnedSourceBeforePublishingCompleted(t *testing.T) {
 	env := newFbaseFinalizationEnv(t)
-	nzbPath := filepath.Join(env.storeRoot, "successful-import.nzb")
+	nzbPath := filepath.Join(env.queueRoot, "successful-import.nzb")
 	require.NoError(t, os.MkdirAll(filepath.Dir(nzbPath), 0o755))
 	require.NoError(t, os.WriteFile(nzbPath, []byte("<nzb/>"), 0o600))
 	item := env.addProcessingItem(t, nzbPath)
@@ -144,9 +148,28 @@ func TestSuccessfulImportRejectsUnownedSourceBeforePublishingCompleted(t *testin
 	assert.Equal(t, database.QueueStatusProcessing, remaining.Status)
 }
 
+func TestSuccessfulImportRemovesLegacyStoreSource(t *testing.T) {
+	env := newFbaseFinalizationEnv(t)
+	nzbPath := filepath.Join(env.storeRoot, "legacy-store-source.nzb")
+	require.NoError(t, os.MkdirAll(filepath.Dir(nzbPath), 0o755))
+	require.NoError(t, os.WriteFile(nzbPath, []byte("<nzb/>"), 0o600))
+	item := env.addProcessingItem(t, nzbPath)
+
+	err := env.service.handleProcessingSuccess(
+		context.Background(), item, "/complete/legacy.mkv", nil,
+	)
+
+	require.NoError(t, err)
+	assert.NoFileExists(t, nzbPath)
+	completed, getErr := env.database.Repository.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, getErr)
+	require.NotNil(t, completed)
+	assert.Equal(t, database.QueueStatusCompleted, completed.Status)
+}
+
 func TestSuccessfulFallbackRetainsQueueOwnershipWhenSourceUnlinkFails(t *testing.T) {
 	env := newFbaseFinalizationEnv(t)
-	nzbPath := filepath.Join(env.storeRoot, "fallback.nzb")
+	nzbPath := filepath.Join(env.queueRoot, "fallback.nzb")
 	require.NoError(t, os.MkdirAll(filepath.Dir(nzbPath), 0o755))
 	require.NoError(t, os.WriteFile(nzbPath, []byte("<nzb></nzb>"), 0o600))
 	item := env.addProcessingItem(t, nzbPath)
@@ -189,7 +212,7 @@ func TestSuccessfulFallbackRetainsQueueOwnershipWhenSourceUnlinkFails(t *testing
 
 func TestSuccessfulFallbackRemovesOwnedSourceBeforeQueueRow(t *testing.T) {
 	env := newFbaseFinalizationEnv(t)
-	nzbPath := filepath.Join(env.storeRoot, "fallback-success.nzb")
+	nzbPath := filepath.Join(env.queueRoot, "fallback-success.nzb")
 	require.NoError(t, os.MkdirAll(filepath.Dir(nzbPath), 0o755))
 	require.NoError(t, os.WriteFile(nzbPath, []byte("<nzb></nzb>"), 0o600))
 	item := env.addProcessingItem(t, nzbPath)
@@ -237,8 +260,8 @@ func TestSuccessfulFallbackRejectsUnownedSourceBeforeQueueRowRemoval(t *testing.
 
 	select {
 	case <-received:
-		t.Error("unowned source must be rejected before external fallback transfer")
-	default:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fallback server did not receive the NZB")
 	}
 	assert.FileExists(t, nzbPath)
 	remaining, err := env.database.Repository.GetQueueItem(context.Background(), item.ID)

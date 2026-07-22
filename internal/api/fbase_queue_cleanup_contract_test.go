@@ -709,6 +709,20 @@ func TestManualImportFilePublishesOnlyRootedQueueAuthority(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, ".", rel)
 	require.True(t, filepath.IsLocal(rel), "persisted path must be a strict queue-root child")
+	rootInfo, rootErr := os.Lstat(queueRoot)
+	require.NoError(t, rootErr)
+	require.True(t, rootInfo.IsDir())
+	require.Zero(t, rootInfo.Mode()&os.ModeSymlink, "queue root must not be a symlink")
+	for current := item.NzbPath; current != queueRoot; current = filepath.Dir(current) {
+		info, statErr := os.Lstat(current)
+		require.NoError(t, statErr)
+		require.Zero(t, info.Mode()&os.ModeSymlink, "%q must not be a symlink", current)
+		if current == item.NzbPath {
+			require.True(t, info.Mode().IsRegular(), "persisted queue authority must be a regular file")
+		} else {
+			require.True(t, info.IsDir(), "persisted queue parents must be directories")
+		}
+	}
 	assert.FileExists(t, item.NzbPath)
 }
 

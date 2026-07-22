@@ -192,6 +192,58 @@ func TestMoveToFailedFolderRejectsCategoryTraversal(t *testing.T) {
 	assert.Equal(t, source, stored.NzbPath)
 }
 
+func TestMoveToFailedFolderRejectsUnownedLegacySource(t *testing.T) {
+	svc := newMoveToFailedTestService(t)
+	source := filepath.Join(t.TempDir(), "operator-source.nzb")
+	require.NoError(t, os.WriteFile(source, []byte("keep"), 0o600))
+	item := &database.ImportQueueItem{
+		NzbPath: source, Status: database.QueueStatusFailed, MaxRetries: 3,
+	}
+	require.NoError(t, svc.database.Repository.AddToQueue(context.Background(), item))
+	destination := filepath.Join(svc.GetFailedNzbFolder(), filepath.Base(source))
+
+	err := svc.MoveToFailedFolder(context.Background(), item)
+
+	require.Error(t, err)
+	assert.FileExists(t, source)
+	assert.NoFileExists(t, destination)
+	stored, getErr := svc.database.Repository.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, getErr)
+	require.NotNil(t, stored)
+	assert.Equal(t, source, stored.NzbPath)
+}
+
+func TestMoveToFailedFolderRollsBackCopyWhenPathUpdateFails(t *testing.T) {
+	svc, db := newMoveToFailedTestServiceWithDB(t)
+	queueRoot := filepath.Join(os.TempDir(), ".altmount-queue")
+	require.NoError(t, os.MkdirAll(queueRoot, 0o755))
+	source := filepath.Join(queueRoot, "update-rollback.nzb")
+	require.NoError(t, os.WriteFile(source, []byte("keep"), 0o600))
+	item := &database.ImportQueueItem{
+		NzbPath: source, Status: database.QueueStatusFailed, MaxRetries: 3,
+	}
+	require.NoError(t, svc.database.Repository.AddToQueue(context.Background(), item))
+	_, err := db.Exec(`
+		CREATE TRIGGER reject_failed_path_update
+		BEFORE UPDATE OF nzb_path ON import_queue
+		BEGIN
+			SELECT RAISE(ABORT, 'injected failed-path update rejection');
+		END;
+	`)
+	require.NoError(t, err)
+	destination := filepath.Join(svc.GetFailedNzbFolder(), filepath.Base(source))
+
+	err = svc.MoveToFailedFolder(context.Background(), item)
+
+	require.Error(t, err)
+	assert.FileExists(t, source, "a rejected path publication must retain the prior owned source")
+	assert.NoFileExists(t, destination, "a rejected path publication must not leak the staged destination")
+	stored, getErr := svc.database.Repository.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, getErr)
+	require.NotNil(t, stored)
+	assert.Equal(t, source, stored.NzbPath)
+}
+
 // TestCleanupFailedItems_RemovesNzbFile verifies that cleanupFailedItems removes
 // an owned NZB before purging its queue row.
 func TestCleanupFailedItems_RemovesNzbFile(t *testing.T) {

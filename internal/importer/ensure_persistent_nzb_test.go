@@ -259,6 +259,23 @@ func requireStrictChildPath(t *testing.T, root, path string) string {
 	require.NoError(t, err)
 	require.NotEqual(t, ".", rel)
 	require.True(t, filepath.IsLocal(rel), "%q must be a strict child of %q", path, root)
+	rootInfo, err := os.Lstat(root)
+	require.NoError(t, err)
+	require.True(t, rootInfo.IsDir())
+	require.Zero(t, rootInfo.Mode()&os.ModeSymlink, "queue root must not be a symlink")
+	components := strings.Split(filepath.Clean(rel), string(os.PathSeparator))
+	current := root
+	for i, component := range components {
+		current = filepath.Join(current, component)
+		info, statErr := os.Lstat(current)
+		require.NoError(t, statErr)
+		require.Zero(t, info.Mode()&os.ModeSymlink, "%q must not be a symlink", current)
+		if i < len(components)-1 {
+			require.True(t, info.IsDir(), "%q must be an unambiguous directory", current)
+		} else {
+			require.True(t, info.Mode().IsRegular(), "%q must be a regular file", current)
+		}
+	}
 	return rel
 }
 
