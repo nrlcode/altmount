@@ -58,31 +58,37 @@ func (r *HealthStateRepository) UpsertGapRange(ctx context.Context, write GapRan
 		if write.SegmentCount > revisionSegments || write.StartSegment > revisionSegments-write.SegmentCount {
 			return fmt.Errorf("gap range exceeds file revision segment count")
 		}
-		if requestedID != "" {
-			var existingRevision string
-			var existingKind GapKind
-			var existingStart, existingCount int64
-			var existingCreated time.Time
-			err := tx.QueryRowContext(ctx, `
-				SELECT file_revision_id, kind, start_segment, segment_count, created_at
-				FROM health_gap_ranges WHERE id = ?
-			`, requestedID).Scan(&existingRevision, &existingKind, &existingStart, &existingCount, &existingCreated)
+		var naturalID string
+		var naturalCreated time.Time
+		err := tx.QueryRowContext(ctx, `
+			SELECT id, created_at FROM health_gap_ranges
+			WHERE file_revision_id = ? AND kind = ? AND start_segment = ? AND segment_count = ?
+		`, write.FileRevisionID, write.Kind, write.StartSegment, write.SegmentCount).
+			Scan(&naturalID, &naturalCreated)
+		switch {
+		case err == nil:
+			if requestedID == naturalID && !naturalCreated.Equal(write.CreatedAt) {
+				return ErrHealthChunkConflict
+			}
+			write.ID = naturalID
+		case !errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("read natural health gap identity: %w", err)
+		case requestedID == "":
+			write.ID = uuid.NewString()
+		default:
+			var existingID string
+			err = tx.QueryRowContext(ctx,
+				`SELECT id FROM health_gap_ranges WHERE id = ?`, requestedID).Scan(&existingID)
 			switch {
 			case err == nil:
-				if existingRevision != write.FileRevisionID || existingKind != write.Kind ||
-					existingStart != write.StartSegment || existingCount != write.SegmentCount ||
-					!existingCreated.Equal(write.CreatedAt) {
-					return ErrHealthChunkConflict
-				}
+				return ErrHealthChunkConflict
 			case !errors.Is(err, sql.ErrNoRows):
 				return fmt.Errorf("read health gap identity: %w", err)
 			}
-		} else {
-			write.ID = uuid.NewString()
 		}
 
 		var canonicalID string
-		err := tx.QueryRowContext(ctx, `
+		err = tx.QueryRowContext(ctx, `
 			INSERT INTO health_gap_ranges
 				(id, file_revision_id, kind, start_segment, segment_count, status,
 				 created_at, confirmed_at, cleared_at)
