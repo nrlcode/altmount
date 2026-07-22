@@ -33,6 +33,7 @@ func newMoveToFailedTestService(t *testing.T) *Service {
 func newMoveToFailedTestServiceWithDB(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
 
+	setImporterTempRoot(t, t.TempDir())
 	configDir := t.TempDir()
 
 	// Use a per-test unique in-memory SQLite DB to avoid shared-cache collisions.
@@ -78,8 +79,9 @@ func newMoveToFailedTestServiceWithDB(t *testing.T) (*Service, *sql.DB) {
 
 	cfg := config.DefaultConfig(configDir)
 	storeRoot := filepath.Join(configDir, ".nzbs")
+	queueRoot := filepath.Join(os.TempDir(), ".altmount-queue")
 	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
-	require.NoError(t, metadataService.ConfigureCleanupRoots(storeRoot, storeRoot))
+	require.NoError(t, metadataService.ConfigureCleanupRoots(storeRoot, queueRoot, storeRoot))
 	cfgGetter := config.ConfigGetter(func() *config.Config { return cfg })
 
 	return &Service{

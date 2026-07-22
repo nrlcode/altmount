@@ -3,15 +3,17 @@ package importer
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,9 +22,15 @@ import (
 	"github.com/javi11/altmount/internal/metadata"
 )
 
+func setImporterTempRoot(t *testing.T, root string) {
+	t.Helper()
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(name, root)
+	}
+}
+
 // newMinimalServiceForPersistTest builds just enough of *Service to exercise
-// ensurePersistentNzb. It uses an in-memory SQLite database so no disk paths
-// are required.
+// ensurePersistentNzb.
 func newMinimalServiceForPersistTest(t *testing.T) *Service {
 	t.Helper()
 	service, _ := newMinimalServiceForPersistTestWithDB(t)
@@ -32,12 +40,17 @@ func newMinimalServiceForPersistTest(t *testing.T) *Service {
 func newMinimalServiceForPersistTestWithDB(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
 
-	// Open in-memory SQLite and run the minimal queue schema.
-	db, err := sql.Open("sqlite3", "file::memory:?cache=shared&_busy_timeout=5000")
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "queue.db")+"?_busy_timeout=5000")
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
+	setupMinimalPersistSchema(t, db)
+	return newMinimalServiceForPersistTestDB(t, db), db
+}
 
-	_, err = db.Exec(`
+func setupMinimalPersistSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS import_queue (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			download_id TEXT DEFAULT NULL,
@@ -67,6 +80,10 @@ func newMinimalServiceForPersistTestWithDB(t *testing.T) (*Service, *sql.DB) {
 		CREATE INDEX IF NOT EXISTS idx_queue_nzb_path ON import_queue(nzb_path);
 	`)
 	require.NoError(t, err)
+}
+
+func newMinimalServiceForPersistTestDB(t *testing.T, db *sql.DB) *Service {
+	t.Helper()
 
 	repo := database.NewQueueRepository(db, database.DialectSQLite)
 	dbWrapper := &database.DB{}
@@ -90,7 +107,7 @@ func newMinimalServiceForPersistTestWithDB(t *testing.T) (*Service, *sql.DB) {
 		log:             slog.Default(),
 		cancelFuncs:     make(map[int64]context.CancelFunc),
 		mu:              sync.RWMutex{},
-	}, db
+	}
 }
 
 func TestEnsurePersistentNzb_UsesOSTempQueueDir(t *testing.T) {
@@ -146,8 +163,11 @@ func TestEnsurePersistentNzb_AlreadyInTempQueueDir_IsNoop(t *testing.T) {
 }
 
 func TestEnsurePersistentNzbRejectsSymlinkedTempQueueRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
 	tempRoot := t.TempDir()
-	t.Setenv("TMPDIR", tempRoot)
+	setImporterTempRoot(t, tempRoot)
 
 	svc := newMinimalServiceForPersistTest(t)
 	outside := t.TempDir()
@@ -164,13 +184,52 @@ func TestEnsurePersistentNzbRejectsSymlinkedTempQueueRoot(t *testing.T) {
 	assert.FileExists(t, victim)
 }
 
-func TestAddToQueueNeverCommitsAnUnownedSourcePath(t *testing.T) {
-	tempRoot := t.TempDir()
-	t.Setenv("TMPDIR", tempRoot)
-	svc, db := newMinimalServiceForPersistTestWithDB(t)
+var fbaseQueueCommitDriverID atomic.Uint64
 
+func TestAddToQueueNeverPublishesAnUnownedSourcePath(t *testing.T) {
+	tempRoot := t.TempDir()
+	setImporterTempRoot(t, tempRoot)
 	queueRoot := filepath.Join(tempRoot, ".altmount-queue")
-	installOwnedQueuePathTrigger(t, db, queueRoot)
+	var unsafePath atomic.Bool
+	var unsafeCommitAttempted atomic.Bool
+	driverName := fmt.Sprintf("fbase-queue-commit-%d", fbaseQueueCommitDriverID.Add(1))
+	sql.Register(driverName, &sqlite3.SQLiteDriver{ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+		if err := conn.RegisterFunc("fbase_record_queue_path", func(path string) int {
+			rel, err := filepath.Rel(queueRoot, path)
+			unsafePath.Store(err != nil || rel == "." || !filepath.IsLocal(rel))
+			return 0
+		}, true); err != nil {
+			return err
+		}
+		conn.RegisterCommitHook(func() int {
+			if unsafePath.Load() {
+				unsafeCommitAttempted.Store(true)
+				return 1
+			}
+			return 0
+		})
+		conn.RegisterRollbackHook(func() { unsafePath.Store(false) })
+		return nil
+	}})
+	db, err := sql.Open(driverName, filepath.Join(t.TempDir(), "queue.db")+"?_busy_timeout=5000")
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	setupMinimalPersistSchema(t, db)
+	_, err = db.Exec(`
+		CREATE TRIGGER record_queue_path_insert
+		AFTER INSERT ON import_queue
+		BEGIN
+			SELECT fbase_record_queue_path(NEW.nzb_path);
+		END;
+		CREATE TRIGGER record_queue_path_update
+		AFTER UPDATE OF nzb_path ON import_queue
+		BEGIN
+			SELECT fbase_record_queue_path(NEW.nzb_path);
+		END;
+	`)
+	require.NoError(t, err)
+	svc := newMinimalServiceForPersistTestDB(t, db)
 
 	stageDir := t.TempDir()
 	source := filepath.Join(stageDir, "admission.nzb")
@@ -178,26 +237,13 @@ func TestAddToQueueNeverCommitsAnUnownedSourcePath(t *testing.T) {
 
 	item, err := svc.AddToQueue(context.Background(), source, nil, nil, nil, nil, nil, nil)
 
+	assert.False(t, unsafeCommitAttempted.Load(),
+		"the caller path may exist provisionally in one transaction but must not reach commit")
 	require.NoError(t, err)
 	require.NotNil(t, item)
 	require.NotZero(t, item.ID)
 	requireStrictChildPath(t, queueRoot, item.NzbPath)
 	assert.FileExists(t, item.NzbPath)
-}
-
-func installOwnedQueuePathTrigger(t *testing.T, db *sql.DB, queueRoot string) {
-	t.Helper()
-	queuePrefix := queueRoot + string(os.PathSeparator)
-	sqlPrefix := strings.ReplaceAll(queuePrefix, "'", "''")
-	_, err := db.Exec(`
-		CREATE TRIGGER reject_unowned_queue_path
-		BEFORE INSERT ON import_queue
-		WHEN substr(NEW.nzb_path, 1, ` + strconv.Itoa(len(queuePrefix)) + `) != '` + sqlPrefix + `'
-		BEGIN
-			SELECT RAISE(ABORT, 'unowned queue path');
-		END;
-	`)
-	require.NoError(t, err)
 }
 
 func requireQueueRowCount(t *testing.T, db *sql.DB, want int) {
@@ -217,8 +263,11 @@ func requireStrictChildPath(t *testing.T, root, path string) string {
 }
 
 func TestAddToQueueRejectsSymlinkedOwnedAncestor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
 	tempRoot := t.TempDir()
-	t.Setenv("TMPDIR", tempRoot)
+	setImporterTempRoot(t, tempRoot)
 	svc, db := newMinimalServiceForPersistTestWithDB(t)
 	queueRoot := filepath.Join(tempRoot, ".altmount-queue")
 	require.NoError(t, os.MkdirAll(queueRoot, 0o755))
@@ -241,11 +290,10 @@ func TestAddToQueueRejectsSymlinkedOwnedAncestor(t *testing.T) {
 
 func TestAddToQueueAcceptsAlreadyOwnedRegularFile(t *testing.T) {
 	tempRoot := t.TempDir()
-	t.Setenv("TMPDIR", tempRoot)
+	setImporterTempRoot(t, tempRoot)
 	svc, db := newMinimalServiceForPersistTestWithDB(t)
 	queueRoot := filepath.Join(tempRoot, ".altmount-queue")
 	require.NoError(t, os.MkdirAll(queueRoot, 0o755))
-	installOwnedQueuePathTrigger(t, db, queueRoot)
 
 	source := filepath.Join(queueRoot, "already-owned.nzb")
 	require.NoError(t, os.WriteFile(source, []byte("<nzb/>"), 0o600))
@@ -258,18 +306,103 @@ func TestAddToQueueAcceptsAlreadyOwnedRegularFile(t *testing.T) {
 	requireQueueRowCount(t, db, 1)
 }
 
-func TestAddToQueueRollsBackRootedCopyWhenPathUpdateFails(t *testing.T) {
+func TestAddToQueueRejectsNonRegularOwnedSources(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, string) (string, string)
+	}{
+		{
+			name: "directory",
+			setup: func(t *testing.T, queueRoot string) (string, string) {
+				path := filepath.Join(queueRoot, "directory.nzb")
+				require.NoError(t, os.Mkdir(path, 0o755))
+				return path, ""
+			},
+		},
+		{
+			name: "leaf symlink",
+			setup: func(t *testing.T, queueRoot string) (string, string) {
+				if runtime.GOOS == "windows" {
+					t.Skip("symlink authority test requires Unix symlink semantics")
+				}
+				victim := filepath.Join(t.TempDir(), "victim.nzb")
+				require.NoError(t, os.WriteFile(victim, []byte("keep"), 0o600))
+				path := filepath.Join(queueRoot, "leaf.nzb")
+				require.NoError(t, os.Symlink(victim, path))
+				return path, victim
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempRoot := t.TempDir()
+			setImporterTempRoot(t, tempRoot)
+			svc, db := newMinimalServiceForPersistTestWithDB(t)
+			queueRoot := filepath.Join(tempRoot, ".altmount-queue")
+			require.NoError(t, os.MkdirAll(queueRoot, 0o755))
+			source, victim := tt.setup(t, queueRoot)
+
+			item, err := svc.AddToQueue(context.Background(), source, nil, nil, nil, nil, nil, nil)
+
+			require.Error(t, err)
+			require.Nil(t, item)
+			requireQueueRowCount(t, db, 0)
+			if victim != "" {
+				assert.FileExists(t, victim)
+			}
+		})
+	}
+}
+
+func TestAddToQueueRollsBackSourceAndRootedCopyWhenFinalPublicationFails(t *testing.T) {
 	tempRoot := t.TempDir()
-	t.Setenv("TMPDIR", tempRoot)
-	svc, db := newMinimalServiceForPersistTestWithDB(t)
-	_, err := db.Exec(`
-		CREATE TRIGGER reject_queue_path_update
-		BEFORE UPDATE OF nzb_path ON import_queue
+	setImporterTempRoot(t, tempRoot)
+	queueRoot := filepath.Join(tempRoot, ".altmount-queue")
+	var sawQueuePath atomic.Bool
+	var rootedPath atomic.Bool
+	var rootedCommitAttempted atomic.Bool
+	driverName := fmt.Sprintf("fbase-queue-rollback-%d", fbaseQueueCommitDriverID.Add(1))
+	sql.Register(driverName, &sqlite3.SQLiteDriver{ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+		if err := conn.RegisterFunc("fbase_record_final_queue_path", func(path string) int {
+			rel, err := filepath.Rel(queueRoot, path)
+			sawQueuePath.Store(true)
+			rootedPath.Store(err == nil && rel != "." && filepath.IsLocal(rel))
+			return 0
+		}, true); err != nil {
+			return err
+		}
+		conn.RegisterCommitHook(func() int {
+			if sawQueuePath.Load() && rootedPath.Load() {
+				rootedCommitAttempted.Store(true)
+				return 1
+			}
+			return 0
+		})
+		conn.RegisterRollbackHook(func() {
+			sawQueuePath.Store(false)
+			rootedPath.Store(false)
+		})
+		return nil
+	}})
+	db, err := sql.Open(driverName, filepath.Join(t.TempDir(), "queue.db")+"?_busy_timeout=5000")
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	setupMinimalPersistSchema(t, db)
+	_, err = db.Exec(`
+		CREATE TRIGGER record_final_queue_path_insert
+		AFTER INSERT ON import_queue
 		BEGIN
-			SELECT RAISE(ABORT, 'injected path update failure');
+			SELECT fbase_record_final_queue_path(NEW.nzb_path);
+		END;
+		CREATE TRIGGER record_final_queue_path_update
+		AFTER UPDATE OF nzb_path ON import_queue
+		BEGIN
+			SELECT fbase_record_final_queue_path(NEW.nzb_path);
 		END;
 	`)
 	require.NoError(t, err)
+	svc := newMinimalServiceForPersistTestDB(t, db)
 
 	source := filepath.Join(t.TempDir(), "rollback.nzb")
 	require.NoError(t, os.WriteFile(source, []byte("<nzb/>"), 0o600))
@@ -277,6 +410,7 @@ func TestAddToQueueRollsBackRootedCopyWhenPathUpdateFails(t *testing.T) {
 
 	require.Error(t, err)
 	require.Nil(t, item)
+	assert.True(t, rootedCommitAttempted.Load(), "fixture must reject the final rooted publication")
 	assert.FileExists(t, source, "a failed DB publication must retain the caller-owned source")
 	requireQueueRowCount(t, db, 0)
 	entries, readErr := os.ReadDir(filepath.Join(tempRoot, ".altmount-queue"))

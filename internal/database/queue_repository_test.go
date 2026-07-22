@@ -3,6 +3,8 @@ package database
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -170,20 +172,27 @@ func TestAddToQueueReturnsExistingRowIDForNoopConflict(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	setupQueueSchema(t, db)
-	insertQueueItemWithTime(t, db, 1, "active.nzb", "pending", time.Now())
+	insertQueueItemWithTime(t, db, 1, "active.nzb", "processing", time.Now())
 	insertQueueItemWithTime(t, db, 2, "last-insert.nzb", "failed", time.Now())
+	_, err = db.Exec(`UPDATE import_queue SET category = 'protected', metadata = 'protected' WHERE id = 1`)
+	require.NoError(t, err)
 
 	repo := NewQueueRepository(db, DialectSQLite)
+	incomingCategory := "incoming"
+	incomingMetadata := "incoming"
 	item := &ImportQueueItem{
 		NzbPath:    "active.nzb",
 		Status:     QueueStatusPending,
 		Priority:   QueuePriorityNormal,
 		MaxRetries: 3,
+		Category:   &incomingCategory,
+		Metadata:   &incomingMetadata,
 	}
 
 	require.NoError(t, repo.AddToQueue(context.Background(), item))
 	require.EqualValues(t, 1, item.ID,
 		"a no-op conflict must return the authoritative existing row ID, not last_insert_rowid")
+	requireNoopConflictRowUnchanged(t, db, "active.nzb", QueueStatusProcessing)
 }
 
 func TestAddBatchToQueueReturnsExistingRowIDForNoopConflict(t *testing.T) {
@@ -194,18 +203,106 @@ func TestAddBatchToQueueReturnsExistingRowIDForNoopConflict(t *testing.T) {
 	setupQueueSchema(t, db)
 	insertQueueItemWithTime(t, db, 1, "completed.nzb", "completed", time.Now())
 	insertQueueItemWithTime(t, db, 2, "last-insert.nzb", "failed", time.Now())
+	_, err = db.Exec(`UPDATE import_queue SET category = 'protected', metadata = 'protected' WHERE id = 1`)
+	require.NoError(t, err)
 
 	repo := NewQueueRepository(db, DialectSQLite)
+	incomingCategory := "incoming"
+	incomingMetadata := "incoming"
 	item := &ImportQueueItem{
 		NzbPath:    "completed.nzb",
 		Status:     QueueStatusPending,
 		Priority:   QueuePriorityNormal,
 		MaxRetries: 3,
+		Category:   &incomingCategory,
+		Metadata:   &incomingMetadata,
 	}
 
 	require.NoError(t, repo.AddBatchToQueue(context.Background(), []*ImportQueueItem{item}))
 	require.EqualValues(t, 1, item.ID,
 		"a no-op batch conflict must return the authoritative existing row ID, not last_insert_rowid")
+	requireNoopConflictRowUnchanged(t, db, "completed.nzb", QueueStatusCompleted)
+}
+
+func requireNoopConflictRowUnchanged(t *testing.T, db *sql.DB, path string, status QueueStatus) {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM import_queue WHERE nzb_path = ?`, path).Scan(&count))
+	require.Equal(t, 1, count)
+	var gotStatus QueueStatus
+	var category, metadata string
+	require.NoError(t, db.QueryRow(
+		`SELECT status, category, metadata FROM import_queue WHERE nzb_path = ?`, path,
+	).Scan(&gotStatus, &category, &metadata))
+	assert.Equal(t, status, gotStatus)
+	assert.Equal(t, "protected", category)
+	assert.Equal(t, "protected", metadata)
+}
+
+func TestPostgresNoopQueueConflictsReturnAuthoritativeIDs(t *testing.T) {
+	dsn := os.Getenv("ALTMOUNT_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("ALTMOUNT_TEST_POSTGRES_DSN is not configured")
+	}
+	db, err := NewDB(Config{Type: "postgres", DSN: dsn})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	repo := NewQueueRepository(db.Connection(), DialectPostgres)
+
+	tests := []struct {
+		name   string
+		status QueueStatus
+		add    func(context.Context, *ImportQueueItem) error
+	}{
+		{
+			name:   "single processing conflict",
+			status: QueueStatusProcessing,
+			add: func(ctx context.Context, item *ImportQueueItem) error {
+				return repo.AddToQueue(ctx, item)
+			},
+		},
+		{
+			name:   "batch completed conflict",
+			status: QueueStatusCompleted,
+			add: func(ctx context.Context, item *ImportQueueItem) error {
+				return repo.AddBatchToQueue(ctx, []*ImportQueueItem{item})
+			},
+		},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := fmt.Sprintf("fbase/noop-%d-%d.nzb", time.Now().UnixNano(), i)
+			protectedCategory := "protected"
+			protectedMetadata := "protected"
+			seed := &ImportQueueItem{
+				NzbPath: path, Status: QueueStatusPending, Priority: QueuePriorityNormal,
+				MaxRetries: 3, Category: &protectedCategory, Metadata: &protectedMetadata,
+			}
+			require.NoError(t, repo.AddToQueue(ctx, seed))
+			require.NotZero(t, seed.ID)
+			require.NoError(t, repo.UpdateQueueItemStatus(ctx, seed.ID, tt.status, nil))
+			t.Cleanup(func() { _ = repo.RemoveFromQueue(context.Background(), seed.ID) })
+
+			incomingCategory := "incoming"
+			incomingMetadata := "incoming"
+			incoming := &ImportQueueItem{
+				NzbPath: path, Status: QueueStatusPending, Priority: QueuePriorityNormal,
+				MaxRetries: 3, Category: &incomingCategory, Metadata: &incomingMetadata,
+			}
+			require.NoError(t, tt.add(ctx, incoming))
+			require.Equal(t, seed.ID, incoming.ID)
+
+			got, getErr := repo.GetQueueItem(ctx, seed.ID)
+			require.NoError(t, getErr)
+			require.NotNil(t, got)
+			assert.Equal(t, tt.status, got.Status)
+			require.NotNil(t, got.Category)
+			assert.Equal(t, protectedCategory, *got.Category)
+			require.NotNil(t, got.Metadata)
+			assert.Equal(t, protectedMetadata, *got.Metadata)
+		})
+	}
 }
 
 func TestResetStaleItems_UpdatedAtFieldUpdated(t *testing.T) {

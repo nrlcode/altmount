@@ -107,6 +107,43 @@ func TestSuccessfulImportRetainsProcessingOwnershipWhenSourceUnlinkFails(t *test
 	assert.Equal(t, database.QueueStatusProcessing, remaining.Status)
 }
 
+func TestSuccessfulImportRemovesOwnedSourceBeforePublishingCompleted(t *testing.T) {
+	env := newFbaseFinalizationEnv(t)
+	nzbPath := filepath.Join(env.storeRoot, "successful-import.nzb")
+	require.NoError(t, os.MkdirAll(filepath.Dir(nzbPath), 0o755))
+	require.NoError(t, os.WriteFile(nzbPath, []byte("<nzb/>"), 0o600))
+	item := env.addProcessingItem(t, nzbPath)
+
+	err := env.service.handleProcessingSuccess(
+		context.Background(), item, "/complete/movie.mkv", nil,
+	)
+
+	require.NoError(t, err)
+	assert.NoFileExists(t, nzbPath)
+	completed, getErr := env.database.Repository.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, getErr)
+	require.NotNil(t, completed)
+	assert.Equal(t, database.QueueStatusCompleted, completed.Status)
+}
+
+func TestSuccessfulImportRejectsUnownedSourceBeforePublishingCompleted(t *testing.T) {
+	env := newFbaseFinalizationEnv(t)
+	nzbPath := filepath.Join(t.TempDir(), "operator-source.nzb")
+	require.NoError(t, os.WriteFile(nzbPath, []byte("keep"), 0o600))
+	item := env.addProcessingItem(t, nzbPath)
+
+	err := env.service.handleProcessingSuccess(
+		context.Background(), item, "/complete/movie.mkv", nil,
+	)
+
+	require.Error(t, err)
+	assert.FileExists(t, nzbPath)
+	remaining, getErr := env.database.Repository.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, getErr)
+	require.NotNil(t, remaining)
+	assert.Equal(t, database.QueueStatusProcessing, remaining.Status)
+}
+
 func TestSuccessfulFallbackRetainsQueueOwnershipWhenSourceUnlinkFails(t *testing.T) {
 	env := newFbaseFinalizationEnv(t)
 	nzbPath := filepath.Join(env.storeRoot, "fallback.nzb")
@@ -147,5 +184,65 @@ func TestSuccessfulFallbackRetainsQueueOwnershipWhenSourceUnlinkFails(t *testing
 	remaining, err := env.database.Repository.GetQueueItem(context.Background(), item.ID)
 	require.NoError(t, err)
 	require.NotNil(t, remaining, "failed local cleanup must retain the transferred queue row")
+	assert.Equal(t, database.QueueStatusFailed, remaining.Status)
+}
+
+func TestSuccessfulFallbackRemovesOwnedSourceBeforeQueueRow(t *testing.T) {
+	env := newFbaseFinalizationEnv(t)
+	nzbPath := filepath.Join(env.storeRoot, "fallback-success.nzb")
+	require.NoError(t, os.MkdirAll(filepath.Dir(nzbPath), 0o755))
+	require.NoError(t, os.WriteFile(nzbPath, []byte("<nzb></nzb>"), 0o600))
+	item := env.addProcessingItem(t, nzbPath)
+
+	received := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		received <- struct{}{}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":true,"nzo_ids":["SAB-1"]}`))
+	}))
+	t.Cleanup(server.Close)
+	env.config.SABnzbd.FallbackHost = server.URL
+	env.config.SABnzbd.FallbackAPIKey = "test-key"
+
+	env.service.handleProcessingFailure(context.Background(), item, errors.New("force fallback"))
+
+	select {
+	case <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fallback server did not receive the NZB")
+	}
+	assert.NoFileExists(t, nzbPath)
+	remaining, err := env.database.Repository.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, err)
+	assert.Nil(t, remaining)
+}
+
+func TestSuccessfulFallbackRejectsUnownedSourceBeforeQueueRowRemoval(t *testing.T) {
+	env := newFbaseFinalizationEnv(t)
+	nzbPath := filepath.Join(t.TempDir(), "operator-fallback.nzb")
+	require.NoError(t, os.WriteFile(nzbPath, []byte("keep"), 0o600))
+	item := env.addProcessingItem(t, nzbPath)
+
+	received := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		received <- struct{}{}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":true,"nzo_ids":["SAB-1"]}`))
+	}))
+	t.Cleanup(server.Close)
+	env.config.SABnzbd.FallbackHost = server.URL
+	env.config.SABnzbd.FallbackAPIKey = "test-key"
+
+	env.service.handleProcessingFailure(context.Background(), item, errors.New("force fallback"))
+
+	select {
+	case <-received:
+		t.Error("unowned source must be rejected before external fallback transfer")
+	default:
+	}
+	assert.FileExists(t, nzbPath)
+	remaining, err := env.database.Repository.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, err)
+	require.NotNil(t, remaining)
 	assert.Equal(t, database.QueueStatusFailed, remaining.Status)
 }

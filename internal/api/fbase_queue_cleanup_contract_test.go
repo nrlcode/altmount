@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,8 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/javi11/altmount/internal/database"
 	"github.com/javi11/altmount/internal/importer"
 	"github.com/javi11/altmount/internal/metadata"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,6 +29,7 @@ import (
 type queueCleanupTestEnv struct {
 	server    *Server
 	repo      *database.Repository
+	db        *sql.DB
 	ownedRoot string
 }
 
@@ -51,6 +54,7 @@ func newQueueCleanupTestEnv(t *testing.T) *queueCleanupTestEnv {
 			metadataService: metadataService,
 		},
 		repo:      repo,
+		db:        db.Connection(),
 		ownedRoot: filepath.Join(ownedRoot, "failed"),
 	}
 }
@@ -88,6 +92,13 @@ func requireQueueItemStatus(t *testing.T, repo *database.Repository, id int64, w
 	require.NoError(t, err)
 	require.NotNil(t, item)
 	assert.Equal(t, want, item.Status)
+}
+
+func (e *queueCleanupTestEnv) ageItem(t *testing.T, item *database.ImportQueueItem) {
+	t.Helper()
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	_, err := e.db.Exec(`UPDATE import_queue SET created_at = ?, updated_at = ? WHERE id = ?`, old, old, item.ID)
+	require.NoError(t, err)
 }
 
 func (e *queueCleanupTestEnv) addSymlinkEscapedItem(
@@ -196,6 +207,134 @@ func TestQueueDeleteRetainsRowWhenContainedDirectoryCleanupFails(t *testing.T) {
 	requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusFailed)
 }
 
+func TestQueueAndSystemCleanupOwnersRejectSymlinkEscapes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
+	tests := []struct {
+		name   string
+		status database.QueueStatus
+		method string
+		path   string
+		mount  func(*fiber.App, *Server)
+		body   func(*database.ImportQueueItem) string
+	}{
+		{
+			name: "bulk", status: database.QueueStatusPending, method: "DELETE", path: "/queue/bulk",
+			mount: func(app *fiber.App, server *Server) { app.Delete("/queue/bulk", server.handleDeleteQueueBulk) },
+			body:  func(item *database.ImportQueueItem) string { return fmt.Sprintf(`{"ids":[%d]}`, item.ID) },
+		},
+		{
+			name: "completed", status: database.QueueStatusCompleted, method: "DELETE", path: "/queue/completed",
+			mount: func(app *fiber.App, server *Server) { app.Delete("/queue/completed", server.handleClearCompletedQueue) },
+		},
+		{
+			name: "failed", status: database.QueueStatusFailed, method: "DELETE", path: "/queue/failed",
+			mount: func(app *fiber.App, server *Server) { app.Delete("/queue/failed", server.handleClearFailedQueue) },
+		},
+		{
+			name: "pending", status: database.QueueStatusPending, method: "DELETE", path: "/queue/pending",
+			mount: func(app *fiber.App, server *Server) { app.Delete("/queue/pending", server.handleClearPendingQueue) },
+		},
+		{
+			name: "system cleanup", status: database.QueueStatusCompleted, method: "POST", path: "/system/cleanup",
+			mount: func(app *fiber.App, server *Server) { app.Post("/system/cleanup", server.handleSystemCleanup) },
+		},
+		{
+			name: "queue reset", status: database.QueueStatusFailed, method: "POST", path: "/system/reset?reset_queue=true",
+			mount: func(app *fiber.App, server *Server) { app.Post("/system/reset", server.handleResetSystemStats) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newQueueCleanupTestEnv(t)
+			item, victim := env.addSymlinkEscapedItem(t, tt.status)
+			if tt.name == "system cleanup" {
+				env.ageItem(t, item)
+			}
+			app := fiber.New()
+			tt.mount(app, env.server)
+			var body *bytes.Buffer
+			if tt.body != nil {
+				body = bytes.NewBufferString(tt.body(item))
+			} else {
+				body = bytes.NewBuffer(nil)
+			}
+			req := httptest.NewRequest(tt.method, tt.path, body)
+			if tt.body != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			resp, err := app.Test(req)
+			require.NoError(t, err)
+			assert.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
+			assert.FileExists(t, victim)
+			requireQueueItemStatus(t, env.repo, item.ID, tt.status)
+		})
+	}
+}
+
+func TestQueueAndSystemCleanupOwnersRemoveOwnedFilesAndRows(t *testing.T) {
+	tests := []struct {
+		name   string
+		status database.QueueStatus
+		method string
+		path   string
+		mount  func(*fiber.App, *Server)
+	}{
+		{
+			name: "single", status: database.QueueStatusPending, method: "DELETE",
+			mount: func(app *fiber.App, server *Server) { app.Delete("/queue/:id", server.handleDeleteQueue) },
+		},
+		{
+			name: "completed", status: database.QueueStatusCompleted, method: "DELETE", path: "/queue/completed",
+			mount: func(app *fiber.App, server *Server) { app.Delete("/queue/completed", server.handleClearCompletedQueue) },
+		},
+		{
+			name: "failed", status: database.QueueStatusFailed, method: "DELETE", path: "/queue/failed",
+			mount: func(app *fiber.App, server *Server) { app.Delete("/queue/failed", server.handleClearFailedQueue) },
+		},
+		{
+			name: "pending", status: database.QueueStatusPending, method: "DELETE", path: "/queue/pending",
+			mount: func(app *fiber.App, server *Server) { app.Delete("/queue/pending", server.handleClearPendingQueue) },
+		},
+		{
+			name: "system cleanup", status: database.QueueStatusCompleted, method: "POST", path: "/system/cleanup",
+			mount: func(app *fiber.App, server *Server) { app.Post("/system/cleanup", server.handleSystemCleanup) },
+		},
+		{
+			name: "queue reset", status: database.QueueStatusFailed, method: "POST", path: "/system/reset?reset_queue=true",
+			mount: func(app *fiber.App, server *Server) { app.Post("/system/reset", server.handleResetSystemStats) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newQueueCleanupTestEnv(t)
+			require.NoError(t, os.MkdirAll(env.ownedRoot, 0o755))
+			path := filepath.Join(env.ownedRoot, "owned.nzb")
+			require.NoError(t, os.WriteFile(path, []byte("<nzb/>"), 0o600))
+			item := env.addItem(t, path, tt.status)
+			if tt.name == "system cleanup" {
+				env.ageItem(t, item)
+			}
+			app := fiber.New()
+			tt.mount(app, env.server)
+			requestPath := tt.path
+			if requestPath == "" {
+				requestPath = fmt.Sprintf("/queue/%d", item.ID)
+			}
+			resp, err := app.Test(httptest.NewRequest(tt.method, requestPath, nil))
+			require.NoError(t, err)
+			if tt.name == "single" {
+				assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
+			} else {
+				assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+			}
+			assert.NoFileExists(t, path)
+			requireQueueItemExists(t, env.repo, item.ID, false)
+		})
+	}
+}
+
 func TestQueueBulkDeleteCleansOwnedFiles(t *testing.T) {
 	env := newQueueCleanupTestEnv(t)
 	require.NoError(t, os.MkdirAll(env.ownedRoot, 0o755))
@@ -227,15 +366,18 @@ func TestQueueBulkDeleteStopsAfterOwnedCleanupFailure(t *testing.T) {
 	env := newQueueCleanupTestEnv(t)
 	require.NoError(t, os.MkdirAll(env.ownedRoot, 0o755))
 
+	failing, child := env.addNonEmptyDirectoryItem(t, database.QueueStatusFailed)
 	ownedPath := filepath.Join(env.ownedRoot, "first-owned.nzb")
 	require.NoError(t, os.WriteFile(ownedPath, []byte("delete"), 0o600))
 	owned := env.addItem(t, ownedPath, database.QueueStatusPending)
-	failing, child := env.addNonEmptyDirectoryItem(t, database.QueueStatusFailed)
-	require.Less(t, owned.ID, failing.ID, "fixture IDs must preserve request order")
+	sentinelPath := filepath.Join(env.ownedRoot, "last-owned.nzb")
+	require.NoError(t, os.WriteFile(sentinelPath, []byte("retain"), 0o600))
+	sentinel := env.addItem(t, sentinelPath, database.QueueStatusPending)
+	require.Less(t, failing.ID, owned.ID, "fixture row order must differ from request order")
 
 	app := fiber.New()
 	app.Delete("/queue/bulk", env.server.handleDeleteQueueBulk)
-	body := fmt.Sprintf(`{"ids":[%d,%d]}`, owned.ID, failing.ID)
+	body := fmt.Sprintf(`{"ids":[%d,%d,%d]}`, owned.ID, failing.ID, sentinel.ID)
 	req := httptest.NewRequest("DELETE", "/queue/bulk", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := app.Test(req)
@@ -246,6 +388,8 @@ func TestQueueBulkDeleteStopsAfterOwnedCleanupFailure(t *testing.T) {
 	requireQueueItemExists(t, env.repo, owned.ID, false)
 	assert.FileExists(t, child)
 	requireQueueItemStatus(t, env.repo, failing.ID, database.QueueStatusFailed)
+	assert.FileExists(t, sentinelPath, "fail-stop must not process a later request item")
+	requireQueueItemStatus(t, env.repo, sentinel.ID, database.QueueStatusPending)
 }
 
 func TestQueueStatusClearPreservesOwnershipWhenCleanupFails(t *testing.T) {
@@ -284,6 +428,7 @@ func TestQueueStatusClearPreservesOwnershipWhenCleanupFails(t *testing.T) {
 func TestSystemCleanupRetainsCompletedRowWhenCleanupFails(t *testing.T) {
 	env := newQueueCleanupTestEnv(t)
 	item, child := env.addNonEmptyDirectoryItem(t, database.QueueStatusCompleted)
+	env.ageItem(t, item)
 
 	app := fiber.New()
 	app.Post("/system/cleanup", env.server.handleSystemCleanup)
@@ -360,6 +505,33 @@ func TestSABQueueDeletionReportsCleanupFailureForEveryIdentifier(t *testing.T) {
 	}
 }
 
+func TestSABQueueDeletionRejectsSymlinkEscapeForEveryIdentifier(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
+	tests := []struct {
+		name       string
+		downloadID string
+		value      func(*database.ImportQueueItem) string
+	}{
+		{name: "numeric id", value: func(item *database.ImportQueueItem) string { return fmt.Sprint(item.ID) }},
+		{name: "download id", downloadID: "sab-queue-symlink", value: func(item *database.ImportQueueItem) string { return *item.DownloadID }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newQueueCleanupTestEnv(t)
+			item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusPending, tt.downloadID)
+			app := fiber.New()
+			app.Get("/sab", env.server.handleSABnzbdQueueDelete)
+			resp, err := app.Test(httptest.NewRequest("GET", "/sab?value="+tt.value(item), nil))
+			require.NoError(t, err)
+			requireSABDeleteResponse(t, resp, false)
+			assert.FileExists(t, victim)
+			requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusPending)
+		})
+	}
+}
+
 func TestSABHistoryDeletionReportsQueueCleanupFailureForEveryIdentifier(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -385,6 +557,68 @@ func TestSABHistoryDeletionReportsQueueCleanupFailureForEveryIdentifier(t *testi
 			history, historyErr := env.repo.GetImportHistoryByNzbID(context.Background(), item.ID)
 			require.NoError(t, historyErr)
 			require.NotNil(t, history, "cleanup failure must retain associated history")
+		})
+	}
+}
+
+func TestSABHistoryDeletionCleansOwnedQueueAndHistoryForEveryIdentifier(t *testing.T) {
+	tests := []struct {
+		name       string
+		downloadID string
+		value      func(*database.ImportQueueItem) string
+	}{
+		{name: "numeric queue id", downloadID: "sab-history-owned-numeric", value: func(item *database.ImportQueueItem) string { return fmt.Sprint(item.ID) }},
+		{name: "download id", downloadID: "sab-history-owned-download", value: func(item *database.ImportQueueItem) string { return *item.DownloadID }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newQueueCleanupTestEnv(t)
+			require.NoError(t, os.MkdirAll(env.ownedRoot, 0o755))
+			path := filepath.Join(env.ownedRoot, "history-owned.nzb")
+			require.NoError(t, os.WriteFile(path, []byte("<nzb/>"), 0o600))
+			item := env.addItem(t, path, database.QueueStatusCompleted, tt.downloadID)
+			env.addHistory(t, item, "history-owned.nzb")
+			app := fiber.New()
+			app.Get("/sab-history", env.server.handleSABnzbdHistoryDelete)
+			resp, err := app.Test(httptest.NewRequest("GET", "/sab-history?value="+tt.value(item), nil))
+			require.NoError(t, err)
+			requireSABDeleteResponse(t, resp, true)
+			assert.NoFileExists(t, path)
+			requireQueueItemExists(t, env.repo, item.ID, false)
+			history, historyErr := env.repo.GetImportHistoryByNzbID(context.Background(), item.ID)
+			require.NoError(t, historyErr)
+			assert.Nil(t, history)
+		})
+	}
+}
+
+func TestSABHistoryDeletionRejectsSymlinkEscapeForEveryIdentifier(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink authority test requires Unix symlink semantics")
+	}
+	tests := []struct {
+		name       string
+		downloadID string
+		value      func(*database.ImportQueueItem) string
+	}{
+		{name: "numeric queue id", downloadID: "sab-history-link-numeric", value: func(item *database.ImportQueueItem) string { return fmt.Sprint(item.ID) }},
+		{name: "download id", downloadID: "sab-history-link-download", value: func(item *database.ImportQueueItem) string { return *item.DownloadID }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newQueueCleanupTestEnv(t)
+			item, victim := env.addSymlinkEscapedItem(t, database.QueueStatusCompleted, tt.downloadID)
+			env.addHistory(t, item, "queue-backed.nzb")
+			app := fiber.New()
+			app.Get("/sab-history", env.server.handleSABnzbdHistoryDelete)
+			resp, err := app.Test(httptest.NewRequest("GET", "/sab-history?value="+tt.value(item), nil))
+			require.NoError(t, err)
+			requireSABDeleteResponse(t, resp, false)
+			assert.FileExists(t, victim)
+			requireQueueItemStatus(t, env.repo, item.ID, database.QueueStatusCompleted)
+			history, historyErr := env.repo.GetImportHistoryByNzbID(context.Background(), item.ID)
+			require.NoError(t, historyErr)
+			require.NotNil(t, history)
 		})
 	}
 }
@@ -416,7 +650,9 @@ func TestSABHistoryOnlyDeletionDoesNotTreatNzbNameAsPathAuthority(t *testing.T) 
 
 func TestManualImportFilePublishesOnlyRootedQueueAuthority(t *testing.T) {
 	tempRoot := t.TempDir()
-	t.Setenv("TMPDIR", tempRoot)
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(name, tempRoot)
+	}
 	configDir := filepath.Join(tempRoot, "config")
 	require.NoError(t, os.MkdirAll(configDir, 0o755))
 	cfg := config.DefaultConfig(configDir)
@@ -429,6 +665,7 @@ func TestManualImportFilePublishesOnlyRootedQueueAuthority(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	queueRoot := filepath.Join(tempRoot, ".altmount-queue")
+	unsafeCommit := installAPIQueuePublicationCommitGuard(t, db.Connection(), queueRoot)
 	storeRoot := filepath.Join(configDir, ".nzbs")
 	metadataService := metadata.NewMetadataService(cfg.Metadata.RootPath)
 	require.NoError(t, metadataService.ConfigureCleanupRoots(storeRoot, queueRoot, storeRoot))
@@ -437,18 +674,6 @@ func TestManualImportFilePublishesOnlyRootedQueueAuthority(t *testing.T) {
 		importer.ServiceConfig{Workers: 1}, metadataService, db, nil, nil, cfgGetter,
 		nil, nil, nil,
 	)
-	require.NoError(t, err)
-
-	queuePrefix := queueRoot + string(os.PathSeparator)
-	sqlPrefix := strings.ReplaceAll(queuePrefix, "'", "''")
-	_, err = db.Connection().Exec(`
-		CREATE TRIGGER reject_unowned_manual_import_path
-		BEFORE INSERT ON import_queue
-		WHEN substr(NEW.nzb_path, 1, ` + strconv.Itoa(len(queuePrefix)) + `) != '` + sqlPrefix + `'
-		BEGIN
-			SELECT RAISE(ABORT, 'unowned manual import path');
-		END;
-	`)
 	require.NoError(t, err)
 
 	server := &Server{
@@ -466,6 +691,7 @@ func TestManualImportFilePublishesOnlyRootedQueueAuthority(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := app.Test(req)
 	require.NoError(t, err)
+	assert.False(t, unsafeCommit.Load(), "manual import must not commit its caller path")
 	require.Equal(t, fiber.StatusOK, resp.StatusCode)
 	defer resp.Body.Close()
 	var envelope struct {
@@ -484,4 +710,64 @@ func TestManualImportFilePublishesOnlyRootedQueueAuthority(t *testing.T) {
 	require.NotEqual(t, ".", rel)
 	require.True(t, filepath.IsLocal(rel), "persisted path must be a strict queue-root child")
 	assert.FileExists(t, item.NzbPath)
+}
+
+func installAPIQueuePublicationCommitGuard(t *testing.T, db *sql.DB, queueRoot string) *atomic.Bool {
+	t.Helper()
+	const connections = 8
+	db.SetMaxOpenConns(connections)
+	db.SetMaxIdleConns(connections)
+	opened := make([]*sql.Conn, 0, connections)
+	attempted := &atomic.Bool{}
+	for range connections {
+		conn, err := db.Conn(context.Background())
+		require.NoError(t, err)
+		opened = append(opened, conn)
+		err = conn.Raw(func(driverConn any) error {
+			sqliteConn, ok := driverConn.(*sqlite3.SQLiteConn)
+			if !ok {
+				return fmt.Errorf("unexpected SQLite driver connection %T", driverConn)
+			}
+			var sawPath atomic.Bool
+			var rootedPath atomic.Bool
+			if err := sqliteConn.RegisterFunc("fbase_record_api_admission_path", func(path string) int {
+				rel, err := filepath.Rel(queueRoot, path)
+				sawPath.Store(true)
+				rootedPath.Store(err == nil && rel != "." && filepath.IsLocal(rel))
+				return 0
+			}, true); err != nil {
+				return err
+			}
+			sqliteConn.RegisterCommitHook(func() int {
+				if sawPath.Load() && !rootedPath.Load() {
+					attempted.Store(true)
+					return 1
+				}
+				return 0
+			})
+			sqliteConn.RegisterRollbackHook(func() {
+				sawPath.Store(false)
+				rootedPath.Store(false)
+			})
+			return nil
+		})
+		require.NoError(t, err)
+	}
+	for _, conn := range opened {
+		require.NoError(t, conn.Close())
+	}
+	_, err := db.Exec(`
+		CREATE TRIGGER record_api_admission_path_insert
+		AFTER INSERT ON import_queue
+		BEGIN
+			SELECT fbase_record_api_admission_path(NEW.nzb_path);
+		END;
+		CREATE TRIGGER record_api_admission_path_update
+		AFTER UPDATE OF nzb_path ON import_queue
+		BEGIN
+			SELECT fbase_record_api_admission_path(NEW.nzb_path);
+		END;
+	`)
+	require.NoError(t, err)
+	return attempted
 }
