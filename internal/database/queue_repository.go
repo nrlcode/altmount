@@ -173,6 +173,12 @@ func (r *QueueRepository) RestartQueueItemsBulk(ctx context.Context, ids []int64
 
 // AddToQueue adds a new NZB file to the import queue
 func (r *QueueRepository) AddToQueue(ctx context.Context, item *ImportQueueItem) error {
+	return r.withQueueTransaction(ctx, func(txRepo *QueueRepository) error {
+		return txRepo.addToQueue(ctx, item)
+	})
+}
+
+func (r *QueueRepository) addToQueue(ctx context.Context, item *ImportQueueItem) error {
 	query := `
 		INSERT INTO import_queue (download_id, nzb_path, relative_path, category, priority, status, retry_count, max_retries, batch_id, metadata, file_size, target_path, skip_arr_notification, skip_post_import_links, indexer, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
@@ -244,18 +250,15 @@ func (r *QueueRepository) AddStoragePath(ctx context.Context, itemID int64, stor
 }
 
 // IsFileInQueue checks if a file is already in the queue (pending, processing, or paused).
-// It matches by exact nzb_path first, and also by filename suffix to handle the case where
-// ensurePersistentNzb has already moved the file and updated nzb_path from the temp path to
-// the persistent storage path (e.g. /tmp/altmount-uploads/x.nzb → /.nzbs/stremio/42-x.nzb).
-// The LIKE pattern uses "%-filename" (dash wildcard) rather than "%/filename" so it also
-// matches the "<id>-<base>.nzb" naming that ensurePersistentNzb applies on collision.
+// It matches exact paths, rooted basename paths, and legacy ID-prefixed names.
 func (r *QueueRepository) IsFileInQueue(ctx context.Context, filePath string) (bool, error) {
 	filename := filepath.Base(filePath)
-	query := `SELECT 1 FROM import_queue WHERE (nzb_path = ? OR nzb_path LIKE ?) AND status IN ('pending', 'processing', 'paused') LIMIT 1`
-	likePattern := "%-" + filename
+	query := `SELECT 1 FROM import_queue WHERE (nzb_path = ? OR nzb_path LIKE ? ESCAPE '\' OR nzb_path LIKE ? ESCAPE '\') AND status IN ('pending', 'processing', 'paused') LIMIT 1`
+	legacyPattern := "%-" + escapeLikePattern(filename)
+	rootedPattern := "%" + escapeLikePattern(string(filepath.Separator)+filename)
 
 	var exists int
-	err := r.db.QueryRowContext(ctx, query, filePath, likePattern).Scan(&exists)
+	err := r.db.QueryRowContext(ctx, query, filePath, legacyPattern, rootedPattern).Scan(&exists)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return false, nil

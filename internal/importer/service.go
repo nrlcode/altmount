@@ -644,19 +644,6 @@ func uniqueFailedNzbPath(failedDir, srcNzbPath string, itemID int64) string {
 	return newPath
 }
 
-// persistentNzbPath returns the destination path for a successfully imported NZB inside
-// nzbDir. It prefers the clean filename directly in nzbDir and only namespaces it with the
-// queue item ID as a filename prefix (nzbDir/<id>-<name><ext>) when the plain destination is
-// reported taken by isTaken, guaranteeing a unique path for the UNIQUE import_queue.nzb_path
-// column. Mirrors uniqueFailedNzbPath.
-func persistentNzbPath(nzbDir, baseName, ext string, itemID int64, isTaken func(string) bool) string {
-	plain := filepath.Join(nzbDir, baseName+ext)
-	if !isTaken(plain) {
-		return plain
-	}
-	return filepath.Join(nzbDir, fmt.Sprintf("%d-%s%s", itemID, baseName, ext))
-}
-
 // sanitizeFilename replaces invalid characters in filenames
 func sanitizeFilename(name string) string {
 	return strings.ReplaceAll(name, "/", "_")
@@ -768,9 +755,8 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 	return item, nil
 }
 
-// FindAndUpdatePendingUpload de-duplicates manual NZB re-uploads. UNIQUE(nzb_path) can't catch them
-// because ensurePersistentNzb rewrites the path after insert, so this matches a still-pending item by
-// its category-independent base filename and updates its category/priority in place. Returns nil if none.
+// FindAndUpdatePendingUpload de-duplicates manual NZB re-uploads by their
+// category-independent basename and updates category/priority in place.
 func (s *Service) FindAndUpdatePendingUpload(ctx context.Context, filename string, category *string, priority *database.QueuePriority) (*database.ImportQueueItem, error) {
 	// NZBs uploaded via the API are persisted into the OS temp queue dir.
 	queueDir := filepath.Join(os.TempDir(), ".altmount-queue")
@@ -803,9 +789,9 @@ func (s *Service) FindAndUpdatePendingUpload(ctx context.Context, filename strin
 	items = append(items, stremioItems...)
 
 	for _, it := range items {
-		// Persisted name is "<base><ext>" or, on collision, "<id>-<base><ext>".
+		// New rooted paths preserve the basename; retain legacy ID-prefix support.
 		cand := nzbtrim.TrimNzbExtension(filepath.Base(it.NzbPath))
-		if cand != base && !strings.HasSuffix(cand, "-"+base) {
+		if cand != base && cand != fmt.Sprintf("%d-%s", it.ID, base) {
 			continue
 		}
 

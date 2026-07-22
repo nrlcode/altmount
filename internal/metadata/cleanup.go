@@ -602,6 +602,7 @@ type stagedSourceNzb struct {
 	file             *os.File
 	destination      *cleanupTarget
 	removeSource     bool
+	pruneSource      bool
 	sourceWasRemoved bool
 }
 
@@ -725,6 +726,9 @@ func stageSourceNzb(
 		return nil, err
 	}
 	entry := &stagedSourceNzb{source: source, file: file}
+	for _, root := range roots.sources {
+		entry.pruneSource = entry.pruneSource || pathWithinRoot(root, source.absolute)
+	}
 	keepFile := false
 	defer func() {
 		if !keepFile {
@@ -789,7 +793,7 @@ func uniqueStagedName(base string) (string, error) {
 	if _, err := rand.Read(random); err != nil {
 		return "", fmt.Errorf("generate rooted source filename: %w", err)
 	}
-	return hex.EncodeToString(random) + "-" + base, nil
+	return filepath.Join(hex.EncodeToString(random), base), nil
 }
 
 func openRegularCleanupTarget(target *cleanupTarget) (*os.File, fs.FileInfo, error) {
@@ -834,6 +838,13 @@ func removeStagedSources(staged []*stagedSourceNzb) error {
 		}
 		entry.sourceWasRemoved = true
 	}
+	for _, entry := range staged {
+		if entry.sourceWasRemoved && entry.pruneSource {
+			if err := pruneCleanupParents(entry.source); err != nil {
+				return errors.Join(err, rollbackStagedSourceNzbs(staged))
+			}
+		}
+	}
 	return nil
 }
 
@@ -846,6 +857,12 @@ func rollbackStagedSourceNzbs(staged []*stagedSourceNzb) error {
 		if _, err := entry.file.Seek(0, io.SeekStart); err != nil {
 			restoreErrors = append(restoreErrors, fmt.Errorf("rewind source NZB %q: %w", entry.source.absolute, err))
 			continue
+		}
+		if parent := filepath.Dir(entry.source.relative); parent != "." {
+			if err := entry.source.authority.root.MkdirAll(parent, 0o755); err != nil {
+				restoreErrors = append(restoreErrors, fmt.Errorf("restore source parent %q: %w", entry.source.absolute, err))
+				continue
+			}
 		}
 		restored, err := entry.source.authority.root.OpenFile(entry.source.relative, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
@@ -868,7 +885,7 @@ func rollbackStagedSourceNzbs(staged []*stagedSourceNzb) error {
 		if entry.destination == nil || entry.destination == entry.source {
 			continue
 		}
-		if err := removeCleanupTarget(entry.destination); err != nil {
+		if err := removeAndPrune(entry.destination, true); err != nil {
 			return fmt.Errorf("remove rolled-back rooted source copy %q: %w", entry.destination.absolute, err)
 		}
 	}
