@@ -3,10 +3,8 @@ package database
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -15,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newFACORECHG007SQLiteDB(t *testing.T) (*DB, *HealthStateRepository) {
+func newFACORECHG007SQLiteDB(t *testing.T) *DB {
 	t.Helper()
 	db, err := NewDB(Config{
 		Type:         "sqlite",
@@ -27,7 +25,7 @@ func newFACORECHG007SQLiteDB(t *testing.T) (*DB, *HealthStateRepository) {
 	var journalMode string
 	require.NoError(t, db.Connection().QueryRow(`PRAGMA journal_mode`).Scan(&journalMode))
 	require.Equal(t, "wal", journalMode)
-	return db, NewHealthStateRepository(db.Connection(), DialectSQLite)
+	return db
 }
 
 func facoreCHG007SQLiteConn(t *testing.T, db *DB) *sql.Conn {
@@ -46,8 +44,14 @@ func requireFACORECHG007SQLiteBusy(t *testing.T, err error) {
 	assert.Equal(t, sqlite3.ErrBusy, sqliteErr.Code)
 }
 
+func requireFACORECHG007SQLiteBeginBusy(t *testing.T, err error) {
+	t.Helper()
+	require.ErrorContains(t, err, "begin health state transaction")
+	requireFACORECHG007SQLiteBusy(t, err)
+}
+
 func TestFACORECHG007SQLiteExplicitTransactionsOwnTheWriterAtBegin(t *testing.T) {
-	db, _ := newFACORECHG007SQLiteDB(t)
+	db := newFACORECHG007SQLiteDB(t)
 	ctx := context.Background()
 	holderConn := facoreCHG007SQLiteConn(t, db)
 	contenderConn := facoreCHG007SQLiteConn(t, db)
@@ -58,8 +62,10 @@ func TestFACORECHG007SQLiteExplicitTransactionsOwnTheWriterAtBegin(t *testing.T)
 	// must therefore own SQLite's single writer solely because it began.
 	holder, err := holderConn.BeginTx(ctx, nil)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = holder.Rollback() })
 	contender, beginErr := contenderConn.BeginTx(ctx, nil)
 	if beginErr == nil {
+		t.Cleanup(func() { _ = contender.Rollback() })
 		require.NoError(t, contender.Rollback())
 		t.Errorf("a second explicit transaction began before the first released write ownership")
 	} else {
@@ -74,6 +80,7 @@ func TestFACORECHG007SQLiteExplicitTransactionsOwnTheWriterAtBegin(t *testing.T)
 
 	retry, err := contenderConn.BeginTx(ctx, nil)
 	require.NoError(t, err, "the bounded contender must be retryable after writer release")
+	t.Cleanup(func() { _ = retry.Rollback() })
 	_, err = retry.ExecContext(ctx,
 		`INSERT INTO file_health (file_path, status) VALUES ('chg007/retry.mkv', 'pending')`)
 	require.NoError(t, err)
@@ -83,64 +90,9 @@ func TestFACORECHG007SQLiteExplicitTransactionsOwnTheWriterAtBegin(t *testing.T)
 	assert.Equal(t, 1, partial)
 }
 
-type facoreCHG007BeginBarrier struct {
-	mu   sync.Mutex
-	next chan struct{}
-}
-
-func (b *facoreCHG007BeginBarrier) arm() <-chan struct{} {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.next != nil {
-		panic("FACORE CHG-007 BeginTx barrier already armed")
-	}
-	b.next = make(chan struct{})
-	return b.next
-}
-
-func (b *facoreCHG007BeginBarrier) signal() {
-	b.mu.Lock()
-	next := b.next
-	b.next = nil
-	b.mu.Unlock()
-	if next != nil {
-		close(next)
-	}
-}
-
-type facoreCHG007SQLiteConnector struct {
-	driver  *sqlite3.SQLiteDriver
-	dsn     string
-	barrier *facoreCHG007BeginBarrier
-}
-
-func (c *facoreCHG007SQLiteConnector) Connect(ctx context.Context) (driver.Conn, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	conn, err := c.driver.Open(c.dsn)
-	if err != nil {
-		return nil, err
-	}
-	return &facoreCHG007SQLiteBarrierConn{Conn: conn, barrier: c.barrier}, nil
-}
-
-func (c *facoreCHG007SQLiteConnector) Driver() driver.Driver { return c.driver }
-
-type facoreCHG007SQLiteBarrierConn struct {
-	driver.Conn
-	barrier *facoreCHG007BeginBarrier
-}
-
-func (c *facoreCHG007SQLiteBarrierConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	c.barrier.signal()
-	return c.Conn.(driver.ConnBeginTx).BeginTx(ctx, opts)
-}
-
 type facoreCHG007SQLiteFixture struct {
 	db       *DB
 	repo     *HealthStateRepository
-	barrier  *facoreCHG007BeginBarrier
 	revision *HealthFileRevision
 	snapshot *ProviderSnapshot
 	now      time.Time
@@ -153,11 +105,11 @@ func newFACORECHG007ImmediateSQLiteFixture(t *testing.T) facoreCHG007SQLiteFixtu
 	require.NoError(t, err)
 	require.NoError(t, migrated.Close())
 
-	barrier := &facoreCHG007BeginBarrier{}
-	dsn := path + "?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=30000&_foreign_keys=on&_txlock=immediate"
-	raw := sql.OpenDB(&facoreCHG007SQLiteConnector{
-		driver: &sqlite3.SQLiteDriver{}, dsn: dsn, barrier: barrier,
-	})
+	// The zero busy timeout makes the bounded contention result immediate and
+	// deterministic while retaining the production candidate's transaction mode.
+	dsn := path + "?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=0&_foreign_keys=on&_txlock=immediate"
+	raw, err := sql.Open("sqlite3", dsn)
+	require.NoError(t, err)
 	raw.SetMaxOpenConns(8)
 	require.NoError(t, raw.Ping())
 	db := &DB{conn: raw, dialect: dialectHelper{d: DialectSQLite}}
@@ -173,60 +125,39 @@ func newFACORECHG007ImmediateSQLiteFixture(t *testing.T) facoreCHG007SQLiteFixtu
 	snapshot, err := repo.CaptureActiveProviderSnapshot(ctx, now)
 	require.NoError(t, err)
 	return facoreCHG007SQLiteFixture{
-		db: db, repo: repo, barrier: barrier, revision: revision, snapshot: snapshot, now: now,
+		db: db, repo: repo, revision: revision, snapshot: snapshot, now: now,
 	}
 }
 
-func runFACORECHG007AfterBeginBlocked(
-	t *testing.T,
-	f facoreCHG007SQLiteFixture,
-	operation func(context.Context) error,
-) error {
+func holdFACORECHG007SQLiteWriter(t *testing.T, db *DB) *sql.Tx {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	holderConn := facoreCHG007SQLiteConn(t, f.db)
-	holder, err := holderConn.BeginTx(ctx, nil)
+	holderConn := facoreCHG007SQLiteConn(t, db)
+	holder, err := holderConn.BeginTx(context.Background(), nil)
 	require.NoError(t, err)
-	attempted := f.barrier.arm()
-	result := make(chan error, 1)
-	go func() { result <- operation(ctx) }()
-	select {
-	case <-attempted:
-	case <-ctx.Done():
-		_ = holder.Rollback()
-		t.Fatalf("operation did not reach BeginTx barrier: %v", ctx.Err())
-	}
-	select {
-	case operationErr := <-result:
-		_ = holder.Rollback()
-		t.Fatalf("operation completed before writer release: %v", operationErr)
-	default:
-	}
-	require.NoError(t, holder.Rollback())
-	select {
-	case operationErr := <-result:
-		return operationErr
-	case <-ctx.Done():
-		t.Fatalf("operation did not finish after writer release: %v", ctx.Err())
-		return ctx.Err()
-	}
+	t.Cleanup(func() { _ = holder.Rollback() })
+	return holder
 }
 
 func TestFACORECHG007SQLiteReadBeforeWriteBoundariesHonorImmediateOwnership(t *testing.T) {
 	t.Run("CreateHealthRun", func(t *testing.T) {
 		f := newFACORECHG007ImmediateSQLiteFixture(t)
+		ctx := context.Background()
 		spec := HealthRunSpec{
 			ID: "chg007-contended-run", FileRevisionID: f.revision.ID,
 			ProviderSnapshotID: f.snapshot.ID, Trigger: "manual", Mode: "observation",
 			TotalSegments: f.revision.SegmentCount, CreatedAt: f.now.Add(time.Minute),
 		}
-		err := runFACORECHG007AfterBeginBlocked(t, f, func(ctx context.Context) error {
-			_, err := f.repo.CreateHealthRun(ctx, spec)
-			return err
-		})
-		require.NoError(t, err)
+		holder := holdFACORECHG007SQLiteWriter(t, f.db)
+		_, err := f.repo.CreateHealthRun(ctx, spec)
+		requireFACORECHG007SQLiteBeginBusy(t, err)
 		var count int
+		require.NoError(t, f.db.Connection().QueryRow(
+			`SELECT COUNT(*) FROM health_runs WHERE id = ?`, spec.ID).Scan(&count))
+		assert.Zero(t, count, "failed creation must not publish a partial run")
+		require.NoError(t, holder.Rollback())
+
+		_, err = f.repo.CreateHealthRun(ctx, spec)
+		require.NoError(t, err, "creation must succeed when retried after writer release")
 		require.NoError(t, f.db.Connection().QueryRow(
 			`SELECT COUNT(*) FROM health_runs WHERE id = ?`, spec.ID).Scan(&count))
 		assert.Equal(t, 1, count)
@@ -243,18 +174,30 @@ func TestFACORECHG007SQLiteReadBeforeWriteBoundariesHonorImmediateOwnership(t *t
 			ID: "chg007-synthetic", GapID: gap.ID, FileRevisionID: f.revision.ID,
 			ByteStart: 0, ByteEnd: 99, EmittedAt: f.now.Add(time.Minute),
 		}
-		err = runFACORECHG007AfterBeginBlocked(t, f, func(ctx context.Context) error {
-			_, err := f.repo.RecordSyntheticOutput(ctx, write)
-			return err
-		})
-		require.NoError(t, err)
-		state, err := f.repo.RecordSyntheticOutput(context.Background(), write)
-		require.NoError(t, err, "successful synthetic output must remain replayable")
-		assert.Equal(t, CacheRecoverySynthetic, state.Status)
-		var ranges int
+		holder := holdFACORECHG007SQLiteWriter(t, f.db)
+		_, err = f.repo.RecordSyntheticOutput(context.Background(), write)
+		requireFACORECHG007SQLiteBeginBusy(t, err)
+		var ranges, recovery int
 		require.NoError(t, f.db.Connection().QueryRow(
 			`SELECT COUNT(*) FROM health_synthetic_ranges WHERE id = ?`, write.ID).Scan(&ranges))
+		require.NoError(t, f.db.Connection().QueryRow(
+			`SELECT COUNT(*) FROM health_cache_recovery WHERE file_revision_id = ?`, write.FileRevisionID).Scan(&recovery))
+		assert.Zero(t, ranges, "failed synthetic output must not publish its range")
+		assert.Zero(t, recovery, "failed synthetic output must not publish cache state")
+		require.NoError(t, holder.Rollback())
+
+		state, err := f.repo.RecordSyntheticOutput(context.Background(), write)
+		require.NoError(t, err, "synthetic output must succeed when retried after writer release")
+		assert.Equal(t, CacheRecoverySynthetic, state.Status)
+		state, err = f.repo.RecordSyntheticOutput(context.Background(), write)
+		require.NoError(t, err, "successful synthetic output must remain replayable")
+		assert.Equal(t, CacheRecoverySynthetic, state.Status)
+		require.NoError(t, f.db.Connection().QueryRow(
+			`SELECT COUNT(*) FROM health_synthetic_ranges WHERE id = ?`, write.ID).Scan(&ranges))
+		require.NoError(t, f.db.Connection().QueryRow(
+			`SELECT COUNT(*) FROM health_cache_recovery WHERE file_revision_id = ?`, write.FileRevisionID).Scan(&recovery))
 		assert.Equal(t, 1, ranges)
+		assert.Equal(t, 1, recovery)
 	})
 
 	t.Run("MarkSyntheticRangeRecovered", func(t *testing.T) {
@@ -272,17 +215,29 @@ func TestFACORECHG007SQLiteReadBeforeWriteBoundariesHonorImmediateOwnership(t *t
 		_, err = f.repo.RecordSyntheticOutput(ctx, write)
 		require.NoError(t, err)
 		recoveredAt := f.now.Add(2 * time.Minute)
-		err = runFACORECHG007AfterBeginBlocked(t, f, func(ctx context.Context) error {
-			_, err := f.repo.MarkSyntheticRangeRecovered(ctx, write.ID, recoveredAt)
-			return err
-		})
-		require.NoError(t, err)
-		state, err := f.repo.MarkSyntheticRangeRecovered(ctx, write.ID, recoveredAt.Add(time.Minute))
-		require.NoError(t, err, "successful recovery must remain replayable")
-		assert.Equal(t, CacheRecoveryPending, state.Status)
-		var retained time.Time
+		holder := holdFACORECHG007SQLiteWriter(t, f.db)
+		_, err = f.repo.MarkSyntheticRangeRecovered(ctx, write.ID, recoveredAt)
+		requireFACORECHG007SQLiteBeginBusy(t, err)
+		var retained *time.Time
 		require.NoError(t, f.db.Connection().QueryRow(
 			`SELECT recovered_at FROM health_synthetic_ranges WHERE id = ?`, write.ID).Scan(&retained))
+		assert.Nil(t, retained, "failed recovery must not mark the synthetic range")
+		state, err := f.repo.GetCacheRecoveryState(ctx, write.FileRevisionID)
+		require.NoError(t, err)
+		require.NotNil(t, state)
+		assert.Equal(t, CacheRecoverySynthetic, state.Status,
+			"failed recovery must not publish pending cache state")
+		require.NoError(t, holder.Rollback())
+
+		state, err = f.repo.MarkSyntheticRangeRecovered(ctx, write.ID, recoveredAt)
+		require.NoError(t, err, "recovery must succeed when retried after writer release")
+		assert.Equal(t, CacheRecoveryPending, state.Status)
+		state, err = f.repo.MarkSyntheticRangeRecovered(ctx, write.ID, recoveredAt.Add(time.Minute))
+		require.NoError(t, err, "successful recovery must remain replayable")
+		assert.Equal(t, CacheRecoveryPending, state.Status)
+		require.NoError(t, f.db.Connection().QueryRow(
+			`SELECT recovered_at FROM health_synthetic_ranges WHERE id = ?`, write.ID).Scan(&retained))
+		require.NotNil(t, retained)
 		assert.True(t, retained.Equal(recoveredAt), "replay changed the first recovery time")
 	})
 }

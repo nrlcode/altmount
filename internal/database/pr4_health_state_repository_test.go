@@ -77,40 +77,47 @@ func TestPR4ProviderRegistryAllowsAnonymousAccountIdentity(t *testing.T) {
 }
 
 func TestPR4ProviderRegistryRejectsDuplicateConfiguredIdentitiesBeforeMutation(t *testing.T) {
-	db, repo := newPR4Repository(t)
-	ctx := context.Background()
-	_, err := repo.ReconcileProviders(ctx, []ProviderSpec{
-		{StableID: "retained-provider", DisplayName: "Retained", Endpoint: "retained.example.invalid", Port: 119, Account: "retained", Role: ProviderRolePrimary, Order: 0},
-	})
-	require.NoError(t, err)
-	before := chg007ProviderRegistryState(t, ctx, db, repo)
+	forEachFACORECHG007IdentityBackend(t, func(t *testing.T, backend chg007IdentityBackend) {
+		ctx := context.Background()
+		suffix := uuid.NewString()
+		_, err := backend.repo.ReconcileProviders(ctx, []ProviderSpec{{
+			StableID: "retained-provider-" + suffix, DisplayName: "Retained",
+			Endpoint: "retained-" + suffix + ".example.invalid", Port: 119, Account: "retained",
+			Role: ProviderRolePrimary, Order: 0,
+		}})
+		require.NoError(t, err)
+		before := chg007CapturePreexistingRegistryState(t, ctx, backend.db, backend.repo)
 
-	_, err = repo.ReconcileProviders(ctx, []ProviderSpec{
-		{DisplayName: "Account A", Endpoint: " Shared.Example.Invalid ", Port: 119, Account: " shared ", Role: ProviderRolePrimary, Order: 0},
-		{DisplayName: "Account B", Endpoint: "shared.example.invalid", Port: 119, Account: "shared", Role: ProviderRoleBackup, Order: 1},
+		_, err = backend.repo.ReconcileProviders(ctx, []ProviderSpec{
+			{DisplayName: "Account A", Endpoint: " Shared-" + suffix + ".Example.Invalid. ", Port: 119, Account: " shared ", Role: ProviderRolePrimary, Order: 0},
+			{DisplayName: "Account B", Endpoint: "shared-" + suffix + ".example.invalid", Port: 119, Account: "shared", Role: ProviderRoleBackup, Order: 1},
+		})
+		assert.ErrorContains(t, err, "duplicate provider identity")
+		assertCHG007PreexistingRegistryStatePreserved(t, ctx, backend.db, backend.repo, before)
 	})
-	assert.ErrorContains(t, err, "duplicate provider identity")
-	assert.Equal(t, before, chg007ProviderRegistryState(t, ctx, db, repo),
-		"duplicate normalized identities must be rejected before tombstoning retained state")
 }
 
 func TestPR4ProviderRegistryRejectsIdentityClaimedInSameReconcile(t *testing.T) {
-	db, repo := newPR4Repository(t)
-	ctx := context.Background()
-	initial, err := repo.ReconcileProviders(ctx, []ProviderSpec{
-		{StableID: "stable-provider", DisplayName: "Original", Endpoint: "old.example.invalid", Port: 119, Account: "account", Role: ProviderRolePrimary, Order: 0},
-	})
-	require.NoError(t, err)
-	require.Len(t, initial, 1)
-	before := chg007ProviderRegistryState(t, ctx, db, repo)
+	forEachFACORECHG007IdentityBackend(t, func(t *testing.T, backend chg007IdentityBackend) {
+		ctx := context.Background()
+		suffix := uuid.NewString()
+		providerID := "stable-provider-" + suffix
+		initial, err := backend.repo.ReconcileProviders(ctx, []ProviderSpec{{
+			StableID: providerID, DisplayName: "Original",
+			Endpoint: "old-" + suffix + ".example.invalid", Port: 119, Account: "account",
+			Role: ProviderRolePrimary, Order: 0,
+		}})
+		require.NoError(t, err)
+		require.Len(t, initial, 1)
+		before := chg007CapturePreexistingRegistryState(t, ctx, backend.db, backend.repo)
 
-	_, err = repo.ReconcileProviders(ctx, []ProviderSpec{
-		{StableID: "stable-provider", DisplayName: "Moved", Endpoint: "new.example.invalid", Port: 119, Account: "account", Role: ProviderRolePrimary, Order: 0},
-		{DisplayName: "Replacement", Endpoint: "old.example.invalid", Port: 119, Account: "account", Role: ProviderRolePrimary, Order: 1},
+		_, err = backend.repo.ReconcileProviders(ctx, []ProviderSpec{
+			{StableID: providerID, DisplayName: "Moved", Endpoint: "new-" + suffix + ".example.invalid", Port: 119, Account: "account", Role: ProviderRolePrimary, Order: 0},
+			{DisplayName: "Replacement", Endpoint: "old-" + suffix + ".example.invalid", Port: 119, Account: "account", Role: ProviderRolePrimary, Order: 1},
+		})
+		assert.ErrorContains(t, err, "retained provider identity")
+		assertCHG007PreexistingRegistryStatePreserved(t, ctx, backend.db, backend.repo, before)
 	})
-	assert.ErrorContains(t, err, "retained provider identity")
-	assert.Equal(t, before, chg007ProviderRegistryState(t, ctx, db, repo),
-		"an identity conflict with an explicitly claimed retained ID must roll back atomically")
 }
 
 func TestPR4ProviderHistoryCannotBeDeletedInsteadOfTombstoned(t *testing.T) {
