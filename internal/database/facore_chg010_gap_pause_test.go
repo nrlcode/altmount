@@ -146,10 +146,11 @@ func TestFACORECHG010GapNaturalKeyReactivatesCanonicalIdentity(t *testing.T) {
 		} {
 			t.Run(transition.name, func(t *testing.T) {
 				createdAt := f.now.Add(time.Minute)
+				initialConfirmedAt := f.now.Add(30 * time.Second)
 				identity := GapRangeWrite{
 					ID: transition.canonical, FileRevisionID: f.run.FileRevisionID,
 					Kind: GapKindConfirmedAbsent, StartSegment: transition.start, SegmentCount: 2,
-					Status: GapStatusActive, CreatedAt: createdAt,
+					Status: GapStatusActive, CreatedAt: createdAt, ConfirmedAt: &initialConfirmedAt,
 				}
 				original, err := f.repo.UpsertGapRange(ctx, identity)
 				require.NoError(t, err)
@@ -340,7 +341,6 @@ func TestFACORECHG010GapConcurrentCanonicalizationAndClientReplay(t *testing.T) 
 func TestFACORECHG010PauseMethodAndAcquireOrdering(t *testing.T) {
 	forEachFACORECHG009RepositoryBackend(t, func(t *testing.T, dialect Dialect) {
 		f := newCHG009Fixture(t, 8, dialect)
-		_ = requireFACORECHG010PauseAcknowledger(t, f.repo) // runtime, not compile-time, API assertion
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		require.NoError(t, f.repo.RequestRunPause(ctx, f.run.ID, true, f.now.Add(time.Minute)))
@@ -351,6 +351,20 @@ func TestFACORECHG010PauseMethodAndAcquireOrdering(t *testing.T) {
 		assert.Equal(t, HealthRunPending, blocked.Status)
 		assert.True(t, blocked.PauseRequested)
 		assert.Nil(t, blocked.LeaseOwner)
+
+		running := f.siblingRun(t)
+		_, err = f.repo.AcquireRunLease(ctx, running.ID, "running-worker", time.Minute)
+		require.NoError(t, err)
+		require.NoError(t, f.repo.RequestRunPause(ctx, running.ID, true, f.now.Add(90*time.Second)))
+		requestedRunning, err := f.repo.GetHealthRun(ctx, running.ID)
+		require.NoError(t, err)
+		_, err = f.repo.AcquireRunLease(ctx, running.ID, "running-worker", time.Minute)
+		assert.ErrorIs(t, err, ErrStaleHealthLease,
+			"a current owner must not reacquire while a pause is requested")
+		afterReacquire, err := f.repo.GetHealthRun(ctx, running.ID)
+		require.NoError(t, err)
+		assert.Equal(t, requestedRunning, afterReacquire,
+			"rejected pause-requested reacquisition must not advance the fence")
 
 		contended := f.siblingRun(t)
 		values, errs := facoreCHG007RunConcurrentPair(t, ctx, [2]func() (*HealthRun, error){
@@ -375,6 +389,7 @@ func TestFACORECHG010PauseMethodAndAcquireOrdering(t *testing.T) {
 			assert.Equal(t, HealthRunPending, after.Status)
 			assert.Nil(t, after.LeaseOwner)
 		}
+		_ = requireFACORECHG010PauseAcknowledger(t, f.repo) // runtime, not compile-time, API assertion
 	})
 }
 
@@ -385,21 +400,32 @@ func TestFACORECHG010PauseFenceExpiryReplayAndResume(t *testing.T) {
 		ctx := context.Background()
 		expiring, err := f.repo.AcquireRunLease(ctx, f.run.ID, "expiring", time.Minute)
 		require.NoError(t, err)
+		beforeRequest, err := f.repo.GetHealthRun(ctx, f.run.ID)
+		require.NoError(t, err)
 		_, err = api.AcknowledgeRunPause(ctx, f.run.ID, "expiring", expiring.FencingToken, f.now)
 		assert.ErrorIs(t, err, ErrStaleHealthLease, "an unrequested pause cannot be acknowledged")
+		afterUnrequested, err := f.repo.GetHealthRun(ctx, f.run.ID)
+		require.NoError(t, err)
+		assert.Equal(t, beforeRequest, afterUnrequested)
 		require.NoError(t, f.repo.RequestRunPause(ctx, f.run.ID, true, f.now.Add(10*time.Second)))
+		requested, err := f.repo.GetHealthRun(ctx, f.run.ID)
+		require.NoError(t, err)
 		_, err = api.AcknowledgeRunPause(ctx, f.run.ID, "wrong-owner", expiring.FencingToken, f.now)
 		assert.ErrorIs(t, err, ErrStaleHealthLease)
+		afterWrongOwner, err := f.repo.GetHealthRun(ctx, f.run.ID)
+		require.NoError(t, err)
+		assert.Equal(t, requested, afterWrongOwner)
 		_, err = api.AcknowledgeRunPause(ctx, f.run.ID, "expiring", expiring.FencingToken+1, f.now)
 		assert.ErrorIs(t, err, ErrStaleHealthLease)
+		afterWrongToken, err := f.repo.GetHealthRun(ctx, f.run.ID)
+		require.NoError(t, err)
+		assert.Equal(t, requested, afterWrongToken)
 		f.clock.now = *expiring.LeaseExpiresAt
 		_, err = api.AcknowledgeRunPause(ctx, f.run.ID, "expiring", expiring.FencingToken, f.now)
 		assert.ErrorIs(t, err, ErrStaleHealthLease, "the exact repository-time deadline is expired")
 		retained, getErr := f.repo.GetHealthRun(ctx, f.run.ID)
 		require.NoError(t, getErr)
-		assert.Equal(t, HealthRunRunning, retained.Status)
-		require.NotNil(t, retained.LeaseOwner)
-		assert.Equal(t, "expiring", *retained.LeaseOwner)
+		assert.Equal(t, requested, retained, "stale acknowledgements must not mutate run state")
 
 		f.clock.now = f.now
 		live := f.siblingRun(t)
