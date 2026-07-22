@@ -192,6 +192,7 @@ func (r *HealthStateRepository) ReconcileProviders(ctx context.Context, specs []
 	normalized := make([]normalizedProvider, len(specs))
 	orders := make(map[int]struct{}, len(specs))
 	stableIDs := make(map[string]struct{}, len(specs))
+	identities := make(map[string]struct{}, len(specs))
 	for i, spec := range specs {
 		n, identity, err := normalizeProviderSpec(spec)
 		if err != nil {
@@ -207,17 +208,27 @@ func (r *HealthStateRepository) ReconcileProviders(ctx context.Context, specs []
 			}
 			stableIDs[n.StableID] = struct{}{}
 		}
+		if _, exists := identities[identity]; exists {
+			return nil, fmt.Errorf("duplicate provider identity")
+		}
+		identities[identity] = struct{}{}
 		normalized[i] = normalizedProvider{spec: n, identity: identity}
 	}
 	sort.SliceStable(normalized, func(i, j int) bool { return normalized[i].spec.Order < normalized[j].spec.Order })
 
-	now := time.Now().UTC()
 	seenIDs := make(map[string]struct{}, len(normalized))
 	reservedIDs := make(map[string]struct{}, len(stableIDs))
 	for id := range stableIDs {
 		reservedIDs[id] = struct{}{}
 	}
+	var providers []HealthProvider
 	err := r.withTransaction(ctx, func(tx *dialectAwareTx) error {
+		if r.dialect.IsPostgres() {
+			if _, err := tx.ExecContext(ctx, `LOCK TABLE health_providers IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+				return fmt.Errorf("lock provider registry: %w", err)
+			}
+		}
+		now := time.Now().UTC()
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE health_providers
 			SET active = FALSE, tombstoned_at = ?, updated_at = ?
@@ -233,15 +244,18 @@ func (r *HealthStateRepository) ReconcileProviders(ctx context.Context, specs []
 				if err != nil {
 					return err
 				}
-				if len(matches) == 1 {
+				switch len(matches) {
+				case 0:
+					providerID = uuid.NewString()
+				case 1:
 					_, alreadyClaimed := seenIDs[matches[0]]
 					_, explicitlyReserved := reservedIDs[matches[0]]
-					if !alreadyClaimed && !explicitlyReserved {
-						providerID = matches[0]
+					if alreadyClaimed || explicitlyReserved {
+						return fmt.Errorf("retained provider identity is already claimed")
 					}
-				}
-				if providerID == "" {
-					providerID = uuid.NewString()
+					providerID = matches[0]
+				default:
+					return fmt.Errorf("multiple retained provider IDs match configured identity")
 				}
 			}
 			if _, duplicate := seenIDs[providerID]; duplicate {
@@ -293,12 +307,17 @@ func (r *HealthStateRepository) ReconcileProviders(ctx context.Context, specs []
 				}
 			}
 		}
+		listed, err := listProviders(ctx, tx, false)
+		if err != nil {
+			return err
+		}
+		providers = listed
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return r.ListProviders(ctx, false)
+	return providers, nil
 }
 
 func providerIDsForIdentity(ctx context.Context, tx *dialectAwareTx, identity string) ([]string, error) {
@@ -345,6 +364,10 @@ func scanHealthProvider(row rowScanner, provider *HealthProvider) error {
 }
 
 func (r *HealthStateRepository) ListProviders(ctx context.Context, includeTombstoned bool) ([]HealthProvider, error) {
+	return listProviders(ctx, r.db, includeTombstoned)
+}
+
+func listProviders(ctx context.Context, db DBQuerier, includeTombstoned bool) ([]HealthProvider, error) {
 	query := `
 		SELECT id, display_name, role, configured_order, active, current_generation,
 		       tombstoned_at, created_at, updated_at
@@ -354,7 +377,7 @@ func (r *HealthStateRepository) ListProviders(ctx context.Context, includeTombst
 		query += ` WHERE active = TRUE`
 	}
 	query += ` ORDER BY active DESC, configured_order, id`
-	rows, err := r.db.QueryContext(ctx, query)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("list providers: %w", err)
 	}
