@@ -2,11 +2,15 @@ package metadata
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -591,6 +595,292 @@ func (ms *MetadataService) DeleteStoragePathWithSourceNzb(ctx context.Context, s
 		plan.pruneSources = true
 		return ms.executeFileCleanup(ctx, plan)
 	})
+}
+
+type stagedSourceNzb struct {
+	source           *cleanupTarget
+	file             *os.File
+	destination      *cleanupTarget
+	removeSource     bool
+	sourceWasRemoved bool
+}
+
+func (ms *MetadataService) PublishSourceNzbs(
+	ctx context.Context,
+	destinationRoot string,
+	sourcePaths []string,
+	publish func([]string) error,
+) error {
+	return ms.publishSourceNzbs(ctx, destinationRoot, sourcePaths, nil, false, publish)
+}
+
+func (ms *MetadataService) RelocateSourceNzb(
+	ctx context.Context,
+	sourcePath, destinationRoot, destinationName string,
+	publish func(string) error,
+) error {
+	if publish == nil {
+		return errors.New("relocate source NZB: callback is nil")
+	}
+	return ms.publishSourceNzbs(ctx, destinationRoot, []string{sourcePath}, []string{destinationName}, true, func(paths []string) error {
+		return publish(paths[0])
+	})
+}
+
+func (ms *MetadataService) publishSourceNzbs(
+	ctx context.Context,
+	destinationRoot string,
+	sourcePaths, destinationNames []string,
+	requireOwned bool,
+	publish func([]string) error,
+) error {
+	if publish == nil {
+		return errors.New("publish source NZBs: callback is nil")
+	}
+	return ms.cleanupOperation(func(planner *cleanupPlanner, roots cleanupRoots) error {
+		rootName, authority, err := prepareSourceDestination(planner, roots, destinationRoot)
+		if err != nil {
+			return err
+		}
+		staged := make([]*stagedSourceNzb, 0, len(sourcePaths))
+		defer closeStagedSourceNzbs(staged)
+		for i, sourcePath := range sourcePaths {
+			name := ""
+			if i < len(destinationNames) {
+				name = destinationNames[i]
+			}
+			entry, stageErr := stageSourceNzb(planner, roots, rootName, authority, sourcePath, name, requireOwned)
+			if stageErr != nil {
+				return errors.Join(stageErr, rollbackStagedSourceNzbs(staged))
+			}
+			staged = append(staged, entry)
+		}
+		if err := removeStagedSources(staged); err != nil {
+			return err
+		}
+		paths := make([]string, len(staged))
+		for i, entry := range staged {
+			paths[i] = entry.destination.absolute
+		}
+		if err := publish(paths); err != nil {
+			if rollbackErr := rollbackStagedSourceNzbs(staged); rollbackErr != nil {
+				return errors.Join(err, rollbackErr)
+			}
+			return err
+		}
+		return nil
+	})
+}
+
+func prepareSourceDestination(planner *cleanupPlanner, roots cleanupRoots, destinationRoot string) (string, *cleanupAuthority, error) {
+	absolute, err := filepath.Abs(destinationRoot)
+	if err != nil {
+		return "", nil, fmt.Errorf("canonicalize source destination %q: %w", destinationRoot, err)
+	}
+	if !slices.Contains(roots.sources, absolute) {
+		return "", nil, fmt.Errorf("source destination %q has no configured authority", destinationRoot)
+	}
+	if err := os.MkdirAll(absolute, 0o755); err != nil {
+		return "", nil, fmt.Errorf("create source destination %q: %w", absolute, err)
+	}
+	authority, err := planner.authority(absolute)
+	if err != nil {
+		return "", nil, err
+	}
+	if authority.missing || authority.root == nil {
+		return "", nil, fmt.Errorf("source destination %q is unavailable", absolute)
+	}
+	return absolute, authority, nil
+}
+
+func stageSourceNzb(
+	planner *cleanupPlanner,
+	roots cleanupRoots,
+	destinationRoot string,
+	destinationAuthority *cleanupAuthority,
+	sourcePath, destinationName string,
+	requireOwned bool,
+) (*stagedSourceNzb, error) {
+	var source *cleanupTarget
+	var err error
+	if requireOwned {
+		source, err = planner.sourceFile(roots, sourcePath)
+	} else {
+		absolute, absErr := filepath.Abs(sourcePath)
+		if absErr != nil {
+			return nil, fmt.Errorf("canonicalize source NZB %q: %w", sourcePath, absErr)
+		}
+		if pathWithinRoot(destinationRoot, absolute) {
+			source, err = planner.externalFile(destinationRoot, absolute)
+		} else {
+			parent := filepath.Dir(absolute)
+			source, err = planner.relativeTarget(parent, filepath.Base(absolute), false)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	file, info, err := openRegularCleanupTarget(source)
+	if err != nil {
+		return nil, err
+	}
+	entry := &stagedSourceNzb{source: source, file: file}
+	keepFile := false
+	defer func() {
+		if !keepFile {
+			_ = file.Close()
+		}
+	}()
+
+	if destinationName == "" && pathWithinRoot(destinationRoot, source.absolute) {
+		entry.destination = source
+		keepFile = true
+		return entry, nil
+	}
+	if destinationName == "" {
+		destinationName, err = uniqueStagedName(filepath.Base(source.absolute))
+		if err != nil {
+			return nil, err
+		}
+	}
+	destinationName = filepath.Clean(destinationName)
+	if !filepath.IsLocal(destinationName) || destinationName == "." {
+		return nil, fmt.Errorf("source destination %q is not local", destinationName)
+	}
+	parent := filepath.Dir(destinationName)
+	if parent != "." {
+		if err := destinationAuthority.root.MkdirAll(parent, 0o755); err != nil {
+			return nil, fmt.Errorf("create source destination parent %q: %w", parent, err)
+		}
+	}
+	if _, err := planner.relativeTarget(destinationRoot, destinationName, false); err != nil {
+		return nil, err
+	}
+	destinationFile, err := destinationAuthority.root.OpenFile(destinationName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	if err != nil {
+		return nil, fmt.Errorf("create rooted source copy %q: %w", filepath.Join(destinationRoot, destinationName), err)
+	}
+	_, copyErr := io.Copy(destinationFile, file)
+	copyErr = errors.Join(copyErr, destinationFile.Close())
+	if copyErr != nil {
+		_ = destinationAuthority.root.Remove(destinationName)
+		return nil, fmt.Errorf("copy source NZB into rooted authority: %w", copyErr)
+	}
+	destination, err := planner.relativeTarget(destinationRoot, destinationName, false)
+	if err != nil {
+		_ = destinationAuthority.root.Remove(destinationName)
+		return nil, err
+	}
+	if !destination.exists || destination.mode&os.ModeSymlink != 0 || !destination.mode.IsRegular() {
+		_ = destinationAuthority.root.Remove(destinationName)
+		return nil, fmt.Errorf("rooted source copy %q is not a regular file", destination.absolute)
+	}
+	entry.destination = destination
+	entry.removeSource = true
+	keepFile = true
+	return entry, nil
+}
+
+func uniqueStagedName(base string) (string, error) {
+	if base == "" || base == "." {
+		return "", errors.New("source NZB has no usable filename")
+	}
+	random := make([]byte, 12)
+	if _, err := rand.Read(random); err != nil {
+		return "", fmt.Errorf("generate rooted source filename: %w", err)
+	}
+	return hex.EncodeToString(random) + "-" + base, nil
+}
+
+func openRegularCleanupTarget(target *cleanupTarget) (*os.File, fs.FileInfo, error) {
+	if target == nil || !target.exists || target.authority == nil || target.authority.root == nil {
+		return nil, nil, errors.New("source NZB does not exist")
+	}
+	if target.mode&os.ModeSymlink != 0 || !target.mode.IsRegular() {
+		return nil, nil, fmt.Errorf("source NZB %q is not a regular file", target.absolute)
+	}
+	file, err := target.authority.root.Open(target.relative)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open source NZB %q: %w", target.absolute, err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("inspect opened source NZB %q: %w", target.absolute, err)
+	}
+	current, err := target.authority.root.Lstat(target.relative)
+	if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(current, info) {
+		_ = file.Close()
+		return nil, nil, fmt.Errorf("source NZB %q changed while acquiring authority", target.absolute)
+	}
+	return file, info, nil
+}
+
+func removeStagedSources(staged []*stagedSourceNzb) error {
+	for _, entry := range staged {
+		if !entry.removeSource {
+			continue
+		}
+		opened, err := entry.file.Stat()
+		if err != nil {
+			return errors.Join(fmt.Errorf("inspect source NZB %q before removal: %w", entry.source.absolute, err), rollbackStagedSourceNzbs(staged))
+		}
+		current, err := entry.source.authority.root.Lstat(entry.source.relative)
+		if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(current, opened) {
+			return errors.Join(fmt.Errorf("source NZB %q changed before removal", entry.source.absolute), rollbackStagedSourceNzbs(staged))
+		}
+		if err := entry.source.authority.root.Remove(entry.source.relative); err != nil {
+			return errors.Join(fmt.Errorf("remove admitted source NZB %q: %w", entry.source.absolute, err), rollbackStagedSourceNzbs(staged))
+		}
+		entry.sourceWasRemoved = true
+	}
+	return nil
+}
+
+func rollbackStagedSourceNzbs(staged []*stagedSourceNzb) error {
+	var restoreErrors []error
+	for _, entry := range staged {
+		if !entry.sourceWasRemoved {
+			continue
+		}
+		if _, err := entry.file.Seek(0, io.SeekStart); err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("rewind source NZB %q: %w", entry.source.absolute, err))
+			continue
+		}
+		restored, err := entry.source.authority.root.OpenFile(entry.source.relative, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			restoreErrors = append(restoreErrors, fmt.Errorf("restore source NZB %q: %w", entry.source.absolute, err))
+			continue
+		}
+		_, copyErr := io.Copy(restored, entry.file)
+		closeErr := restored.Close()
+		if copyErr != nil || closeErr != nil {
+			_ = entry.source.authority.root.Remove(entry.source.relative)
+			restoreErrors = append(restoreErrors, errors.Join(copyErr, closeErr))
+			continue
+		}
+		entry.sourceWasRemoved = false
+	}
+	if len(restoreErrors) > 0 {
+		return fmt.Errorf("rollback admitted source NZBs: %w", errors.Join(restoreErrors...))
+	}
+	for _, entry := range staged {
+		if entry.destination == nil || entry.destination == entry.source {
+			continue
+		}
+		if err := removeCleanupTarget(entry.destination); err != nil {
+			return fmt.Errorf("remove rolled-back rooted source copy %q: %w", entry.destination.absolute, err)
+		}
+	}
+	return nil
+}
+
+func closeStagedSourceNzbs(staged []*stagedSourceNzb) {
+	for _, entry := range staged {
+		if entry != nil && entry.file != nil {
+			_ = entry.file.Close()
+		}
+	}
 }
 
 func removeCleanupTarget(target *cleanupTarget) error {

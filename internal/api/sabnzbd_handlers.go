@@ -406,7 +406,7 @@ func (s *Server) handleSABnzbdAddFile(c *fiber.Ctx) error {
 	if movie := c.FormValue("movie"); movie != "" {
 		metadata["movie_title"] = movie
 	}
-	
+
 	var metadataJSON *string
 	if len(metadata) > 0 {
 		if b, err := json.Marshal(metadata); err == nil {
@@ -708,47 +708,41 @@ func (s *Server) handleSABnzbdQueueDelete(c *fiber.Ctx) error {
 		return s.writeSABnzbdErrorFiber(c, "Importer service not available")
 	}
 
-	// 1. Try numeric ID
-	id, err := strconv.ParseInt(nzoID, 10, 64)
-	if err == nil {
-		// Delete from queue
-		err = s.queueRepo.RemoveFromQueue(c.Context(), id)
-		if err == nil {
-			// Also remove from history if it existed there (to prevent ghost items)
-			_, _ = s.queueRepo.RemoveFromHistoryByNzbID(c.Context(), id)
-			_, _ = s.queueRepo.RemoveFromHistory(c.Context(), id)
+	item, err := s.queueItemBySABIdentifier(c.Context(), nzoID)
+	if err != nil {
+		return s.writeSABnzbdErrorFiber(c, "Failed to get queue item")
+	}
+	if item == nil {
+		return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true})
+	}
+	return s.removeSABQueueItem(c, item)
+}
 
-			// When a queue item is deleted by ID, notify web UI of queue change
-			if s.progressBroadcaster != nil {
-				s.progressBroadcaster.BroadcastQueueChanged()
-			}
-			return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true})
+func (s *Server) queueItemBySABIdentifier(ctx context.Context, value string) (*database.ImportQueueItem, error) {
+	if id, err := strconv.ParseInt(value, 10, 64); err == nil {
+		item, getErr := s.queueRepo.GetQueueItem(ctx, id)
+		if getErr != nil {
+			return nil, getErr
+		}
+		if item != nil {
+			return item, nil
 		}
 	}
+	return s.queueRepo.GetQueueItemByDownloadID(ctx, value)
+}
 
-	// 2. Fallback to DownloadID if not found or not numeric
-	if s.queueRepo != nil {
-		// Try to find the item first to get its ID (for history cleanup)
-		item, _ := s.queueRepo.GetQueueItemByDownloadID(c.Context(), nzoID)
-
-		err = s.queueRepo.RemoveFromQueueByDownloadID(c.Context(), nzoID)
-		if err == nil {
-			// Also remove from history by DownloadID
-			_, _ = s.queueRepo.RemoveFromHistoryByDownloadID(c.Context(), nzoID)
-
-			if item != nil {
-				_, _ = s.queueRepo.RemoveFromHistoryByNzbID(c.Context(), item.ID)
-			}
-
-			// When a queue item is deleted by DownloadID, notify web UI of queue change
-			if s.progressBroadcaster != nil {
-				s.progressBroadcaster.BroadcastQueueChanged()
-			}
-			return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true})
-		}
+func (s *Server) removeSABQueueItem(c *fiber.Ctx, item *database.ImportQueueItem) error {
+	if err := s.removeOwnedQueueItem(c.Context(), item); err != nil {
+		return s.writeSABnzbdErrorFiber(c, "Failed to clean up queue item: "+err.Error())
 	}
-
-	return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true}) // Always return true for delete consistency
+	_, _ = s.queueRepo.RemoveFromHistoryByNzbID(c.Context(), item.ID)
+	if item.DownloadID != nil {
+		_, _ = s.queueRepo.RemoveFromHistoryByDownloadID(c.Context(), *item.DownloadID)
+	}
+	if s.progressBroadcaster != nil {
+		s.progressBroadcaster.BroadcastQueueChanged()
+	}
+	return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true})
 }
 
 // handleSABnzbdHistory handles history operations
@@ -1135,65 +1129,20 @@ func (s *Server) handleSABnzbdHistoryDelete(c *fiber.Ctx) error {
 		return s.writeSABnzbdErrorFiber(c, "Importer service not available")
 	}
 
-	// 1. Try numeric ID
-	id, err := strconv.ParseInt(nzoID, 10, 64)
-	if err == nil {
-		// Delete from queue (history items are still queue items with completed/failed status)
-		err = s.queueRepo.RemoveFromQueue(c.Context(), id)
-		if err == nil {
-			_, _ = s.queueRepo.RemoveFromHistoryByNzbID(c.Context(), id)
-			_, _ = s.queueRepo.RemoveFromHistory(c.Context(), id)
-			// When a history item is deleted by queue ID, notify web UI of queue change
-			if s.progressBroadcaster != nil {
-				s.progressBroadcaster.BroadcastQueueChanged()
-			}
-			return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true})
+	if id, err := strconv.ParseInt(nzoID, 10, 64); err == nil {
+		item, getErr := s.queueRepo.GetQueueItem(c.Context(), id)
+		if getErr != nil {
+			return s.writeSABnzbdErrorFiber(c, "Failed to get queue item")
 		}
-
-		// If not in active queue, it might be in persistent history
-		// Try by original NzbID first
-		affected, histErr := s.queueRepo.RemoveFromHistoryByNzbID(c.Context(), id)
-		if histErr == nil && affected > 0 {
-			// When a history item is deleted by NZB ID, notify web UI of queue change
-			if s.progressBroadcaster != nil {
-				s.progressBroadcaster.BroadcastQueueChanged()
-			}
-			return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true})
-		}
-
-		affected, histErr = s.queueRepo.RemoveFromHistory(c.Context(), id)
-		if histErr == nil && affected > 0 {
-			// When a history item is deleted by history ID, notify web UI of queue change
-			if s.progressBroadcaster != nil {
-				s.progressBroadcaster.BroadcastQueueChanged()
-			}
-			return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true})
-		}
-	}
-
-	// 2. Fallback to DownloadID if not found or not numeric
-	if s.queueRepo != nil {
-		// Try to find the item first to get its ID
-		item, _ := s.queueRepo.GetQueueItemByDownloadID(c.Context(), nzoID)
-
-		// Remove from queue and history by DownloadID
-		_ = s.queueRepo.RemoveFromQueueByDownloadID(c.Context(), nzoID)
-		affected, err := s.queueRepo.RemoveFromHistoryByDownloadID(c.Context(), nzoID)
-
-		if err == nil && affected > 0 {
-			if item != nil {
-				_, _ = s.queueRepo.RemoveFromHistoryByNzbID(c.Context(), item.ID)
-			}
-			// When a history item is deleted by DownloadID, notify web UI of queue change
-			if s.progressBroadcaster != nil {
-				s.progressBroadcaster.BroadcastQueueChanged()
-			}
-			return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true})
-		}
-
-		// If item was found in queue but not in history, consider it handled
 		if item != nil {
-			// When a queue item is removed by DownloadID during history delete, notify web UI
+			return s.removeSABQueueItem(c, item)
+		}
+
+		affected, _ := s.queueRepo.RemoveFromHistoryByNzbID(c.Context(), id)
+		if affected == 0 {
+			affected, _ = s.queueRepo.RemoveFromHistory(c.Context(), id)
+		}
+		if affected > 0 {
 			if s.progressBroadcaster != nil {
 				s.progressBroadcaster.BroadcastQueueChanged()
 			}
@@ -1201,7 +1150,19 @@ func (s *Server) handleSABnzbdHistoryDelete(c *fiber.Ctx) error {
 		}
 	}
 
-	return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true}) // Always return true for delete consistency
+	item, err := s.queueRepo.GetQueueItemByDownloadID(c.Context(), nzoID)
+	if err != nil {
+		return s.writeSABnzbdErrorFiber(c, "Failed to get queue item")
+	}
+	if item != nil {
+		return s.removeSABQueueItem(c, item)
+	}
+
+	_, _ = s.queueRepo.RemoveFromHistoryByDownloadID(c.Context(), nzoID)
+	if s.progressBroadcaster != nil {
+		s.progressBroadcaster.BroadcastQueueChanged()
+	}
+	return s.writeSABnzbdResponseFiber(c, SABnzbdDeleteResponse{Status: true})
 }
 
 // handleSABnzbdStatus handles full status request

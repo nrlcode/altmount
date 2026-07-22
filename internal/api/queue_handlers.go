@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"html"
 	"io"
@@ -23,19 +24,32 @@ import (
 	"github.com/javi11/altmount/internal/nzblnk"
 )
 
-// removeQueueNzbFiles deletes the on-disk NZB files for every non-empty path.
-// Missing files are ignored; other errors are logged so the caller can still
-// report the DB deletion as successful.
-func (s *Server) removeQueueNzbFiles(c *fiber.Ctx, paths []string) {
-	for _, p := range paths {
-		if p == "" {
+func (s *Server) removeOwnedQueueItem(ctx context.Context, item *database.ImportQueueItem) error {
+	if s.metadataService == nil {
+		return fmt.Errorf("metadata cleanup service is not available")
+	}
+	if err := s.metadataService.DeleteStoragePathWithSourceNzb(ctx, "", item.NzbPath); err != nil {
+		return err
+	}
+	return s.queueRepo.RemoveFromQueue(ctx, item.ID)
+}
+
+func (s *Server) clearOwnedQueueItemsByStatus(ctx context.Context, status database.QueueStatus, olderThan *time.Time) (int, error) {
+	items, err := s.queueRepo.ListQueueItems(ctx, &status, "", "", int(^uint(0)>>1), 0, "created_at", "asc")
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, item := range items {
+		if olderThan != nil && !item.UpdatedAt.Before(*olderThan) {
 			continue
 		}
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			slog.WarnContext(c.Context(), "Failed to delete NZB file after queue removal",
-				"path", p, "error", err)
+		if err := s.removeOwnedQueueItem(ctx, item); err != nil {
+			return removed, err
 		}
+		removed++
 	}
+	return removed, nil
 }
 
 // transformQueueError transforms specific errors to user-friendly messages
@@ -239,13 +253,11 @@ func (s *Server) handleDeleteQueue(c *fiber.Ctx) error {
 		return RespondConflict(c, "Cannot delete item currently being processed", "Wait for processing to complete or fail")
 	}
 
-	// Remove from queue
-	err = s.queueRepo.RemoveFromQueue(c.Context(), id)
+	// Release the queue-owned source before removing its ownership row.
+	err = s.removeOwnedQueueItem(c.Context(), item)
 	if err != nil {
 		return RespondInternalError(c, "Failed to delete queue item", err.Error())
 	}
-
-	s.removeQueueNzbFiles(c, []string{item.NzbPath})
 
 	if s.progressBroadcaster != nil {
 		s.progressBroadcaster.BroadcastQueueChanged()
@@ -444,12 +456,10 @@ func (s *Server) handleGetQueueHistoricalStats(c *fiber.Ctx) error {
 //	@Security		BearerAuth
 //	@Router			/queue/completed [delete]
 func (s *Server) handleClearCompletedQueue(c *fiber.Ctx) error {
-	paths, count, err := s.queueRepo.ClearCompletedQueueItems(c.Context())
+	count, err := s.clearOwnedQueueItemsByStatus(c.Context(), database.QueueStatusCompleted, nil)
 	if err != nil {
 		return RespondInternalError(c, "Failed to clear completed queue items", err.Error())
 	}
-
-	s.removeQueueNzbFiles(c, paths)
 
 	if s.progressBroadcaster != nil {
 		s.progressBroadcaster.BroadcastQueueChanged()
@@ -469,12 +479,10 @@ func (s *Server) handleClearCompletedQueue(c *fiber.Ctx) error {
 //	@Security		BearerAuth
 //	@Router			/queue/failed [delete]
 func (s *Server) handleClearFailedQueue(c *fiber.Ctx) error {
-	paths, count, err := s.queueRepo.ClearFailedQueueItems(c.Context())
+	count, err := s.clearOwnedQueueItemsByStatus(c.Context(), database.QueueStatusFailed, nil)
 	if err != nil {
 		return RespondInternalError(c, "Failed to clear failed queue items", err.Error())
 	}
-
-	s.removeQueueNzbFiles(c, paths)
 
 	if s.progressBroadcaster != nil {
 		s.progressBroadcaster.BroadcastQueueChanged()
@@ -494,12 +502,10 @@ func (s *Server) handleClearFailedQueue(c *fiber.Ctx) error {
 //	@Security		BearerAuth
 //	@Router			/queue/pending [delete]
 func (s *Server) handleClearPendingQueue(c *fiber.Ctx) error {
-	paths, count, err := s.queueRepo.ClearPendingQueueItems(c.Context())
+	count, err := s.clearOwnedQueueItemsByStatus(c.Context(), database.QueueStatusPending, nil)
 	if err != nil {
 		return RespondInternalError(c, "Failed to clear pending queue items", err.Error())
 	}
-
-	s.removeQueueNzbFiles(c, paths)
 
 	if s.progressBroadcaster != nil {
 		s.progressBroadcaster.BroadcastQueueChanged()
@@ -536,26 +542,37 @@ func (s *Server) handleDeleteQueueBulk(c *fiber.Ctx) error {
 		return RespondBadRequest(c, "No IDs provided", "At least one ID is required")
 	}
 
-	// Remove from queue in bulk (this will check for processing items)
-	result, err := s.queueRepo.RemoveFromQueueBulk(c.Context(), request.IDs)
-	if err != nil {
-		// Check if the error is about processing items
-		if result != nil && result.ProcessingCount > 0 {
-			return RespondConflict(c, "Cannot delete items currently being processed", fmt.Sprintf("%d items are currently being processed", result.ProcessingCount))
+	seen := make(map[int64]struct{}, len(request.IDs))
+	deletedCount := 0
+	defer func() {
+		if deletedCount > 0 && s.progressBroadcaster != nil {
+			s.progressBroadcaster.BroadcastQueueChanged()
 		}
-
-		return RespondInternalError(c, "Failed to delete queue items", err.Error())
-	}
-
-	s.removeQueueNzbFiles(c, result.DeletedPaths)
-
-	if s.progressBroadcaster != nil {
-		s.progressBroadcaster.BroadcastQueueChanged()
+	}()
+	for _, id := range request.IDs {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		item, err := s.queueRepo.GetQueueItem(c.Context(), id)
+		if err != nil {
+			return RespondInternalError(c, "Failed to retrieve queue item", err.Error())
+		}
+		if item == nil {
+			continue
+		}
+		if item.Status == database.QueueStatusProcessing {
+			return RespondConflict(c, "Cannot delete items currently being processed", "1 item is currently being processed")
+		}
+		if err := s.removeOwnedQueueItem(c.Context(), item); err != nil {
+			return RespondInternalError(c, "Failed to delete queue items", err.Error())
+		}
+		deletedCount++
 	}
 
 	return RespondSuccess(c, fiber.Map{
-		"deleted_count": result.DeletedCount,
-		"message":       fmt.Sprintf("Successfully deleted %d queue items", result.DeletedCount),
+		"deleted_count": deletedCount,
+		"message":       fmt.Sprintf("Successfully deleted %d queue items", deletedCount),
 	})
 }
 

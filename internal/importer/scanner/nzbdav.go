@@ -165,6 +165,7 @@ func (n *NzbDavImporter) performImport(ctx context.Context, epoch int64, dbPath 
 		n.mu.Unlock()
 		return
 	}
+	defer os.RemoveAll(nzbTempDir)
 
 	// Create workers
 	numWorkers := 4 // Use fewer parallel workers for file creation
@@ -267,8 +268,8 @@ func (n *NzbDavImporter) processBatch(ctx context.Context, batchChan <-chan *dat
 
 	// extractMeta reads nzbdav-specific fields from the item metadata JSON.
 	type nzbdavMeta struct {
-		NzbdavID     string        `json:"nzbdav_id"`
-		DavItemName  string        `json:"nzbdav_dav_item_name"`
+		NzbdavID      string        `json:"nzbdav_id"`
+		DavItemName   string        `json:"nzbdav_dav_item_name"`
 		NzbdavAliases []nzbdavAlias `json:"nzbdav_aliases"`
 	}
 	extractMeta := func(item *database.ImportQueueItem) nzbdavMeta {

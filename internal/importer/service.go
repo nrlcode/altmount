@@ -31,7 +31,6 @@ import (
 	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/progress"
 	"github.com/javi11/altmount/internal/sabnzbd"
-	"github.com/javi11/altmount/internal/utils"
 	"github.com/javi11/altmount/pkg/rclonecli"
 	"github.com/javi11/nzbparser"
 )
@@ -60,7 +59,7 @@ const (
 
 // queueAdapterForScanner adapts database repository for scanner.QueueAdder interface
 type queueAdapterForScanner struct {
-	repo            *database.QueueRepository
+	service         *Service
 	metadataService *metadata.MetadataService
 	calcFileSize    func(string) (int64, error)
 }
@@ -85,11 +84,11 @@ func (a *queueAdapterForScanner) AddToQueue(ctx context.Context, filePath string
 		CreatedAt:    time.Now(),
 	}
 
-	return a.repo.AddToQueue(ctx, item)
+	return a.service.AddQueueItem(ctx, item)
 }
 
 func (a *queueAdapterForScanner) IsFileInQueue(ctx context.Context, filePath string) bool {
-	inQueue, _ := a.repo.IsFileInQueue(ctx, filePath)
+	inQueue, _ := a.service.IsFileInQueue(ctx, filePath)
 	return inQueue
 }
 
@@ -100,12 +99,12 @@ func (a *queueAdapterForScanner) IsFileProcessed(filePath string, scanRoot strin
 // batchQueueAdapterForImporter adapts database repository for scanner.BatchQueueAdder and
 // scanner.MigrationRecorder interfaces.
 type batchQueueAdapterForImporter struct {
-	repo          *database.QueueRepository
+	service       *Service
 	migrationRepo *database.ImportMigrationRepository
 }
 
 func (a *batchQueueAdapterForImporter) AddBatchToQueue(ctx context.Context, items []*database.ImportQueueItem) error {
-	return a.repo.AddBatchToQueue(ctx, items)
+	return a.service.addBatchToQueue(ctx, items)
 }
 
 func (a *batchQueueAdapterForImporter) UpsertMigration(ctx context.Context, source, externalID, relativePath string) (int64, error) {
@@ -271,7 +270,7 @@ func NewService(config ServiceConfig, metadataService *metadata.MetadataService,
 
 	// Create scanner adapter for directory scanning
 	scannerAdapter := &queueAdapterForScanner{
-		repo:            database.Repository,
+		service:         service,
 		metadataService: metadataService,
 		calcFileSize:    service.CalculateFileSizeOnly,
 	}
@@ -279,7 +278,7 @@ func NewService(config ServiceConfig, metadataService *metadata.MetadataService,
 
 	// Create adapter for NZBDav imports
 	importerAdapter := &batchQueueAdapterForImporter{
-		repo:          database.Repository,
+		service:       service,
 		migrationRepo: database.MigrationRepo,
 	}
 	service.nzbdavImporter = scanner.NewNzbDavImporter(importerAdapter, importerAdapter)
@@ -597,25 +596,11 @@ func (s *Service) GetFailedNzbFolder() string {
 func (s *Service) MoveToFailedFolder(ctx context.Context, item *database.ImportQueueItem) error {
 	failedDir := s.GetFailedNzbFolder()
 
-	// Add category subfolder if present to keep failed items organized
 	if item.Category != nil && *item.Category != "" {
+		if !filepath.IsLocal(*item.Category) {
+			return fmt.Errorf("failed NZB category %q is not local", *item.Category)
+		}
 		failedDir = filepath.Join(failedDir, *item.Category)
-	}
-
-	if err := os.MkdirAll(failedDir, 0755); err != nil {
-		return fmt.Errorf("failed to create failed directory: %w", err)
-	}
-
-	// import_queue.nzb_path is UNIQUE. Two failed items can share a basename (e.g. a re-acquired
-	// release reuses the same NZB filename), so a prior failed item may already occupy the plain
-	// destination -- without disambiguation the DB update below fails with a UNIQUE constraint
-	// violation. uniqueFailedNzbPath namespaces the copy by the queue item ID on collision.
-	newPath := uniqueFailedNzbPath(failedDir, item.NzbPath, item.ID)
-
-	// Check if source exists
-	if _, err := os.Stat(item.NzbPath); os.IsNotExist(err) {
-		// If source doesn't exist, maybe it was already moved?
-		return nil
 	}
 
 	// Avoid moving if already in failed folder (e.g. retry of failed item)
@@ -623,20 +608,26 @@ func (s *Service) MoveToFailedFolder(ctx context.Context, item *database.ImportQ
 		return nil
 	}
 
-	// Move file
-	if err := utils.MoveFile(item.NzbPath, newPath); err != nil {
-		return fmt.Errorf("failed to move NZB to failed folder: %w", err)
+	if _, err := os.Lstat(item.NzbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect failed NZB source: %w", err)
 	}
 
-	// Update DB
-	if err := s.database.Repository.UpdateQueueItemNzbPath(ctx, item.ID, newPath); err != nil {
-		return fmt.Errorf("failed to update DB with new NZB path: %w", err)
+	newPath := uniqueFailedNzbPath(failedDir, item.NzbPath, item.ID)
+	destinationName, err := filepath.Rel(s.GetNzbFolder(), newPath)
+	if err != nil || !filepath.IsLocal(destinationName) {
+		return fmt.Errorf("failed NZB destination %q is not local", newPath)
 	}
-
-	// Update struct
-	item.NzbPath = newPath
-	s.log.InfoContext(ctx, "Moved failed NZB to failed directory", "new_path", newPath)
-	return nil
+	return s.metadataService.RelocateSourceNzb(ctx, item.NzbPath, s.GetNzbFolder(), destinationName, func(path string) error {
+		if err := s.database.Repository.UpdateQueueItemNzbPath(ctx, item.ID, path); err != nil {
+			return err
+		}
+		item.NzbPath = path
+		s.log.InfoContext(ctx, "Moved failed NZB to failed directory", "new_path", path)
+		return nil
+	})
 }
 
 // uniqueFailedNzbPath returns the destination path for a failed NZB inside failedDir. It keeps the
@@ -669,6 +660,41 @@ func persistentNzbPath(nzbDir, baseName, ext string, itemID int64, isTaken func(
 // sanitizeFilename replaces invalid characters in filenames
 func sanitizeFilename(name string) string {
 	return strings.ReplaceAll(name, "/", "_")
+}
+
+func (s *Service) publishQueueItems(ctx context.Context, items []*database.ImportQueueItem, add func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	originals := make([]string, len(items))
+	for i, item := range items {
+		originals[i] = item.NzbPath
+	}
+	err := s.metadataService.PublishSourceNzbs(ctx, filepath.Join(os.TempDir(), ".altmount-queue"), originals, func(paths []string) error {
+		for i, path := range paths {
+			items[i].NzbPath = path
+		}
+		return add()
+	})
+	if err != nil {
+		for i, path := range originals {
+			items[i].NzbPath = path
+		}
+	}
+	return err
+}
+
+// AddQueueItem publishes one rooted queue path and its database row as one operation.
+func (s *Service) AddQueueItem(ctx context.Context, item *database.ImportQueueItem) error {
+	return s.publishQueueItems(ctx, []*database.ImportQueueItem{item}, func() error {
+		return s.database.Repository.AddToQueue(ctx, item)
+	})
+}
+
+func (s *Service) addBatchToQueue(ctx context.Context, items []*database.ImportQueueItem) error {
+	return s.publishQueueItems(ctx, items, func() error {
+		return s.database.Repository.AddBatchToQueue(ctx, items)
+	})
 }
 
 // AddToQueue adds a new NZB file to the import queue.
@@ -724,21 +750,9 @@ func (s *Service) AddToQueue(ctx context.Context, filePath string, relativePath 
 		CreatedAt:    time.Now(),
 	}
 
-	// Insert the DB row first so item.ID is available for the persistent filename
-	// (which uses the queue ID as a uniqueness suffix). If persisting the NZB to
-	// disk fails afterwards, roll back the row so the queue doesn't leak an orphan.
-	if err := s.database.Repository.AddToQueue(ctx, item); err != nil {
+	if err := s.AddQueueItem(ctx, item); err != nil {
 		s.log.ErrorContext(ctx, "Failed to add file to queue", "file", item.NzbPath, "error", err)
 		return nil, err
-	}
-
-	if err := s.ensurePersistentNzb(ctx, item); err != nil {
-		s.log.ErrorContext(ctx, "Failed to ensure persistent NZB during queue addition", "file", filePath, "error", err)
-		if rmErr := s.database.Repository.RemoveFromQueue(ctx, item.ID); rmErr != nil {
-			s.log.WarnContext(ctx, "Failed to roll back queue row after persistence failure",
-				"queue_id", item.ID, "error", rmErr)
-		}
-		return nil, fmt.Errorf("failed to make NZB persistent: %w", err)
 	}
 
 	if s.broadcaster != nil {
@@ -791,7 +805,7 @@ func (s *Service) FindAndUpdatePendingUpload(ctx context.Context, filename strin
 	for _, it := range items {
 		// Persisted name is "<base><ext>" or, on collision, "<id>-<base><ext>".
 		cand := nzbtrim.TrimNzbExtension(filepath.Base(it.NzbPath))
-		if cand != base && cand != fmt.Sprintf("%d-%s", it.ID, base) {
+		if cand != base && !strings.HasSuffix(cand, "-"+base) {
 			continue
 		}
 
@@ -1009,70 +1023,12 @@ func sanitizeVirtualPath(p string) string {
 // stremio's defer os.RemoveAll(stageDir) from deleting the file before the
 // worker can process it.
 func (s *Service) ensurePersistentNzb(ctx context.Context, item *database.ImportQueueItem) error {
-	// Use OS temp queue dir; itemID ensures uniqueness so no category subfolder needed.
-	nzbDir := filepath.Join(os.TempDir(), ".altmount-queue")
-
-	// Check if current path is already in the persistent directory
-	absNzbPath, _ := filepath.Abs(item.NzbPath)
-	absNzbDir, _ := filepath.Abs(nzbDir)
-
-	// Simple check: if path starts with persistent dir (with separator) or equals it, assume it's fine.
-	// The trailing separator prevents a false match like /tmp/.altmount-queue-other/ matching /tmp/.altmount-queue.
-	if strings.HasPrefix(absNzbPath, absNzbDir+string(os.PathSeparator)) || absNzbPath == absNzbDir {
-		return nil
-	}
-
 	if item.ID == 0 {
 		return fmt.Errorf("cannot persist NZB without queue ID (row must be inserted first)")
 	}
-
-	if err := os.MkdirAll(nzbDir, 0755); err != nil {
-		return fmt.Errorf("failed to create persistent NZB directory: %w", err)
-	}
-
-	ext := nzbfile.PlainExtension
-
-	base := nzbtrim.TrimNzbExtension(sanitizeFilename(filepath.Base(item.NzbPath)))
-
-	// Save directly into the category folder using the clean filename. Only when that
-	// destination is already taken do we namespace it with the queue item ID as a filename
-	// prefix (<id>-<name>) — this drops the numeric folder in the common case while still
-	// guaranteeing a unique path on collision for the UNIQUE import_queue.nzb_path column.
-	taken := func(p string) bool {
-		if _, err := os.Stat(p); err == nil {
-			return true
-		}
-		// Also treat a path owned by a different queue item as taken (UNIQUE nzb_path constraint).
-		if existing, err := s.database.Repository.GetQueueItemByNzbPath(ctx, p); err == nil && existing != nil && existing.ID != item.ID {
-			return true
-		}
-		return false
-	}
-	newPath := persistentNzbPath(nzbDir, base, ext, item.ID, taken)
-
-	s.log.DebugContext(ctx, "Moving NZB to persistent storage", "old_path", item.NzbPath, "new_path", newPath)
-
-	// Move the NZB to persistent storage.
-	if err := utils.MoveFile(item.NzbPath, newPath); err != nil {
-		s.log.ErrorContext(ctx, "Failed to move NZB to persistent storage", "error", err, "src", item.NzbPath, "dst", newPath)
-		return fmt.Errorf("failed to move NZB to persistent storage: %w", err)
-	}
-
-	// Update DB
-	oldPath := item.NzbPath
-	item.NzbPath = newPath
-	if err := s.database.Repository.UpdateQueueItemNzbPath(ctx, item.ID, newPath); err != nil {
-		// If DB update fails, we are in a weird state (file moved but DB points to old).
-		// We should probably try to move it back or just fail.
-		// But failing here aborts the import.
-		// The file is at newPath.
-		// If we fail, the item stays 'processing' in DB with old path.
-		// Next retry will fail to find file at old path.
-		return fmt.Errorf("failed to update DB with new NZB path: %w", err)
-	}
-
-	s.log.InfoContext(ctx, "Moved NZB to persistent storage", "old_path", oldPath, "new_path", newPath)
-	return nil
+	return s.publishQueueItems(ctx, []*database.ImportQueueItem{item}, func() error {
+		return s.database.Repository.UpdateQueueItemNzbPath(ctx, item.ID, item.NzbPath)
+	})
 }
 
 // buildCategoryPath resolves a category name to its configured directory path (memoized).
@@ -1196,18 +1152,17 @@ func (s *Service) handleProcessingSuccess(ctx context.Context, item *database.Im
 		}
 	}
 
+	// Delete the on-disk NZB — the .nzbz store can regenerate it on demand.
+	if item.NzbPath != "" {
+		if err := s.metadataService.DeleteStoragePathWithSourceNzb(ctx, "", item.NzbPath); err != nil {
+			return fmt.Errorf("delete completed queue source %q: %w", item.NzbPath, err)
+		}
+	}
+
 	// Mark as completed in queue database
 	if err := s.database.Repository.UpdateQueueItemStatus(ctx, item.ID, database.QueueStatusCompleted, nil); err != nil {
 		s.log.ErrorContext(ctx, "Failed to mark item as completed", "queue_id", item.ID, "error", err)
 		return err
-	}
-
-	// Delete the on-disk NZB — the .nzbz store can regenerate it on demand.
-	if item.NzbPath != "" {
-		if err := os.Remove(item.NzbPath); err != nil && !os.IsNotExist(err) {
-			s.log.WarnContext(ctx, "Failed to delete NZB after successful import",
-				"queue_id", item.ID, "nzb_path", item.NzbPath, "error", err)
-		}
 	}
 
 	// Update import_migrations row if this was a nzbdav migration import
@@ -1375,7 +1330,11 @@ func (s *Service) handleProcessingFailure(ctx context.Context, item *database.Im
 
 	// Delegate fallback handling to post-processor
 	if err := s.postProcessor.HandleFailure(ctx, item, processingErr); err == nil {
-		// Fallback succeeded - remove item from queue since ownership transfers to external SABnzbd
+		// Fallback succeeded; release the rooted local source before its ownership row.
+		if rmErr := s.metadataService.DeleteStoragePathWithSourceNzb(ctx, "", item.NzbPath); rmErr != nil {
+			s.log.WarnContext(ctx, "Failed to remove NZB file after fallback transfer", "file", item.NzbPath, "error", rmErr)
+			return
+		}
 		if err := s.database.Repository.RemoveFromQueue(ctx, item.ID); err != nil {
 			s.log.ErrorContext(ctx, "Failed to remove fallback item from queue", "queue_id", item.ID, "error", err)
 		} else {
@@ -1383,10 +1342,6 @@ func (s *Service) handleProcessingFailure(ctx context.Context, item *database.Im
 				"queue_id", item.ID,
 				"file", item.NzbPath,
 				"fallback_host", s.configGetter().SABnzbd.FallbackHost)
-		}
-		// Remove the local NZB file since ownership transfers to the external SABnzbd instance
-		if rmErr := os.Remove(item.NzbPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			s.log.WarnContext(ctx, "Failed to remove NZB file after fallback transfer", "file", item.NzbPath, "error", rmErr)
 		}
 	} else if IsNonRetryable(err) && strings.Contains(err.Error(), "SABnzbd fallback not configured") {
 		s.log.DebugContext(ctx, "SABnzbd fallback skipped (not configured)",
@@ -1444,30 +1399,33 @@ func (s *Service) cleanupFailedItems(ctx context.Context) {
 	}
 
 	cutoff := time.Now().Add(-time.Duration(retentionHours) * time.Hour)
-	deletedItems, err := s.database.Repository.DeleteFailedItemsOlderThan(ctx, cutoff)
+	items, err := s.database.Repository.ListFailedItemsOlderThan(ctx, cutoff)
 	if err != nil {
 		s.log.ErrorContext(ctx, "Failed to cleanup old failed queue items", "error", err)
 		return
 	}
 
-	if len(deletedItems) == 0 {
-		return
-	}
-
-	// Remove NZB files for deleted items
-	for _, item := range deletedItems {
-		if item.NzbPath != "" {
-			if rmErr := os.Remove(item.NzbPath); rmErr != nil && !os.IsNotExist(rmErr) {
-				s.log.WarnContext(ctx, "Failed to remove NZB file during cleanup", "file", item.NzbPath, "error", rmErr)
-			}
+	removed := 0
+	for _, item := range items {
+		if err := s.metadataService.DeleteStoragePathWithSourceNzb(ctx, "", item.NzbPath); err != nil {
+			s.log.WarnContext(ctx, "Failed to remove NZB file during cleanup", "file", item.NzbPath, "error", err)
+			continue
 		}
+		if err := s.database.Repository.RemoveFromQueue(ctx, item.ID); err != nil {
+			s.log.WarnContext(ctx, "Failed to remove stale failed queue item", "queue_id", item.ID, "error", err)
+			continue
+		}
+		removed++
+	}
+	if removed == 0 {
+		return
 	}
 
 	if s.broadcaster != nil {
 		s.broadcaster.BroadcastQueueChanged()
 	}
 	s.log.InfoContext(ctx, "Cleaned up stale failed queue items",
-		"count", len(deletedItems),
+		"count", removed,
 		"retention_hours", retentionHours)
 }
 
@@ -1849,4 +1807,3 @@ func joinPathsMergingOverlap(parent, child string) string {
 	}
 	return result
 }
-

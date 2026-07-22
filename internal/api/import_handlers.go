@@ -197,7 +197,7 @@ func (s *Server) handleManualImportFile(c *fiber.Ctx) error {
 
 	slog.DebugContext(c.Context(), "Adding file to queue", "file", req.FilePath, "relative_path", req.RelativePath, "target_path", targetPath)
 
-	err = s.queueRepo.AddToQueue(c.Context(), item)
+	err = s.importerService.AddQueueItem(c.Context(), item)
 	if err != nil {
 		return RespondInternalError(c, "Failed to add file to queue", err.Error())
 	}
