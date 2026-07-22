@@ -372,13 +372,11 @@ func TestFACORECHG010GapCanonicalReplayIgnoresLaterProposalOwner(t *testing.T) {
 			"the natural key must recover a lost canonical response after its discarded proposal is reused")
 		assert.Equal(t, canonical.ID, replay.ID)
 		assert.True(t, replay.CreatedAt.Equal(canonical.CreatedAt))
-		retainedOwner, err := f.repo.UpsertGapRange(ctx, GapRangeWrite{
-			ID: owner.ID, FileRevisionID: owner.FileRevisionID, Kind: owner.Kind,
-			StartSegment: owner.StartSegment, SegmentCount: owner.SegmentCount,
-			Status: owner.Status, CreatedAt: owner.CreatedAt,
-		})
-		require.NoError(t, err)
-		assert.Equal(t, owner, retainedOwner,
+		retainedOwner := facoreCHG010ReadGap(
+			t, ctx, f.repo, owner.FileRevisionID, owner.Kind,
+			owner.StartSegment, owner.SegmentCount,
+		)
+		assert.Equal(t, *owner, retainedOwner,
 			"canonical replay must not rebind or mutate the retained proposal owner")
 	})
 }
