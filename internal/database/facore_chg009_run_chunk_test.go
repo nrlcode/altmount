@@ -22,7 +22,12 @@ func chg009SetIntegrity(commit *HealthChunkCommit, sequence int64, resolved []by
 		field.SetInt(sequence)
 	}
 	if field := v.FieldByName("ResolvedBitmap"); field.IsValid() && field.CanSet() {
-		field.SetBytes(append([]byte(nil), resolved...))
+		var clone []byte
+		if resolved != nil {
+			clone = make([]byte, len(resolved))
+			copy(clone, resolved)
+		}
+		field.SetBytes(clone)
 	}
 }
 
@@ -216,6 +221,17 @@ func TestFACORECHG009ResolvedBitmapValidationAndUniqueUnion(t *testing.T) {
 				assert.Zero(t, chg009Count(t, f, `SELECT COUNT(*) FROM health_run_chunks WHERE run_id = ?`, f.run.ID))
 			})
 		}
+
+		t.Run("zero sequence explicit empty is not compatibility nil", func(t *testing.T) {
+			f := newCHG009Fixture(t, 8, dialect)
+			lease, err := f.repo.AcquireRunLease(context.Background(), f.run.ID, "worker", 10*time.Minute)
+			require.NoError(t, err)
+			commit := chg009PresentCommit(f, f.run, lease, "explicit-empty", "worker", f.providers[0].ID, "stat", 0, 4, 4, 0, 0)
+			chg009SetIntegrity(&commit, 0, []byte{})
+			_, err = f.repo.CommitHealthChunk(context.Background(), commit)
+			assert.Error(t, err, "a non-nil empty bitmap must fail exact-length validation")
+			assert.Zero(t, chg009Count(t, f, `SELECT COUNT(*) FROM health_run_chunks WHERE run_id = ?`, f.run.ID))
+		})
 
 		t.Run("repeated positions across stage and provider count once", func(t *testing.T) {
 			f := newCHG009Fixture(t, 8, dialect)
