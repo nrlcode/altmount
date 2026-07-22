@@ -129,3 +129,15 @@ func TestReuploadDifferentFileIsNotDeduped(t *testing.T) {
 	rows := countQueueRows(t, dbPath)
 	require.Len(t, rows, 2, "distinct files must each get their own queue entry")
 }
+
+func TestReuploadSuffixNameIsNotDeduped(t *testing.T) {
+	s, configDir := newDedupTestService(t)
+	uploadDir := filepath.Join(configDir, "altmount-uploads")
+
+	first := uploadViaHandlerFlow(t, s, uploadDir, "Series-Movie.nzb", nil)
+	second := uploadViaHandlerFlow(t, s, uploadDir, "Movie.nzb", nil)
+
+	require.NotEqual(t, first.ID, second.ID,
+		"a staged prefix must not turn a distinct suffix filename into the same upload")
+	require.Len(t, countQueueRows(t, filepath.Join(configDir, "altmount.db")), 2)
+}
