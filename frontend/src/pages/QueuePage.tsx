@@ -778,10 +778,7 @@ export function QueuePage() {
 														<tr>
 															<th className="w-16">
 																<div className="dropdown">
-																	<label
-																		tabIndex={0}
-																		className="flex cursor-pointer items-center gap-1"
-																	>
+																	<label className="flex cursor-pointer items-center gap-1">
 																		<input
 																			type="checkbox"
 																			className="checkbox checkbox-sm"
@@ -794,7 +791,7 @@ export function QueuePage() {
 																		<ChevronDown className="h-3 w-3" />
 																	</label>
 																	<ul
-																		tabIndex={0}
+																		tabIndex={-1}
 																		className="dropdown-content menu z-[1] w-52 rounded-box bg-base-100 p-2 shadow"
 																	>
 																		<li>
