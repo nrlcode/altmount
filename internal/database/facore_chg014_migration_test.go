@@ -111,9 +111,7 @@ func TestFACORECHG014ClaimGenerationMigrationRoundTrip(t *testing.T) {
 		repo := NewHealthRepository(backend.db, backend.dialect)
 		require.NoError(t, repo.ResetFileAllChecking(ctx))
 		owner := claimCHG014Health(t, repo, "movies/migrated-checking.mkv")
-		ownerGeneration, ok := reflectedCHG014ClaimGeneration(t, owner)
-		require.True(t, ok)
-		assert.Equal(t, int64(1), ownerGeneration,
+		assert.Equal(t, int64(1), owner.ClaimGeneration,
 			"the first fenced claim after migration must advance zero to one")
 		assertCHG014MigratedEvidence(t, ctx, backend, HealthStatusChecking)
 

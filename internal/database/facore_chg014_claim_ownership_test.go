@@ -3,20 +3,12 @@ package database
 import (
 	"context"
 	"path/filepath"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// claimedHealthRowsReleaser is the narrow cleanup half of the durable claim
-// boundary. Keep this runtime assertion until the tests-only checkpoint has
-// demonstrated the missing contract against the pre-correction source.
-type claimedHealthRowsReleaser interface {
-	ReleaseClaimedHealthRows(context.Context, []*FileHealth) error
-}
 
 func newCHG014HealthRepositories(t *testing.T) (*HealthRepository, *HealthRepository) {
 	t.Helper()
@@ -72,51 +64,14 @@ func rearmAndReclaimCHG014Health(t *testing.T, repo *HealthRepository, owner *Fi
 	return newOwner
 }
 
-func reflectedCHG014ClaimGeneration(t *testing.T, row *FileHealth) (int64, bool) {
-	t.Helper()
-	require.NotNil(t, row)
-	typ := reflect.TypeOf(*row)
-	field, ok := typ.FieldByName("ClaimGeneration")
-	if !assert.True(t, ok, "FileHealth must expose persisted ClaimGeneration ownership") {
-		return 0, false
-	}
-	if !assert.Equal(t, reflect.Int64, field.Type.Kind(), "ClaimGeneration must be int64") {
-		return 0, false
-	}
-	return reflect.ValueOf(*row).FieldByIndex(field.Index).Int(), true
-}
-
-func setReflectedCHG014ClaimGeneration(t *testing.T, row *FileHealth, generation int64) bool {
-	t.Helper()
-	require.NotNil(t, row)
-	value := reflect.ValueOf(row).Elem()
-	field := value.FieldByName("ClaimGeneration")
-	if !assert.True(t, field.IsValid(), "FileHealth must expose persisted ClaimGeneration ownership") {
-		return false
-	}
-	if !assert.True(t, field.CanSet(), "ClaimGeneration must be writable on claimed snapshots") {
-		return false
-	}
-	field.SetInt(generation)
-	return true
-}
-
 func TestFACORECHG014ClaimGenerationAdvancesAcrossSameRowReclaim(t *testing.T) {
 	repoA, repoB := newCHG014HealthRepositories(t)
 	insertCHG014PendingHealth(t, repoA, "movies/generation.mkv", 0, nil)
 
 	ownerA := claimCHG014Health(t, repoA, "movies/generation.mkv")
-	generationA, ok := reflectedCHG014ClaimGeneration(t, ownerA)
-	if !ok {
-		return
-	}
 	ownerB := rearmAndReclaimCHG014Health(t, repoB, ownerA)
-	generationB, ok := reflectedCHG014ClaimGeneration(t, ownerB)
-	if !ok {
-		return
-	}
 
-	assert.Greater(t, generationB, generationA,
+	assert.Greater(t, ownerB.ClaimGeneration, ownerA.ClaimGeneration,
 		"every successful claim must advance persisted ownership")
 }
 
@@ -179,9 +134,7 @@ func TestFACORECHG014ZeroGenerationCannotFinalizeClaim(t *testing.T) {
 	insertCHG014PendingHealth(t, repoA, "movies/zero-generation.mkv", 0, nil)
 	owner := claimCHG014Health(t, repoA, "movies/zero-generation.mkv")
 	forged := *owner
-	if !setReflectedCHG014ClaimGeneration(t, &forged, 0) {
-		return
-	}
+	forged.ClaimGeneration = 0
 
 	err := repoA.PublishClaimedHealthStatusBulk(context.Background(), []*FileHealth{&forged}, []HealthStatusUpdate{{
 		Type:             UpdateTypeHealthy,
@@ -191,11 +144,7 @@ func TestFACORECHG014ZeroGenerationCannotFinalizeClaim(t *testing.T) {
 	}})
 	require.Error(t, err, "the migration sentinel cannot authorize publication")
 
-	releaser, ok := any(repoA).(claimedHealthRowsReleaser)
-	if !assert.True(t, ok, "HealthRepository must expose exact-owner claim release") {
-		return
-	}
-	_ = releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{&forged})
+	_ = repoA.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{&forged})
 
 	current, getErr := repoA.GetFileHealth(context.Background(), owner.FilePath)
 	require.NoError(t, getErr)
@@ -204,10 +153,6 @@ func TestFACORECHG014ZeroGenerationCannotFinalizeClaim(t *testing.T) {
 
 func TestFACORECHG014ReleaseClaimedHealthRowsHonorsOwnership(t *testing.T) {
 	repoA, repoB := newCHG014HealthRepositories(t)
-	releaser, ok := any(repoA).(claimedHealthRowsReleaser)
-	if !assert.True(t, ok, "HealthRepository must expose exact-owner claim release") {
-		return
-	}
 
 	t.Run("owned checking row becomes due without erasing evidence", func(t *testing.T) {
 		priorError := "prior inconclusive evidence"
@@ -216,7 +161,7 @@ func TestFACORECHG014ReleaseClaimedHealthRowsHonorsOwnership(t *testing.T) {
 		owned := claimCHG014Health(t, repoA, "movies/owned-release.mkv")
 		unrelated := claimCHG014Health(t, repoB, "movies/unrelated-owner.mkv")
 
-		require.NoError(t, releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{owned}))
+		require.NoError(t, repoA.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{owned}))
 
 		current, err := repoA.GetFileHealth(context.Background(), owned.FilePath)
 		require.NoError(t, err)
@@ -239,7 +184,7 @@ func TestFACORECHG014ReleaseClaimedHealthRowsHonorsOwnership(t *testing.T) {
 		ownerA := claimCHG014Health(t, repoA, "movies/stale-release.mkv")
 		ownerB := rearmAndReclaimCHG014Health(t, repoB, ownerA)
 
-		require.NoError(t, releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{ownerA}))
+		require.NoError(t, repoA.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{ownerA}))
 
 		current, err := repoB.GetFileHealth(context.Background(), ownerB.FilePath)
 		require.NoError(t, err)
@@ -258,7 +203,7 @@ func TestFACORECHG014ReleaseClaimedHealthRowsHonorsOwnership(t *testing.T) {
 		newOwner := claimCHG014Health(t, repoB, oldOwner.FilePath)
 		require.NotEqual(t, oldOwner.ID, newOwner.ID)
 
-		require.NoError(t, releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{oldOwner}))
+		require.NoError(t, repoA.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{oldOwner}))
 
 		current, err := repoA.GetFileHealth(context.Background(), newOwner.FilePath)
 		require.NoError(t, err)
@@ -278,7 +223,7 @@ func TestFACORECHG014ReleaseClaimedHealthRowsHonorsOwnership(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, HealthStatusHealthy, published.Status)
 
-		require.NoError(t, releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{owner}))
+		require.NoError(t, repoA.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{owner}))
 
 		current, err := repoB.GetFileHealth(context.Background(), owner.FilePath)
 		require.NoError(t, err)
@@ -301,7 +246,7 @@ func TestFACORECHG014ReleaseClaimedHealthRowsHonorsOwnership(t *testing.T) {
 		`)
 		require.NoError(t, err)
 
-		err = releaser.ReleaseClaimedHealthRows(context.Background(), owners)
+		err = repoA.ReleaseClaimedHealthRows(context.Background(), owners)
 		require.Error(t, err)
 		for _, owner := range owners {
 			current, getErr := repoA.GetFileHealth(context.Background(), owner.FilePath)
