@@ -9,17 +9,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// schemaFreeHealthEvidence is the narrow repository boundary required by
-// FACORE-AD-004. Identity is the existing row ID and transient checking status.
-type schemaFreeHealthEvidence interface {
+// generationFencedHealthEvidence is the claim/publication boundary retained
+// when FACORE-CHG-014 superseded FACORE-AD-004's schema-free identity.
+type generationFencedHealthEvidence interface {
 	ClaimFilesCheckingBulk(context.Context, []*FileHealth) ([]*FileHealth, error)
 	PublishClaimedHealthStatusBulk(context.Context, []*FileHealth, []HealthStatusUpdate) error
 }
 
-func requireSchemaFreeHealthEvidence(t *testing.T, repo *HealthRepository) schemaFreeHealthEvidence {
+func requireGenerationFencedHealthEvidence(t *testing.T, repo *HealthRepository) generationFencedHealthEvidence {
 	t.Helper()
-	api, ok := any(repo).(schemaFreeHealthEvidence)
-	require.True(t, ok, "HealthRepository must expose the schema-free claim/publication boundary")
+	api, ok := any(repo).(generationFencedHealthEvidence)
+	require.True(t, ok, "HealthRepository must expose the generation-fenced claim/publication boundary")
 	if !ok {
 		return nil
 	}
@@ -46,7 +46,7 @@ func TestClaimFilesCheckingBulkReturnsCurrentRows(t *testing.T) {
 		return updateErr
 	}())
 
-	claimed, err := requireSchemaFreeHealthEvidence(t, repo).ClaimFilesCheckingBulk(ctx, []*FileHealth{selected})
+	claimed, err := requireGenerationFencedHealthEvidence(t, repo).ClaimFilesCheckingBulk(ctx, []*FileHealth{selected})
 	require.NoError(t, err)
 	require.Len(t, claimed, 1)
 	assert.Equal(t, selected.ID, claimed[0].ID)
@@ -71,7 +71,7 @@ func TestClaimFilesCheckingBulkOmitsAlreadyCheckingRowWithoutMutation(t *testing
 	require.NoError(t, err)
 	require.Equal(t, HealthStatusChecking, selected.Status)
 
-	claimed, err := requireSchemaFreeHealthEvidence(t, repo).ClaimFilesCheckingBulk(ctx, []*FileHealth{selected})
+	claimed, err := requireGenerationFencedHealthEvidence(t, repo).ClaimFilesCheckingBulk(ctx, []*FileHealth{selected})
 	require.NoError(t, err)
 	assert.Empty(t, claimed, "an in-flight row cannot be admitted a second time")
 
@@ -120,7 +120,7 @@ func TestClaimFilesCheckingBulkOmitsStaleMembers(t *testing.T) {
 			}
 			tc.mutate(t, repo, selected)
 
-			claimed, err := requireSchemaFreeHealthEvidence(t, repo).ClaimFilesCheckingBulk(ctx, selected)
+			claimed, err := requireGenerationFencedHealthEvidence(t, repo).ClaimFilesCheckingBulk(ctx, selected)
 			require.NoError(t, err)
 			require.Len(t, claimed, 1, "stale or replaced members are omitted from admission")
 			assert.Equal(t, selected[0].ID, claimed[0].ID)
@@ -150,7 +150,7 @@ func TestClaimFilesCheckingBulkWriteFailureRollsBack(t *testing.T) {
 		selected = append(selected, row)
 	}
 
-	_, err = requireSchemaFreeHealthEvidence(t, repo).ClaimFilesCheckingBulk(ctx, selected)
+	_, err = requireGenerationFencedHealthEvidence(t, repo).ClaimFilesCheckingBulk(ctx, selected)
 	require.Error(t, err)
 	for _, path := range []string{"a.mkv", "b.mkv"} {
 		row, getErr := repo.GetFileHealth(ctx, path)
@@ -206,7 +206,7 @@ func TestPublishClaimedHealthStatusBulkRejectsLostClaimAtomically(t *testing.T) 
 				require.NoError(t, getErr)
 				selected = append(selected, row)
 			}
-			api := requireSchemaFreeHealthEvidence(t, repo)
+			api := requireGenerationFencedHealthEvidence(t, repo)
 			claimed, err := api.ClaimFilesCheckingBulk(ctx, selected)
 			require.NoError(t, err)
 			beforeB := tc.mutate(t, repo, claimed[1])

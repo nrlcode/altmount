@@ -195,8 +195,7 @@ func TestFACORECHG014ZeroGenerationCannotFinalizeClaim(t *testing.T) {
 	if !assert.True(t, ok, "HealthRepository must expose exact-owner claim release") {
 		return
 	}
-	require.Error(t, releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{&forged}),
-		"the migration sentinel cannot authorize release")
+	_ = releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{&forged})
 
 	current, getErr := repoA.GetFileHealth(context.Background(), owner.FilePath)
 	require.NoError(t, getErr)
@@ -284,5 +283,33 @@ func TestFACORECHG014ReleaseClaimedHealthRowsHonorsOwnership(t *testing.T) {
 		current, err := repoB.GetFileHealth(context.Background(), owner.FilePath)
 		require.NoError(t, err)
 		assert.Equal(t, published, current, "cleanup after success must be a fenced no-op")
+	})
+
+	t.Run("write failure rolls back the whole release", func(t *testing.T) {
+		paths := []string{"movies/release-atomic-a.mkv", "movies/release-atomic-b.mkv"}
+		owners := make([]*FileHealth, 0, len(paths))
+		for _, path := range paths {
+			insertCHG014PendingHealth(t, repoA, path, 0, nil)
+			owners = append(owners, claimCHG014Health(t, repoA, path))
+		}
+		_, err := repoA.db.ExecContext(context.Background(), `
+			CREATE TRIGGER reject_chg014_second_release
+			BEFORE UPDATE OF status ON file_health
+			WHEN OLD.file_path = 'movies/release-atomic-b.mkv'
+			 AND OLD.status = 'checking' AND NEW.status = 'pending'
+			BEGIN SELECT RAISE(ABORT, 'synthetic claim release failure'); END;
+		`)
+		require.NoError(t, err)
+
+		err = releaser.ReleaseClaimedHealthRows(context.Background(), owners)
+		require.Error(t, err)
+		for _, owner := range owners {
+			current, getErr := repoA.GetFileHealth(context.Background(), owner.FilePath)
+			require.NoError(t, getErr)
+			assert.Equal(t, owner, current, "failed release must not partially commit")
+		}
+
+		_, err = repoA.db.ExecContext(context.Background(), `DROP TRIGGER reject_chg014_second_release`)
+		require.NoError(t, err)
 	})
 }

@@ -6,10 +6,24 @@ import (
 	"time"
 
 	"github.com/javi11/altmount/internal/database"
+	"github.com/javi11/altmount/internal/pool"
 	"github.com/javi11/altmount/internal/testsupport/fakepool"
+	"github.com/javi11/nntppool/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type chg014PanicStatManyClient struct {
+	pool.NntpClient
+}
+
+func (c *chg014PanicStatManyClient) StatMany(
+	context.Context,
+	[]string,
+	nntppool.StatManyOptions,
+) <-chan nntppool.StatManyResult {
+	panic("synthetic post-claim health panic")
+}
 
 func claimCHG014WorkerHealth(t *testing.T, env *repairTestEnv, filePath string) *database.FileHealth {
 	t.Helper()
@@ -210,4 +224,49 @@ func TestFACORECHG014OldDirectExitCannotDeleteNewerActiveOwner(t *testing.T) {
 	require.ErrorIs(t, receiveCHG014CheckError(t, resultB), context.Canceled)
 	assert.False(t, env.hw.IsCheckActive(filePath))
 	requireCHG014PendingDue(t, env, filePath, 0)
+}
+
+func TestFACORECHG014CancelHealthCheckCannotResetNewerDurableOwner(t *testing.T) {
+	client := fakepool.New()
+	client.SetDefaultBehavior(fakepool.SegmentBehavior{Latency: 30 * time.Second})
+	env := newBatchTestEnv(t, t.TempDir(), client)
+	const filePath = "movies/cancel-newer-owner.mkv"
+	writeHealthyFile(t, env, filePath)
+	insertFileHealth(t, env.db, filePath, "/library/cancel-newer-owner.mkv", 1, 3)
+
+	ownerA := claimCHG014WorkerHealth(t, env, filePath)
+	resultA := make(chan error, 1)
+	go func() { resultA <- env.hw.performClaimedDirectCheck(context.Background(), ownerA) }()
+	waitForHealthContract(t, func() bool { return client.InFlight() == 1 },
+		"timed out waiting for the active owner targeted by cancellation")
+
+	_, err := env.healthRepo.ResetHealthChecksBulk(context.Background(), []string{filePath})
+	require.NoError(t, err)
+	ownerB := claimCHG014WorkerHealth(t, env, filePath)
+
+	require.NoError(t, env.hw.CancelHealthCheck(context.Background(), filePath))
+	require.ErrorIs(t, receiveCHG014CheckError(t, resultA), context.Canceled)
+	current, err := env.healthRepo.GetFileHealth(context.Background(), filePath)
+	require.NoError(t, err)
+	assert.Equal(t, ownerB, current,
+		"canceling old direct work cannot reset a newer durable claim")
+	assert.False(t, env.hw.IsCheckActive(filePath))
+
+	_, err = env.healthRepo.ResetHealthChecksBulk(context.Background(), []string{filePath})
+	require.NoError(t, err)
+}
+
+func TestFACORECHG014PostClaimPanicReleasesBatch(t *testing.T) {
+	baseClient := fakepool.New()
+	client := &chg014PanicStatManyClient{NntpClient: baseClient}
+	env := newBatchTestEnv(t, t.TempDir(), client)
+	const filePath = "movies/panic-release.mkv"
+	writeHealthyFile(t, env, filePath)
+	insertFileHealth(t, env.db, filePath, "/library/panic-release.mkv", 2, 3)
+
+	err := env.hw.safeRunHealthCheckCycle(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "panic in health check cycle")
+	assert.Contains(t, err.Error(), "synthetic post-claim health panic")
+	requireCHG014PendingDue(t, env, filePath, 2)
 }
