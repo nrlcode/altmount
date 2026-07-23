@@ -98,6 +98,38 @@ func TestFACORECHG014BulkPublicationFailureReleasesWholeClaimedBatch(t *testing.
 	assert.Equal(t, int64(4), client.StatCalls(), "released claims must be selectable by the next cycle")
 }
 
+func TestFACORECHG014PublicationAndReleaseFailuresAreBothReported(t *testing.T) {
+	client := fakepool.New()
+	env := newBatchTestEnv(t, t.TempDir(), client)
+	const filePath = "movies/publication-and-release-failure.mkv"
+	writeHealthyFile(t, env, filePath)
+	insertFileHealth(t, env.db, filePath, "/library/"+filePath, 1, 3)
+
+	_, err := env.db.Exec(`
+		CREATE TRIGGER reject_chg014_publication_before_release_failure
+		BEFORE UPDATE OF status ON file_health
+		WHEN OLD.status = 'checking' AND NEW.status = 'healthy'
+		BEGIN SELECT RAISE(ABORT, 'synthetic publication failure'); END;
+	`)
+	require.NoError(t, err)
+	_, err = env.db.Exec(`
+		CREATE TRIGGER reject_chg014_release_after_publication_failure
+		BEFORE UPDATE OF status ON file_health
+		WHEN OLD.status = 'checking' AND NEW.status = 'pending'
+		BEGIN SELECT RAISE(ABORT, 'synthetic release failure'); END;
+	`)
+	require.NoError(t, err)
+
+	err = env.hw.runHealthCheckCycle(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to publish claimed health evidence")
+	assert.Contains(t, err.Error(), "failed to release unfinished health claims")
+	row, getErr := env.healthRepo.GetFileHealth(context.Background(), filePath)
+	require.NoError(t, getErr)
+	assert.Equal(t, database.HealthStatusChecking, row.Status,
+		"a rejected cleanup must remain visible instead of being reported as released")
+}
+
 func TestFACORECHG014BulkCancellationUsesDetachedClaimCleanup(t *testing.T) {
 	client := fakepool.New()
 	client.SetDefaultBehavior(fakepool.SegmentBehavior{Latency: 30 * time.Second})
@@ -221,6 +253,45 @@ func TestFACORECHG014OldDirectExitCannotDeleteNewerActiveOwner(t *testing.T) {
 		"old detached claim cleanup cannot release the newer durable owner")
 
 	cancelB()
+	require.ErrorIs(t, receiveCHG014CheckError(t, resultB), context.Canceled)
+	assert.False(t, env.hw.IsCheckActive(filePath))
+	requireCHG014PendingDue(t, env, filePath, 0)
+}
+
+func TestFACORECHG014LateOldDirectOwnerCannotReplaceNewerActiveOwner(t *testing.T) {
+	client := fakepool.New()
+	client.SetDefaultBehavior(fakepool.SegmentBehavior{Latency: 30 * time.Second})
+	env := newBatchTestEnv(t, t.TempDir(), client)
+	const filePath = "movies/late-old-direct-owner.mkv"
+	writeHealthyFile(t, env, filePath)
+	insertFileHealth(t, env.db, filePath, "/library/"+filePath, 0, 3)
+
+	ownerA := claimCHG014WorkerHealth(t, env, filePath)
+	_, err := env.healthRepo.ResetHealthChecksBulk(context.Background(), []string{filePath})
+	require.NoError(t, err)
+	ownerB := claimCHG014WorkerHealth(t, env, filePath)
+
+	ctxB, cancelB := context.WithCancel(context.Background())
+	resultB := make(chan error, 1)
+	go func() { resultB <- env.hw.performClaimedDirectCheck(ctxB, ownerB) }()
+	waitForHealthContract(t, func() bool { return client.InFlight() == 1 },
+		"timed out waiting for the newer direct owner")
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancelA()
+		cancelB()
+	})
+	resultA := make(chan error, 1)
+	go func() { resultA <- env.hw.performClaimedDirectCheck(ctxA, ownerA) }()
+	require.ErrorIs(t, receiveCHG014CheckError(t, resultA), ErrHealthCheckAdmissionConflict)
+	assert.Equal(t, int32(1), client.InFlight(), "the obsolete owner must not start another STAT")
+	assert.True(t, env.hw.IsCheckActive(filePath), "the newer direct owner must remain active")
+	current, err := env.healthRepo.GetFileHealth(context.Background(), filePath)
+	require.NoError(t, err)
+	assert.Equal(t, ownerB, current, "late obsolete admission must not release the newer durable owner")
+
+	require.NoError(t, env.hw.CancelHealthCheck(context.Background(), filePath))
 	require.ErrorIs(t, receiveCHG014CheckError(t, resultB), context.Canceled)
 	assert.False(t, env.hw.IsCheckActive(filePath))
 	requireCHG014PendingDue(t, env, filePath, 0)

@@ -52,12 +52,9 @@ func claimCHG014Health(t *testing.T, repo *HealthRepository, path string) *FileH
 
 func rearmAndReclaimCHG014Health(t *testing.T, repo *HealthRepository, owner *FileHealth) *FileHealth {
 	t.Helper()
-	_, err := repo.db.ExecContext(context.Background(), `
-		UPDATE file_health
-		SET status = 'pending', scheduled_check_at = datetime('now')
-		WHERE id = ?
-	`, owner.ID)
-	require.NoError(t, err)
+	require.NoError(t, repo.UpdateFileHealth(
+		context.Background(), owner.FilePath, HealthStatusPending, nil, nil, nil, false,
+	))
 
 	newOwner := claimCHG014Health(t, repo, owner.FilePath)
 	require.Equal(t, owner.ID, newOwner.ID, "the regression requires a same-row reclaim")
@@ -69,10 +66,18 @@ func TestFACORECHG014ClaimGenerationAdvancesAcrossSameRowReclaim(t *testing.T) {
 	insertCHG014PendingHealth(t, repoA, "movies/generation.mkv", 0, nil)
 
 	ownerA := claimCHG014Health(t, repoA, "movies/generation.mkv")
-	ownerB := rearmAndReclaimCHG014Health(t, repoB, ownerA)
+	require.NoError(t, repoB.ResetFileAllChecking(context.Background()))
+	restarted, err := repoB.GetFileHealth(context.Background(), ownerA.FilePath)
+	require.NoError(t, err)
+	require.Equal(t, ownerA.ClaimGeneration, restarted.ClaimGeneration,
+		"startup recovery must preserve the prior claim generation")
+	ownerB := claimCHG014Health(t, repoB, ownerA.FilePath)
+	ownerC := rearmAndReclaimCHG014Health(t, repoA, ownerB)
 
 	assert.Greater(t, ownerB.ClaimGeneration, ownerA.ClaimGeneration,
-		"every successful claim must advance persisted ownership")
+		"the claim after startup recovery must advance persisted ownership")
+	assert.Greater(t, ownerC.ClaimGeneration, ownerB.ClaimGeneration,
+		"the claim after a live rearm must advance persisted ownership")
 }
 
 func TestFACORECHG014StaleSelectionCannotReclaimAfterNewerPublication(t *testing.T) {
