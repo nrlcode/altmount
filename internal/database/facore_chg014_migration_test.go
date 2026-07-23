@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pressly/goose/v3"
 	"github.com/stretchr/testify/assert"
@@ -136,4 +137,77 @@ func TestFACORECHG014ClaimGenerationMigrationRoundTrip(t *testing.T) {
 		assert.Zero(t, generation, "reapplying migration 037 must restore the zero sentinel")
 		assertCHG014MigratedEvidence(t, ctx, backend, HealthStatusPending)
 	})
+}
+
+func TestFACORECHG014PostgresClaimOwnershipParity(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	backend := newFACORECHG009PostgresMigrationBackend(t, ctx)
+	goose.SetBaseFS(embedMigrations)
+	require.NoError(t, goose.SetDialect(backend.gooseDialect))
+	require.NoError(t, goose.UpToContext(
+		ctx, backend.db, backend.migrationsDir, facoreCHG014MigrationVersion,
+	))
+
+	repoA := NewHealthRepository(backend.db, DialectPostgres)
+	repoB := NewHealthRepository(backend.db, DialectPostgres)
+	const path = "movies/postgres-claim-ownership.mkv"
+	priorError := "prior PostgreSQL evidence"
+	_, err := repoA.db.ExecContext(ctx, `
+		INSERT INTO file_health
+			(file_path, status, retry_count, max_retries, last_error, scheduled_check_at)
+		VALUES (?, ?, 2, 3, ?, ?)
+	`, path, HealthStatusPending, priorError, time.Now().UTC().Add(-time.Minute))
+	require.NoError(t, err)
+
+	staleSelection, err := repoA.GetFileHealth(ctx, path)
+	require.NoError(t, err)
+	require.NotNil(t, staleSelection)
+	ownerA, err := repoA.ClaimFilesCheckingBulk(ctx, []*FileHealth{staleSelection})
+	require.NoError(t, err)
+	require.Len(t, ownerA, 1)
+
+	newerEvidence := "newer PostgreSQL owner deferred the check"
+	require.NoError(t, repoA.PublishClaimedHealthStatusBulk(ctx, ownerA, []HealthStatusUpdate{{
+		Type:             UpdateTypeInconclusive,
+		Status:           HealthStatusPending,
+		FilePath:         path,
+		ErrorMessage:     &newerEvidence,
+		ScheduledCheckAt: time.Now().UTC().Add(2 * time.Hour),
+	}}))
+	published, err := repoA.GetFileHealth(ctx, path)
+	require.NoError(t, err)
+	require.Equal(t, HealthStatusPending, published.Status)
+
+	staleClaim, err := repoB.ClaimFilesCheckingBulk(ctx, []*FileHealth{staleSelection})
+	require.NoError(t, err)
+	require.Empty(t, staleClaim)
+	current, err := repoB.GetFileHealth(ctx, path)
+	require.NoError(t, err)
+	require.Equal(t, published, current)
+
+	ownerB, err := repoB.ClaimFilesCheckingBulk(ctx, []*FileHealth{published})
+	require.NoError(t, err)
+	require.Len(t, ownerB, 1)
+	require.Greater(t, ownerB[0].ClaimGeneration, ownerA[0].ClaimGeneration)
+	require.Error(t, repoA.PublishClaimedHealthStatusBulk(ctx, ownerA, []HealthStatusUpdate{{
+		Type:             UpdateTypeHealthy,
+		Status:           HealthStatusHealthy,
+		FilePath:         path,
+		ScheduledCheckAt: time.Now().UTC().Add(time.Hour),
+	}}))
+	require.NoError(t, repoA.ReleaseClaimedHealthRows(ctx, ownerA))
+	current, err = repoA.GetFileHealth(ctx, path)
+	require.NoError(t, err)
+	require.Equal(t, ownerB[0], current, "stale publication and release must preserve the newer owner")
+
+	require.NoError(t, repoB.ReleaseClaimedHealthRows(ctx, ownerB))
+	released, err := repoB.GetFileHealth(ctx, path)
+	require.NoError(t, err)
+	require.Equal(t, HealthStatusPending, released.Status)
+	require.Equal(t, ownerB[0].ClaimGeneration, released.ClaimGeneration)
+	require.Equal(t, 2, released.RetryCount)
+	require.Equal(t, &newerEvidence, released.LastError)
+	require.NotNil(t, released.ScheduledCheckAt)
+	require.False(t, released.ScheduledCheckAt.After(time.Now().UTC().Add(time.Second)))
 }
