@@ -8,8 +8,8 @@ func TestIsAltmountDownloadClient(t *testing.T) {
 		want bool
 	}{
 		{AltmountDownloadClientName, true}, // exact registered name
-		{"Altmount", true},                // common manual name
-		{"altmount", true},                // lowercase
+		{"Altmount", true},                 // common manual name
+		{"altmount", true},                 // lowercase
 		{"AltMount (SABnzbd)", true},
 		{"My AltMount SAB", true},
 		{"", false},

@@ -156,4 +156,3 @@ func (s *Server) ValidateMount() (bool, error) {
 		return false, fmt.Errorf("mount point not responding (stat timed out after 5s)")
 	}
 }
-

@@ -11,7 +11,7 @@ import (
 // memReadCloser serves a byte slice as an io.ReadCloser.
 type memReadCloser struct{ r *bytes.Reader }
 
-func newMem(b []byte) *memReadCloser { return &memReadCloser{r: bytes.NewReader(b)} }
+func newMem(b []byte) *memReadCloser                { return &memReadCloser{r: bytes.NewReader(b)} }
 func (m *memReadCloser) Read(p []byte) (int, error) { return m.r.Read(p) }
 func (m *memReadCloser) Close() error               { return nil }
 
@@ -40,8 +40,8 @@ func buildTwoClipStream(t *testing.T) (raw []byte, spans []clipSpan, wantPTS []i
 	base0 := clip0Base
 	timelineStart1 := base0 + clip0Dur
 	spans = []clipSpan{
-		{start: 0, end: clip0Len - 1, delta: base0 - clip0Base},               // 0
-		{start: clip0Len, end: total - 1, delta: timelineStart1 - clip1Base},  // lift clip1
+		{start: 0, end: clip0Len - 1, delta: base0 - clip0Base},              // 0
+		{start: clip0Len, end: total - 1, delta: timelineStart1 - clip1Base}, // lift clip1
 	}
 
 	// Expected PTS after rewrite.

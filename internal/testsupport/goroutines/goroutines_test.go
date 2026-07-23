@@ -59,7 +59,7 @@ type recordingTB struct {
 	failed bool
 }
 
-func (r *recordingTB) Helper()                                {}
-func (r *recordingTB) Errorf(format string, args ...any)      { r.failed = true }
-func (r *recordingTB) Fatalf(format string, args ...any)      { r.failed = true; r.realTB.FailNow() }
-func (r *recordingTB) Logf(format string, args ...any)        { r.realTB.Logf(format, args...) }
+func (r *recordingTB) Helper()                           {}
+func (r *recordingTB) Errorf(format string, args ...any) { r.failed = true }
+func (r *recordingTB) Fatalf(format string, args ...any) { r.failed = true; r.realTB.FailNow() }
+func (r *recordingTB) Logf(format string, args ...any)   { r.realTB.Logf(format, args...) }

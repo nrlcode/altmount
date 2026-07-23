@@ -37,7 +37,7 @@ type Dir struct {
 	isRootDir     bool
 	uid           uint32
 	gid           uint32
-	asyncBufSize  int  // read-ahead buffer size in bytes, propagated to File nodes
+	asyncBufSize  int // read-ahead buffer size in bytes, propagated to File nodes
 	noModTime     bool
 }
 
