@@ -117,7 +117,7 @@ func (r *HealthRepository) UpdateFileHealthScheduled(ctx context.Context, filePa
 // source of truth for the column list (and the matching scanFileHealth order) avoids
 // drift when a column is added.
 const fileHealthSelectColumns = `
-	SELECT id, file_path, library_path, status, last_checked, last_error, retry_count, max_retries,
+	SELECT id, file_path, library_path, status, claim_generation, last_checked, last_error, retry_count, max_retries,
 	       repair_retry_count, max_repair_retries, source_nzb_path,
 	       error_details, created_at, updated_at, release_date, scheduled_check_at, priority,
 		   streaming_failure_count, is_masked
@@ -136,7 +136,7 @@ type rowScanner interface {
 func scanFileHealth(s rowScanner) (*FileHealth, error) {
 	var health FileHealth
 	err := s.Scan(
-		&health.ID, &health.FilePath, &health.LibraryPath, &health.Status, &health.LastChecked,
+		&health.ID, &health.FilePath, &health.LibraryPath, &health.Status, &health.ClaimGeneration, &health.LastChecked,
 		&health.LastError, &health.RetryCount, &health.MaxRetries,
 		&health.RepairRetryCount, &health.MaxRepairRetries,
 		&health.SourceNzbPath, &health.ErrorDetails,
@@ -235,7 +235,7 @@ func (r *HealthRepository) UnmaskFile(ctx context.Context, filePath string) erro
 // GetUnhealthyFiles returns files that need health checks
 func (r *HealthRepository) GetUnhealthyFiles(ctx context.Context, limit int, strategy string, libraryDir string, maxRetries int) ([]*FileHealth, error) {
 	query := `
-		SELECT id, file_path, status, last_checked, last_error, retry_count, max_retries,
+		SELECT id, file_path, status, claim_generation, last_checked, last_error, retry_count, max_retries,
 		       repair_retry_count, max_repair_retries, source_nzb_path,
 		       error_details, created_at, updated_at, release_date, scheduled_check_at,
 			   library_path, priority, streaming_failure_count, is_masked
@@ -282,7 +282,7 @@ func (r *HealthRepository) GetUnhealthyFiles(ctx context.Context, limit int, str
 	for rows.Next() {
 		var health FileHealth
 		err := rows.Scan(
-			&health.ID, &health.FilePath, &health.Status, &health.LastChecked,
+			&health.ID, &health.FilePath, &health.Status, &health.ClaimGeneration, &health.LastChecked,
 			&health.LastError, &health.RetryCount, &health.MaxRetries,
 			&health.RepairRetryCount, &health.MaxRepairRetries,
 			&health.SourceNzbPath, &health.ErrorDetails,
@@ -1029,7 +1029,8 @@ func (r *HealthRepository) ClaimFilesCheckingBulk(ctx context.Context, selected 
 		}
 		result, execErr := tx.ExecContext(ctx, `
 			UPDATE file_health
-			SET status = ?, updated_at = datetime('now')
+			SET status = ?, claim_generation = claim_generation + 1,
+			    updated_at = datetime('now')
 			WHERE id = ? AND status = ?
 		`, HealthStatusChecking, observed.ID, observed.Status)
 		if execErr != nil {
@@ -1370,23 +1371,44 @@ func (r *HealthRepository) UpdateHealthStatusBulk(ctx context.Context, updates [
 	return r.updateHealthStatusBulk(ctx, updates, nil)
 }
 
+type healthClaimIdentity struct {
+	id         int64
+	generation int64
+}
+
+func claimedHealthIdentities(claimed []*FileHealth) (map[string]healthClaimIdentity, error) {
+	identities := make(map[string]healthClaimIdentity, len(claimed))
+	seenIDs := make(map[int64]struct{}, len(claimed))
+	for _, row := range claimed {
+		if row == nil {
+			return nil, fmt.Errorf("claimed health row is nil")
+		}
+		if row.ID <= 0 || row.ClaimGeneration <= 0 {
+			return nil, fmt.Errorf("invalid health claim identity for %s", row.FilePath)
+		}
+		path := normalizeHealthPath(row.FilePath)
+		if _, exists := identities[path]; exists {
+			return nil, fmt.Errorf("duplicate claimed health path: %s", path)
+		}
+		if _, exists := seenIDs[row.ID]; exists {
+			return nil, fmt.Errorf("duplicate claimed health ID: %d", row.ID)
+		}
+		identities[path] = healthClaimIdentity{id: row.ID, generation: row.ClaimGeneration}
+		seenIDs[row.ID] = struct{}{}
+	}
+	return identities, nil
+}
+
 // PublishClaimedHealthStatusBulk publishes one outcome for every admitted row.
-// Each write is guarded by the exact claimed ID still being in checking; one
-// lost claim rejects and rolls back the entire publication.
+// Each write is guarded by the exact claimed ID and generation still being in
+// checking; one lost claim rejects and rolls back the entire publication.
 func (r *HealthRepository) PublishClaimedHealthStatusBulk(ctx context.Context, claimed []*FileHealth, updates []HealthStatusUpdate) error {
 	if len(claimed) != len(updates) {
 		return fmt.Errorf("claimed health rows and updates differ: %d != %d", len(claimed), len(updates))
 	}
-	claimedIDs := make(map[string]int64, len(claimed))
-	for _, row := range claimed {
-		if row == nil {
-			return fmt.Errorf("claimed health row is nil")
-		}
-		path := normalizeHealthPath(row.FilePath)
-		if _, exists := claimedIDs[path]; exists {
-			return fmt.Errorf("duplicate claimed health path: %s", path)
-		}
-		claimedIDs[path] = row.ID
+	identities, err := claimedHealthIdentities(claimed)
+	if err != nil {
+		return err
 	}
 	seenUpdates := make(map[string]struct{}, len(updates))
 	for _, update := range updates {
@@ -1394,7 +1416,7 @@ func (r *HealthRepository) PublishClaimedHealthStatusBulk(ctx context.Context, c
 		if update.Skip {
 			return fmt.Errorf("claimed health publication cannot skip %s", path)
 		}
-		if _, exists := claimedIDs[path]; !exists {
+		if _, exists := identities[path]; !exists {
 			return fmt.Errorf("no claimed health row for update: %s", path)
 		}
 		if _, exists := seenUpdates[path]; exists {
@@ -1402,15 +1424,54 @@ func (r *HealthRepository) PublishClaimedHealthStatusBulk(ctx context.Context, c
 		}
 		seenUpdates[path] = struct{}{}
 	}
-	for path := range claimedIDs {
+	for path := range identities {
 		if _, exists := seenUpdates[path]; !exists {
 			return fmt.Errorf("claimed health row has no update: %s", path)
 		}
 	}
-	return r.updateHealthStatusBulk(ctx, updates, claimedIDs)
+	return r.updateHealthStatusBulk(ctx, updates, identities)
 }
 
-func (r *HealthRepository) updateHealthStatusBulk(ctx context.Context, updates []HealthStatusUpdate, claimedIDs map[string]int64) error {
+// ReleaseClaimedHealthRows makes work immediately eligible after an
+// unsuccessful owner exits. Lost or already-finalized claims are safe no-ops.
+func (r *HealthRepository) ReleaseClaimedHealthRows(ctx context.Context, claimed []*FileHealth) error {
+	if len(claimed) == 0 {
+		return nil
+	}
+	if _, err := claimedHealthIdentities(claimed); err != nil {
+		return err
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin health claim release: %w", err)
+	}
+	defer tx.Rollback()
+	for _, row := range claimed {
+		result, execErr := tx.ExecContext(ctx, `
+			UPDATE file_health
+			SET status = ?, scheduled_check_at = datetime('now'),
+			    updated_at = datetime('now')
+			WHERE id = ? AND status = ? AND claim_generation = ?
+		`, HealthStatusPending, row.ID, HealthStatusChecking, row.ClaimGeneration)
+		if execErr != nil {
+			return fmt.Errorf("failed to release health claim %d: %w", row.ID, execErr)
+		}
+		rows, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return fmt.Errorf("failed to inspect health claim release %d: %w", row.ID, rowsErr)
+		}
+		if rows > 1 {
+			return fmt.Errorf("health claim release %d affected %d rows", row.ID, rows)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit health claim release: %w", err)
+	}
+	return nil
+}
+
+func (r *HealthRepository) updateHealthStatusBulk(ctx context.Context, updates []HealthStatusUpdate, claimedIDs map[string]healthClaimIdentity) error {
 	if len(updates) == 0 {
 		return nil
 	}
@@ -1466,12 +1527,12 @@ func (r *HealthRepository) updateHealthStatusBulk(ctx context.Context, updates [
 		args = append(args, path)
 		requireMatch := claimedIDs != nil
 		if requireMatch {
-			id, exists := claimedIDs[path]
+			identity, exists := claimedIDs[path]
 			if !exists {
 				return fmt.Errorf("no claimed health identity for %s", path)
 			}
-			query += " AND id = ? AND status = ?"
-			args = append(args, id, HealthStatusChecking)
+			query += " AND id = ? AND status = ? AND claim_generation = ?"
+			args = append(args, identity.id, HealthStatusChecking, identity.generation)
 		} else if update.ExpectedStatus != nil {
 			query += " AND status = ?"
 			args = append(args, *update.ExpectedStatus)
