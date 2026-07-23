@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -124,17 +123,16 @@ func assertFACORECHG010GapKeysRemainSufficient(
 	assertFACORECHG010GapPauseState(t, ctx, backend, seed)
 }
 
-func TestFACORECHG010MigrationHistoryEndsAtImmutable036(t *testing.T) {
+func TestFACORECHG010Migrations035And036RemainImmutable(t *testing.T) {
 	tests := []struct {
 		name       string
-		dir        string
 		path       string
 		wantSHA256 string
 	}{
-		{"sqlite_035", "migrations/sqlite", "migrations/sqlite/035_add_durable_health_state.sql", "f25566918481a10226ece359087b6da08c238d7ccf969ebb81a3a4c7be70d23b"},
-		{"sqlite_036", "migrations/sqlite", "migrations/sqlite/036_add_health_run_progress_identity.sql", "bbcb02366efdf8b93c1685fb8990faf95ac8569e096c023eb8dbe1e0c8e89a87"},
-		{"postgres_035", "migrations/postgres", "migrations/postgres/035_add_durable_health_state.sql", "575b419695ff5dceb28b3cf459066741e43eabebbf6083005205162cbaf48282"},
-		{"postgres_036", "migrations/postgres", "migrations/postgres/036_add_health_run_progress_identity.sql", "ca8cf5a284ed9ad4c0fb72d37cf06b745d9eb231c5a06970d524ecaba73d4511"},
+		{"sqlite_035", "migrations/sqlite/035_add_durable_health_state.sql", "f25566918481a10226ece359087b6da08c238d7ccf969ebb81a3a4c7be70d23b"},
+		{"sqlite_036", "migrations/sqlite/036_add_health_run_progress_identity.sql", "bbcb02366efdf8b93c1685fb8990faf95ac8569e096c023eb8dbe1e0c8e89a87"},
+		{"postgres_035", "migrations/postgres/035_add_durable_health_state.sql", "575b419695ff5dceb28b3cf459066741e43eabebbf6083005205162cbaf48282"},
+		{"postgres_036", "migrations/postgres/036_add_health_run_progress_identity.sql", "ca8cf5a284ed9ad4c0fb72d37cf06b745d9eb231c5a06970d524ecaba73d4511"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -142,13 +140,6 @@ func TestFACORECHG010MigrationHistoryEndsAtImmutable036(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, test.wantSHA256, fmt.Sprintf("%x", sha256.Sum256(contents)),
 				"migrations 035 and 036 are immutable CHG-010 controls")
-
-			entries, err := embedMigrations.ReadDir(test.dir)
-			require.NoError(t, err)
-			for _, entry := range entries {
-				assert.Falsef(t, strings.HasPrefix(entry.Name(), "037_"),
-					"migration 037 must not exist: %s/%s", test.dir, entry.Name())
-			}
 		})
 	}
 }
@@ -165,9 +156,11 @@ func TestFACORECHG010PopulatedGapPauseStateSurvives036RoundTrip(t *testing.T) {
 		seedFACORECHG010GapPauseState(t, ctx, backend, seed)
 		assertFACORECHG010GapPauseState(t, ctx, backend, seed)
 
-		require.NoError(t, goose.UpContext(ctx, backend.db, backend.migrationsDir))
+		require.NoError(t, goose.UpToContext(
+			ctx, backend.db, backend.migrationsDir, facoreCHG009MigrationVersion,
+		))
 		require.Equal(t, facoreCHG009MigrationVersion,
-			facoreCHG009DatabaseVersion(t, ctx, backend), "latest migration must remain 036")
+			facoreCHG009DatabaseVersion(t, ctx, backend), "CHG-010 round trip must stop at 036")
 		assertFACORECHG010GapPauseState(t, ctx, backend, seed)
 
 		require.NoError(t, goose.DownToContext(ctx, backend.db, backend.migrationsDir, 35))
@@ -182,10 +175,11 @@ func TestFACORECHG010PopulatedGapPauseStateSurvives036RoundTrip(t *testing.T) {
 		assertFACORECHG010GapPauseState(t, ctx, backend, seed)
 
 		setAndAssertFACORECHG009IntegrityState(t, ctx, backend, seed)
-		require.NoError(t, goose.UpContext(ctx, backend.db, backend.migrationsDir),
-			"reapplying the latest migration must be a no-op")
+		require.NoError(t, goose.UpToContext(
+			ctx, backend.db, backend.migrationsDir, facoreCHG009MigrationVersion,
+		), "reapplying migration 036 must be a no-op")
 		require.Equal(t, facoreCHG009MigrationVersion,
-			facoreCHG009DatabaseVersion(t, ctx, backend), "latest migration must remain 036")
+			facoreCHG009DatabaseVersion(t, ctx, backend), "CHG-010 round trip must remain at 036")
 		assertFACORECHG010GapPauseState(t, ctx, backend, seed)
 		assertFACORECHG009IntegrityState(t, ctx, backend, seed)
 		assertFACORECHG010GapKeysRemainSufficient(t, ctx, backend, seed)

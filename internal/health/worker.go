@@ -39,6 +39,13 @@ type healthAdmissionSource interface {
 	AcquireHealthAdmission() (release func(), admitted bool)
 }
 
+const healthClaimReleaseTimeout = 5 * time.Second
+
+type activeHealthCheck struct {
+	cancel context.CancelFunc
+	claim  database.FileHealth
+}
+
 // WorkerStatus represents the current status of the health worker
 type WorkerStatus string
 
@@ -82,7 +89,7 @@ type HealthWorker struct {
 	mu           sync.RWMutex
 
 	// Active checks tracking for cancellation
-	activeChecks   map[string]context.CancelFunc // filePath -> cancel function
+	activeChecks   map[string]activeHealthCheck // filePath -> current claim owner
 	activeChecksMu sync.RWMutex
 
 	// Statistics
@@ -145,7 +152,7 @@ func NewHealthWorker(
 		progressBroadcaster: broadcaster,
 		status:              WorkerStatusStopped,
 		stopChan:            make(chan struct{}),
-		activeChecks:        make(map[string]context.CancelFunc),
+		activeChecks:        make(map[string]activeHealthCheck),
 		stats: WorkerStats{
 			Status: WorkerStatusStopped,
 		},
@@ -253,27 +260,72 @@ func (hw *HealthWorker) GetStats() WorkerStats {
 	return hw.stats
 }
 
-// CancelHealthCheck cancels an active health check for the specified file
-func (hw *HealthWorker) CancelHealthCheck(ctx context.Context, filePath string) error {
+func sameHealthClaim(a, b database.FileHealth) bool {
+	return a.ID == b.ID && a.ClaimGeneration == b.ClaimGeneration
+}
+
+func newerHealthClaim(candidate, current database.FileHealth) bool {
+	if candidate.ID != current.ID {
+		return candidate.ID > current.ID
+	}
+	return candidate.ClaimGeneration > current.ClaimGeneration
+}
+
+func (hw *HealthWorker) registerActiveCheck(filePath string, claim *database.FileHealth, cancel context.CancelFunc) bool {
 	hw.activeChecksMu.Lock()
 	defer hw.activeChecksMu.Unlock()
+	if current, exists := hw.activeChecks[filePath]; exists && !newerHealthClaim(*claim, current.claim) {
+		return false
+	}
+	hw.activeChecks[filePath] = activeHealthCheck{cancel: cancel, claim: *claim}
+	return true
+}
 
-	cancelFunc, exists := hw.activeChecks[filePath]
+func (hw *HealthWorker) removeActiveCheck(filePath string, claim database.FileHealth) {
+	hw.activeChecksMu.Lock()
+	defer hw.activeChecksMu.Unlock()
+	if current, exists := hw.activeChecks[filePath]; exists && sameHealthClaim(current.claim, claim) {
+		delete(hw.activeChecks, filePath)
+	}
+}
+
+func (hw *HealthWorker) releaseHealthClaims(ctx context.Context, claimed []*database.FileHealth) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), healthClaimReleaseTimeout)
+	defer cancel()
+	return hw.healthRepo.ReleaseClaimedHealthRows(cleanupCtx, claimed)
+}
+
+func (hw *HealthWorker) releaseUnfinalizedHealthClaims(
+	ctx context.Context,
+	claimed []*database.FileHealth,
+	finalized *bool,
+	result *error,
+) {
+	if *finalized {
+		return
+	}
+	if err := hw.releaseHealthClaims(ctx, claimed); err != nil {
+		wrapped := fmt.Errorf("failed to release unfinished health claims: %w", err)
+		slog.ErrorContext(ctx, "Failed to release unfinished health claims", "error", err)
+		*result = errors.Join(*result, wrapped)
+	}
+}
+
+// CancelHealthCheck cancels an active health check for the specified file
+func (hw *HealthWorker) CancelHealthCheck(ctx context.Context, filePath string) error {
+	hw.activeChecksMu.RLock()
+	active, exists := hw.activeChecks[filePath]
+	hw.activeChecksMu.RUnlock()
 	if !exists {
 		return fmt.Errorf("no active health check found for file: %s", filePath)
 	}
 
-	// Cancel the context
-	cancelFunc()
-
-	// Remove from active checks
-	delete(hw.activeChecks, filePath)
-
-	// Update file status to pending to allow retry
-	err := hw.healthRepo.UpdateFileHealth(ctx, filePath, database.HealthStatusPending, nil, nil, nil, false)
+	active.cancel()
+	err := hw.releaseHealthClaims(ctx, []*database.FileHealth{&active.claim})
+	hw.removeActiveCheck(filePath, active.claim)
 	if err != nil {
-		slog.ErrorContext(ctx, "Failed to update file status after cancellation", "file_path", filePath, "error", err)
-		return fmt.Errorf("failed to update file status after cancellation: %w", err)
+		slog.ErrorContext(ctx, "Failed to release health claim after cancellation", "file_path", filePath, "error", err)
+		return fmt.Errorf("failed to release health claim after cancellation: %w", err)
 	}
 
 	hw.broadcastHealthChanged()
@@ -488,25 +540,20 @@ func (hw *HealthWorker) prepareUpdateForResult(ctx context.Context, fh *database
 }
 
 // performClaimedDirectCheck checks and publishes one already-claimed snapshot.
-func (hw *HealthWorker) performClaimedDirectCheck(ctx context.Context, fh *database.FileHealth) error {
+func (hw *HealthWorker) performClaimedDirectCheck(ctx context.Context, fh *database.FileHealth) (err error) {
 	filePath := fh.FilePath
 	claimed := []*database.FileHealth{fh}
+	finalized := false
+	defer hw.releaseUnfinalizedHealthClaims(ctx, claimed, &finalized, &err)
 
 	// Create cancellable context for this check
 	checkCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Track active check
-	hw.activeChecksMu.Lock()
-	hw.activeChecks[filePath] = cancel
-	hw.activeChecksMu.Unlock()
-
-	// Ensure cleanup on exit
-	defer func() {
-		hw.activeChecksMu.Lock()
-		delete(hw.activeChecks, filePath)
-		hw.activeChecksMu.Unlock()
-	}()
+	if !hw.registerActiveCheck(filePath, fh, cancel) {
+		return fmt.Errorf("%w: newer direct owner for %s", ErrHealthCheckAdmissionConflict, filePath)
+	}
+	defer hw.removeActiveCheck(filePath, *fh)
 
 	// Check if already cancelled
 	select {
@@ -529,6 +576,7 @@ func (hw *HealthWorker) performClaimedDirectCheck(ctx context.Context, fh *datab
 	if err := hw.healthRepo.PublishClaimedHealthStatusBulk(ctx, claimed, []database.HealthStatusUpdate{*update}); err != nil {
 		return fmt.Errorf("failed to publish direct health evidence: %w", err)
 	}
+	finalized = true
 
 	hw.broadcastHealthChanged()
 	hw.healthChecker.notifyRcloneVFS(filePath, event)
@@ -549,7 +597,7 @@ func (hw *HealthWorker) performClaimedDirectCheck(ctx context.Context, fh *datab
 
 // updateStats safely updates worker statistics
 // runHealthCheckCycle runs a single cycle of health checks
-func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
+func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) (err error) {
 	// Set the cycle running flag
 	hw.mu.Lock()
 	hw.cycleRunning = true
@@ -584,7 +632,6 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 	// concurrency. maxJobs still bounds the per-file result handling below
 	// (repair side effects, ARR API calls).
 	var unhealthyFiles []*database.FileHealth
-	var err error
 	releaseAdmission, admitted, admissionSerialized := hw.acquireHealthAdmission()
 	if admissionSerialized && !admitted {
 		slog.InfoContext(ctx, "Deferring ordinary health batch because playback won admission")
@@ -628,6 +675,8 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 		})
 		return nil
 	}
+	finalized := false
+	defer hw.releaseUnfinalizedHealthClaims(ctx, unhealthyFiles, &finalized, &err)
 
 	slog.InfoContext(ctx, "Found files to process",
 		"health_check_files", len(unhealthyFiles),
@@ -664,6 +713,7 @@ func (hw *HealthWorker) runHealthCheckCycle(ctx context.Context) error {
 	if err := hw.healthRepo.PublishClaimedHealthStatusBulk(ctx, unhealthyFiles, results); err != nil {
 		return fmt.Errorf("failed to publish claimed health evidence: %w", err)
 	}
+	finalized = true
 
 	// Observers are notified only after the whole checked batch commits.
 	healthyCount := int64(0)
