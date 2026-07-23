@@ -1008,8 +1008,8 @@ func (r *HealthRepository) SetFilesCheckingBulk(ctx context.Context, filePaths [
 	return nil
 }
 
-// ClaimFilesCheckingBulk admits selected rows by their existing identity and
-// observed status. Stale selections and same-path replacements are omitted;
+// ClaimFilesCheckingBulk admits selected rows by their existing identity,
+// observed status, and generation. Stale selections and replacements are omitted;
 // genuine SQL failures roll back the whole admission transaction.
 func (r *HealthRepository) ClaimFilesCheckingBulk(ctx context.Context, selected []*FileHealth) ([]*FileHealth, error) {
 	if len(selected) == 0 {
@@ -1031,8 +1031,8 @@ func (r *HealthRepository) ClaimFilesCheckingBulk(ctx context.Context, selected 
 			UPDATE file_health
 			SET status = ?, claim_generation = claim_generation + 1,
 			    updated_at = datetime('now')
-			WHERE id = ? AND status = ?
-		`, HealthStatusChecking, observed.ID, observed.Status)
+			WHERE id = ? AND status = ? AND claim_generation = ?
+		`, HealthStatusChecking, observed.ID, observed.Status, observed.ClaimGeneration)
 		if execErr != nil {
 			return nil, fmt.Errorf("failed to claim health row %d: %w", observed.ID, execErr)
 		}
