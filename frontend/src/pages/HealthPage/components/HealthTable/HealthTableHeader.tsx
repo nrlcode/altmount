@@ -27,7 +27,7 @@ export function HealthTableHeader({
 			<tr>
 				<th className="w-16">
 					<div className="dropdown">
-						<label tabIndex={0} className="cursor-pointer flex items-center gap-1">
+						<label tabIndex={0} className="flex cursor-pointer items-center gap-1">
 							<input
 								type="checkbox"
 								className="checkbox checkbox-sm"
@@ -41,7 +41,7 @@ export function HealthTableHeader({
 						</label>
 						<ul
 							tabIndex={0}
-							className="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52"
+							className="dropdown-content menu z-[1] w-52 rounded-box bg-base-100 p-2 shadow"
 						>
 							<li>
 								<button type="button" onClick={() => onSelectAll(true)}>

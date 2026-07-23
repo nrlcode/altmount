@@ -131,7 +131,8 @@ export function StreamingConfigSection({
 						<div className="min-w-0">
 							<h4 className="font-bold text-base-content text-sm">Playback Failure Masking</h4>
 							<p className="mt-1 break-words text-[11px] text-base-content/50 leading-relaxed">
-								Debounce transient streaming errors (like propagation delays) by requiring multiple consecutive playback failures before triggering a redownload.
+								Debounce transient streaming errors (like propagation delays) by requiring multiple
+								consecutive playback failures before triggering a redownload.
 							</p>
 						</div>
 						<input
@@ -159,14 +160,17 @@ export function StreamingConfigSection({
 								<div className="min-w-0">
 									<h5 className="font-bold text-base-content text-xs">Failure Threshold</h5>
 									<p className="mt-1 break-words text-[10px] text-base-content/50 leading-relaxed">
-										Number of consecutive failures required before declaring a file corrupted and requesting repair.
+										Number of consecutive failures required before declaring a file corrupted and
+										requesting repair.
 									</p>
 								</div>
 								<div className="flex shrink-0 items-center gap-3">
-									<span className="font-black font-mono text-primary text-lg">
+									<span className="font-black font-mono text-lg text-primary">
 										{streamingData.failure_masking?.threshold ?? 3}
 									</span>
-									<span className="font-bold text-base-content/60 text-[10px] uppercase">failures</span>
+									<span className="font-bold text-[10px] text-base-content/60 uppercase">
+										failures
+									</span>
 								</div>
 							</div>
 							<input
@@ -189,7 +193,7 @@ export function StreamingConfigSection({
 									checkChanges(newData, cacheData);
 								}}
 							/>
-							<div className="flex justify-between px-1 font-black text-base-content/50 text-[10px]">
+							<div className="flex justify-between px-1 font-black text-[10px] text-base-content/50">
 								<span>1</span>
 								<span>3</span>
 								<span>5</span>

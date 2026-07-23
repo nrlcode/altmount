@@ -1,4 +1,3 @@
-import { apiClient } from "../api/client";
 import { useQueryClient } from "@tanstack/react-query";
 import {
 	Activity,
@@ -28,6 +27,7 @@ import {
 	XOctagon,
 } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
+import { apiClient } from "../api/client";
 import { ImportMethods } from "../components/queue/ImportMethods";
 import { QueueItemCard } from "../components/queue/QueueItemCard";
 import { ErrorAlert } from "../components/ui/ErrorAlert";
@@ -780,7 +780,7 @@ export function QueuePage() {
 																<div className="dropdown">
 																	<label
 																		tabIndex={0}
-																		className="cursor-pointer flex items-center gap-1"
+																		className="flex cursor-pointer items-center gap-1"
 																	>
 																		<input
 																			type="checkbox"
@@ -795,7 +795,7 @@ export function QueuePage() {
 																	</label>
 																	<ul
 																		tabIndex={0}
-																		className="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52"
+																		className="dropdown-content menu z-[1] w-52 rounded-box bg-base-100 p-2 shadow"
 																	>
 																		<li>
 																			<button type="button" onClick={() => handleSelectAll(true)}>
