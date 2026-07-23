@@ -75,6 +75,41 @@ func TestFACORECHG014ClaimGenerationAdvancesAcrossSameRowReclaim(t *testing.T) {
 		"every successful claim must advance persisted ownership")
 }
 
+func TestFACORECHG014StaleSelectionCannotReclaimAfterNewerPublication(t *testing.T) {
+	repoA, repoB := newCHG014HealthRepositories(t)
+	path := "movies/stale-selection.mkv"
+	insertCHG014PendingHealth(t, repoA, path, 0, nil)
+
+	staleSelection, err := repoA.GetFileHealth(context.Background(), path)
+	require.NoError(t, err)
+	require.NotNil(t, staleSelection)
+
+	claimed, err := repoB.ClaimFilesCheckingBulk(context.Background(), []*FileHealth{staleSelection})
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+
+	newerEvidence := "newer owner deferred the check"
+	require.NoError(t, repoB.PublishClaimedHealthStatusBulk(context.Background(), claimed, []HealthStatusUpdate{{
+		Type:             UpdateTypeInconclusive,
+		Status:           HealthStatusPending,
+		FilePath:         path,
+		ErrorMessage:     &newerEvidence,
+		ScheduledCheckAt: time.Now().UTC().Add(2 * time.Hour),
+	}}))
+	published, err := repoB.GetFileHealth(context.Background(), path)
+	require.NoError(t, err)
+	require.Equal(t, HealthStatusPending, published.Status)
+	require.Greater(t, published.ClaimGeneration, staleSelection.ClaimGeneration)
+
+	claimed, err = repoA.ClaimFilesCheckingBulk(context.Background(), []*FileHealth{staleSelection})
+	require.NoError(t, err)
+	require.Empty(t, claimed, "an obsolete selection must not bypass a newer owner's evidence and backoff")
+
+	current, err := repoA.GetFileHealth(context.Background(), path)
+	require.NoError(t, err)
+	assert.Equal(t, published, current, "a rejected stale selection must leave the newer publication unchanged")
+}
+
 func TestFACORECHG014StaleOwnerCannotPublishIntoSameRowReclaim(t *testing.T) {
 	repoA, repoB := newCHG014HealthRepositories(t)
 	insertCHG014PendingHealth(t, repoA, "movies/stale-publication.mkv", 1, nil)
