@@ -31,6 +31,7 @@ func newResilienceDB(t *testing.T) *sql.DB {
 			file_path TEXT NOT NULL UNIQUE,
 			library_path TEXT,
 			status TEXT NOT NULL,
+			claim_generation INTEGER NOT NULL DEFAULT 0,
 			last_checked DATETIME,
 			last_error TEXT,
 			retry_count INTEGER DEFAULT 0,

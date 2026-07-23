@@ -1,0 +1,288 @@
+package database
+
+import (
+	"context"
+	"path/filepath"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// claimedHealthRowsReleaser is the narrow cleanup half of the durable claim
+// boundary. Keep this runtime assertion until the tests-only checkpoint has
+// demonstrated the missing contract against the pre-correction source.
+type claimedHealthRowsReleaser interface {
+	ReleaseClaimedHealthRows(context.Context, []*FileHealth) error
+}
+
+func newCHG014HealthRepositories(t *testing.T) (*HealthRepository, *HealthRepository) {
+	t.Helper()
+
+	db, err := NewDB(Config{
+		Type:         "sqlite",
+		DatabasePath: filepath.Join(t.TempDir(), "health-claim-ownership.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	// Deliberately use separate repository values over the shared durable
+	// authority. Ownership must not depend on which repository instance acts.
+	return NewHealthRepository(db.Connection(), DialectSQLite),
+		NewHealthRepository(db.Connection(), DialectSQLite)
+}
+
+func insertCHG014PendingHealth(t *testing.T, repo *HealthRepository, path string, retryCount int, lastError *string) {
+	t.Helper()
+	_, err := repo.db.ExecContext(context.Background(), `
+		INSERT INTO file_health
+			(file_path, status, retry_count, max_retries, last_error, scheduled_check_at)
+		VALUES (?, 'pending', ?, 3, ?, datetime('now', '-1 second'))
+	`, path, retryCount, lastError)
+	require.NoError(t, err)
+}
+
+func claimCHG014Health(t *testing.T, repo *HealthRepository, path string) *FileHealth {
+	t.Helper()
+	ctx := context.Background()
+	selected, err := repo.GetFileHealth(ctx, path)
+	require.NoError(t, err)
+	require.NotNil(t, selected)
+	claimed, err := repo.ClaimFilesCheckingBulk(ctx, []*FileHealth{selected})
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	require.Equal(t, selected.ID, claimed[0].ID)
+	require.Equal(t, HealthStatusChecking, claimed[0].Status)
+	return claimed[0]
+}
+
+func rearmAndReclaimCHG014Health(t *testing.T, repo *HealthRepository, owner *FileHealth) *FileHealth {
+	t.Helper()
+	_, err := repo.db.ExecContext(context.Background(), `
+		UPDATE file_health
+		SET status = 'pending', scheduled_check_at = datetime('now')
+		WHERE id = ?
+	`, owner.ID)
+	require.NoError(t, err)
+
+	newOwner := claimCHG014Health(t, repo, owner.FilePath)
+	require.Equal(t, owner.ID, newOwner.ID, "the regression requires a same-row reclaim")
+	return newOwner
+}
+
+func reflectedCHG014ClaimGeneration(t *testing.T, row *FileHealth) (int64, bool) {
+	t.Helper()
+	require.NotNil(t, row)
+	typ := reflect.TypeOf(*row)
+	field, ok := typ.FieldByName("ClaimGeneration")
+	if !assert.True(t, ok, "FileHealth must expose persisted ClaimGeneration ownership") {
+		return 0, false
+	}
+	if !assert.Equal(t, reflect.Int64, field.Type.Kind(), "ClaimGeneration must be int64") {
+		return 0, false
+	}
+	return reflect.ValueOf(*row).FieldByIndex(field.Index).Int(), true
+}
+
+func setReflectedCHG014ClaimGeneration(t *testing.T, row *FileHealth, generation int64) bool {
+	t.Helper()
+	require.NotNil(t, row)
+	value := reflect.ValueOf(row).Elem()
+	field := value.FieldByName("ClaimGeneration")
+	if !assert.True(t, field.IsValid(), "FileHealth must expose persisted ClaimGeneration ownership") {
+		return false
+	}
+	if !assert.True(t, field.CanSet(), "ClaimGeneration must be writable on claimed snapshots") {
+		return false
+	}
+	field.SetInt(generation)
+	return true
+}
+
+func TestFACORECHG014ClaimGenerationAdvancesAcrossSameRowReclaim(t *testing.T) {
+	repoA, repoB := newCHG014HealthRepositories(t)
+	insertCHG014PendingHealth(t, repoA, "movies/generation.mkv", 0, nil)
+
+	ownerA := claimCHG014Health(t, repoA, "movies/generation.mkv")
+	generationA, ok := reflectedCHG014ClaimGeneration(t, ownerA)
+	if !ok {
+		return
+	}
+	ownerB := rearmAndReclaimCHG014Health(t, repoB, ownerA)
+	generationB, ok := reflectedCHG014ClaimGeneration(t, ownerB)
+	if !ok {
+		return
+	}
+
+	assert.Greater(t, generationB, generationA,
+		"every successful claim must advance persisted ownership")
+}
+
+func TestFACORECHG014StaleOwnerCannotPublishIntoSameRowReclaim(t *testing.T) {
+	repoA, repoB := newCHG014HealthRepositories(t)
+	insertCHG014PendingHealth(t, repoA, "movies/stale-publication.mkv", 1, nil)
+
+	ownerA := claimCHG014Health(t, repoA, "movies/stale-publication.mkv")
+	ownerB := rearmAndReclaimCHG014Health(t, repoB, ownerA)
+
+	err := repoA.PublishClaimedHealthStatusBulk(context.Background(), []*FileHealth{ownerA}, []HealthStatusUpdate{{
+		Type:             UpdateTypeHealthy,
+		Status:           HealthStatusHealthy,
+		FilePath:         ownerA.FilePath,
+		ScheduledCheckAt: time.Now().UTC().Add(time.Hour),
+	}})
+	require.Error(t, err, "a stale owner must not publish through a newer same-row claim")
+
+	current, getErr := repoB.GetFileHealth(context.Background(), ownerB.FilePath)
+	require.NoError(t, getErr)
+	assert.Equal(t, ownerB, current, "rejected stale publication must not mutate the new owner")
+}
+
+func TestFACORECHG014LostGenerationRollsBackWholePublication(t *testing.T) {
+	repoA, repoB := newCHG014HealthRepositories(t)
+	paths := []string{"movies/atomic-a.mkv", "movies/atomic-b.mkv"}
+	for _, path := range paths {
+		insertCHG014PendingHealth(t, repoA, path, 0, nil)
+	}
+	ownerA := claimCHG014Health(t, repoA, paths[0])
+	staleB := claimCHG014Health(t, repoA, paths[1])
+	ownerB := rearmAndReclaimCHG014Health(t, repoB, staleB)
+
+	err := repoA.PublishClaimedHealthStatusBulk(context.Background(), []*FileHealth{ownerA, staleB}, []HealthStatusUpdate{
+		{
+			Type:             UpdateTypeHealthy,
+			Status:           HealthStatusHealthy,
+			FilePath:         ownerA.FilePath,
+			ScheduledCheckAt: time.Now().UTC().Add(time.Hour),
+		},
+		{
+			Type:             UpdateTypeHealthy,
+			Status:           HealthStatusHealthy,
+			FilePath:         staleB.FilePath,
+			ScheduledCheckAt: time.Now().UTC().Add(time.Hour),
+		},
+	})
+	require.Error(t, err, "one lost generation must reject the whole publication")
+
+	currentA, getErr := repoA.GetFileHealth(context.Background(), ownerA.FilePath)
+	require.NoError(t, getErr)
+	assert.Equal(t, ownerA, currentA, "publication before the lost member must roll back")
+	currentB, getErr := repoB.GetFileHealth(context.Background(), ownerB.FilePath)
+	require.NoError(t, getErr)
+	assert.Equal(t, ownerB, currentB, "the newer owner must remain unchanged")
+}
+
+func TestFACORECHG014ZeroGenerationCannotFinalizeClaim(t *testing.T) {
+	repoA, _ := newCHG014HealthRepositories(t)
+	insertCHG014PendingHealth(t, repoA, "movies/zero-generation.mkv", 0, nil)
+	owner := claimCHG014Health(t, repoA, "movies/zero-generation.mkv")
+	forged := *owner
+	if !setReflectedCHG014ClaimGeneration(t, &forged, 0) {
+		return
+	}
+
+	err := repoA.PublishClaimedHealthStatusBulk(context.Background(), []*FileHealth{&forged}, []HealthStatusUpdate{{
+		Type:             UpdateTypeHealthy,
+		Status:           HealthStatusHealthy,
+		FilePath:         forged.FilePath,
+		ScheduledCheckAt: time.Now().UTC().Add(time.Hour),
+	}})
+	require.Error(t, err, "the migration sentinel cannot authorize publication")
+
+	releaser, ok := any(repoA).(claimedHealthRowsReleaser)
+	if !assert.True(t, ok, "HealthRepository must expose exact-owner claim release") {
+		return
+	}
+	require.Error(t, releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{&forged}),
+		"the migration sentinel cannot authorize release")
+
+	current, getErr := repoA.GetFileHealth(context.Background(), owner.FilePath)
+	require.NoError(t, getErr)
+	assert.Equal(t, owner, current, "invalid ownership evidence cannot mutate the claim")
+}
+
+func TestFACORECHG014ReleaseClaimedHealthRowsHonorsOwnership(t *testing.T) {
+	repoA, repoB := newCHG014HealthRepositories(t)
+	releaser, ok := any(repoA).(claimedHealthRowsReleaser)
+	if !assert.True(t, ok, "HealthRepository must expose exact-owner claim release") {
+		return
+	}
+
+	t.Run("owned checking row becomes due without erasing evidence", func(t *testing.T) {
+		priorError := "prior inconclusive evidence"
+		insertCHG014PendingHealth(t, repoA, "movies/owned-release.mkv", 2, &priorError)
+		insertCHG014PendingHealth(t, repoA, "movies/unrelated-owner.mkv", 1, nil)
+		owned := claimCHG014Health(t, repoA, "movies/owned-release.mkv")
+		unrelated := claimCHG014Health(t, repoB, "movies/unrelated-owner.mkv")
+
+		require.NoError(t, releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{owned}))
+
+		current, err := repoA.GetFileHealth(context.Background(), owned.FilePath)
+		require.NoError(t, err)
+		require.NotNil(t, current)
+		assert.Equal(t, owned.ID, current.ID)
+		assert.Equal(t, HealthStatusPending, current.Status)
+		assert.Equal(t, 2, current.RetryCount, "release cannot consume retry budget")
+		assert.Equal(t, &priorError, current.LastError, "release cannot erase prior evidence")
+		require.NotNil(t, current.ScheduledCheckAt)
+		assert.False(t, current.ScheduledCheckAt.After(time.Now().UTC().Add(time.Second)),
+			"released work must be immediately selectable")
+
+		stillUnrelated, err := repoB.GetFileHealth(context.Background(), unrelated.FilePath)
+		require.NoError(t, err)
+		assert.Equal(t, unrelated, stillUnrelated, "release cannot reset another owner's checking row")
+	})
+
+	t.Run("stale owner cannot release same row after reset and reclaim", func(t *testing.T) {
+		insertCHG014PendingHealth(t, repoA, "movies/stale-release.mkv", 0, nil)
+		ownerA := claimCHG014Health(t, repoA, "movies/stale-release.mkv")
+		ownerB := rearmAndReclaimCHG014Health(t, repoB, ownerA)
+
+		require.NoError(t, releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{ownerA}))
+
+		current, err := repoB.GetFileHealth(context.Background(), ownerB.FilePath)
+		require.NoError(t, err)
+		assert.Equal(t, ownerB, current, "stale cleanup cannot release the new owner")
+	})
+
+	t.Run("same path replacement remains owned by its new row", func(t *testing.T) {
+		insertCHG014PendingHealth(t, repoA, "movies/replacement-release.mkv", 0, nil)
+		oldOwner := claimCHG014Health(t, repoA, "movies/replacement-release.mkv")
+		_, err := repoB.db.ExecContext(context.Background(), `
+			DELETE FROM file_health WHERE id = ?;
+			INSERT INTO file_health (file_path, status, scheduled_check_at)
+			VALUES (?, 'pending', datetime('now'));
+		`, oldOwner.ID, oldOwner.FilePath)
+		require.NoError(t, err)
+		newOwner := claimCHG014Health(t, repoB, oldOwner.FilePath)
+		require.NotEqual(t, oldOwner.ID, newOwner.ID)
+
+		require.NoError(t, releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{oldOwner}))
+
+		current, err := repoA.GetFileHealth(context.Background(), newOwner.FilePath)
+		require.NoError(t, err)
+		assert.Equal(t, newOwner, current)
+	})
+
+	t.Run("successful publication cannot be released afterward", func(t *testing.T) {
+		insertCHG014PendingHealth(t, repoA, "movies/published-release.mkv", 0, nil)
+		owner := claimCHG014Health(t, repoA, "movies/published-release.mkv")
+		require.NoError(t, repoA.PublishClaimedHealthStatusBulk(context.Background(), []*FileHealth{owner}, []HealthStatusUpdate{{
+			Type:             UpdateTypeHealthy,
+			Status:           HealthStatusHealthy,
+			FilePath:         owner.FilePath,
+			ScheduledCheckAt: time.Now().UTC().Add(time.Hour),
+		}}))
+		published, err := repoA.GetFileHealth(context.Background(), owner.FilePath)
+		require.NoError(t, err)
+		require.Equal(t, HealthStatusHealthy, published.Status)
+
+		require.NoError(t, releaser.ReleaseClaimedHealthRows(context.Background(), []*FileHealth{owner}))
+
+		current, err := repoB.GetFileHealth(context.Background(), owner.FilePath)
+		require.NoError(t, err)
+		assert.Equal(t, published, current, "cleanup after success must be a fenced no-op")
+	})
+}
