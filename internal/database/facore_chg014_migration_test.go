@@ -14,6 +14,22 @@ import (
 
 const facoreCHG014MigrationVersion int64 = 37
 
+func ensureCHG014PostgresRepositoryFixture(
+	t *testing.T,
+	ctx context.Context,
+	backend facoreCHG009MigrationBackend,
+) {
+	t.Helper()
+	if backend.dialect != DialectPostgres {
+		return
+	}
+	// Migration 027's legacy schema-free guard can see another test schema and
+	// skip this unrelated canonical column. Keep the isolated fixture complete.
+	_, err := backend.db.ExecContext(ctx,
+		`ALTER TABLE file_health ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT NULL`)
+	require.NoError(t, err)
+}
+
 func requireCHG014ClaimGenerationAbsent(
 	t *testing.T,
 	ctx context.Context,
@@ -77,6 +93,7 @@ func TestFACORECHG014ClaimGenerationMigrationRoundTrip(t *testing.T) {
 		))
 		require.Equal(t, facoreCHG014MigrationVersion,
 			facoreCHG009DatabaseVersion(t, ctx, backend))
+		ensureCHG014PostgresRepositoryFixture(t, ctx, backend)
 
 		metadata := facoreCHG009ReadColumnMetadata(t, backend, "file_health", "claim_generation")
 		if backend.dialect == DialectPostgres {
@@ -148,6 +165,7 @@ func TestFACORECHG014PostgresClaimOwnershipParity(t *testing.T) {
 	require.NoError(t, goose.UpToContext(
 		ctx, backend.db, backend.migrationsDir, facoreCHG014MigrationVersion,
 	))
+	ensureCHG014PostgresRepositoryFixture(t, ctx, backend)
 
 	repoA := NewHealthRepository(backend.db, DialectPostgres)
 	repoB := NewHealthRepository(backend.db, DialectPostgres)
