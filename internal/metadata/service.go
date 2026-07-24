@@ -278,20 +278,14 @@ func (ms *MetadataService) WriteFileMetadataV3(ctx context.Context, virtualPath 
 	return nil
 }
 
-// WriteFileMetadataAuto writes v3 store-backed metadata when storeRef is set,
-// falling back to the v1 inline format if the v3 conversion fails (so a store/index
-// problem on one file never blocks the import). With an empty storeRef it writes v1.
-// This is the single entry point import processors should use.
+// WriteFileMetadataAuto writes v3 store-backed metadata when storeRef is set and
+// propagates conversion or publication failures. With an empty storeRef it writes
+// the intentional v1 inline format used by sources such as STRM imports.
 func (ms *MetadataService) WriteFileMetadataAuto(ctx context.Context, virtualPath string, metadata *metapb.FileMetadata, index map[string]int64, storeRef string) error {
 	if storeRef == "" {
 		return ms.WriteFileMetadata(virtualPath, metadata)
 	}
-	if err := ms.WriteFileMetadataV3(ctx, virtualPath, metadata, index, storeRef); err != nil {
-		slog.WarnContext(ctx, "v3 metadata write failed; writing v1",
-			"path", virtualPath, "error", err)
-		return ms.WriteFileMetadata(virtualPath, metadata)
-	}
-	return nil
+	return ms.WriteFileMetadataV3(ctx, virtualPath, metadata, index, storeRef)
 }
 
 // ReadFileMetadata reads file metadata from disk. The full proto (including
