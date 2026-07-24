@@ -529,13 +529,18 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 	var result string
 	var writtenPaths []string
 
-	// Persist the NzbStore up front so every metadata write below can be emitted
-	// directly in the v3 store-backed format (no read-back conversion pass).
-	// storeRef stays "" on any failure — which makes each write site fall back to
-	// the v1 inline-segment format — so a store problem never blocks the import.
+	// Persist the NzbStore up front so every ordinary metadata write below can be
+	// emitted directly in the durable v3 store-backed format. STRM imports retain
+	// their intentional inline metadata representation.
 	var storeRef string
 	var storeIndex map[string]int64
-	if parsed.Store != nil && len(parsed.SegmentIndex) > 0 && parsed.Type != parser.NzbTypeStrm {
+	if parsed.Type != parser.NzbTypeStrm {
+		if parsed.Store == nil {
+			return "", nil, fmt.Errorf("ordinary NZB parse did not produce a metadata store")
+		}
+		if len(parsed.SegmentIndex) == 0 {
+			return "", nil, fmt.Errorf("ordinary NZB parse did not produce a metadata store index")
+		}
 		cfg := proc.configGetter()
 		configDir := filepath.Dir(cfg.Database.Path)
 		if !filepath.IsAbs(configDir) {
@@ -564,26 +569,24 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			nzbStoreDir = filepath.Join(configDir, ".nzbs")
 		}
 		if mkErr := os.MkdirAll(nzbStoreDir, 0755); mkErr != nil {
-			proc.log.WarnContext(ctx, "failed to create nzb store dir; metadata stays v1",
-				"dir", nzbStoreDir, "error", mkErr)
-		} else {
-			base := nzbtrim.TrimNzbExtension(filepath.Base(filePath))
-			if queueID > 0 {
-				base = fmt.Sprintf("%d-%s", queueID, base)
-			}
-			ref := filepath.Join(nzbStoreDir, base+".nzbz")
-			if storeErr := proc.metadataService.Store().WriteStore(ref, parsed.Store); storeErr != nil {
-				proc.log.ErrorContext(ctx, "failed to write NZB store; metadata stays v1",
-					"store_ref", ref, "error", storeErr)
-			} else if _, integrityErr := proc.metadataService.Store().ReadStore(ref); integrityErr != nil {
-				proc.log.ErrorContext(ctx, "NZB store integrity check failed; removing store",
-					"store_ref", ref, "error", integrityErr)
-				_ = os.Remove(ref)
-			} else {
-				storeRef = ref
-				storeIndex = parsed.SegmentIndex
-			}
+			return "", nil, fmt.Errorf("create NZB metadata store directory %q: %w", nzbStoreDir, mkErr)
 		}
+		base := nzbtrim.TrimNzbExtension(filepath.Base(filePath))
+		if queueID > 0 {
+			base = fmt.Sprintf("%d-%s", queueID, base)
+		}
+		ref := filepath.Join(nzbStoreDir, base+".nzbz")
+		if storeErr := proc.metadataService.Store().WriteStore(ref, parsed.Store); storeErr != nil {
+			return "", nil, fmt.Errorf("write NZB metadata store %q: %w", ref, storeErr)
+		}
+		if _, integrityErr := proc.metadataService.Store().ReadStore(ref); integrityErr != nil {
+			proc.log.ErrorContext(ctx, "NZB store integrity check failed; removing store",
+				"store_ref", ref, "error", integrityErr)
+			_ = os.Remove(ref)
+			return "", nil, fmt.Errorf("validate NZB metadata store %q: %w", ref, integrityErr)
+		}
+		storeRef = ref
+		storeIndex = parsed.SegmentIndex
 	}
 
 	// Bare-ISO Blu-ray expansion. ISOs posted directly to Usenet (without
