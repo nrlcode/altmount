@@ -72,6 +72,18 @@ func (ss *StoreService) ReadStore(ref string) (*metapb.NzbStore, error) {
 	if c, ok := ss.cache.Get(ref); ok {
 		return c, nil
 	}
+	store, err := ss.readStoreFile(ref)
+	if err != nil {
+		return nil, err
+	}
+	ss.cache.Add(ref, store)
+	return store, nil
+}
+
+// readStoreFile reads the current on-disk store without consulting or updating
+// the cache. Ownership acquisition uses it to validate the artifact protected
+// by the cleanup lock rather than an earlier cached copy.
+func (ss *StoreService) readStoreFile(ref string) (*metapb.NzbStore, error) {
 	compressed, err := os.ReadFile(ref)
 	if err != nil {
 		return nil, fmt.Errorf("read store %q: %w", ref, err)
@@ -84,7 +96,6 @@ func (ss *StoreService) ReadStore(ref string) (*metapb.NzbStore, error) {
 	if err := proto.Unmarshal(raw, store); err != nil {
 		return nil, fmt.Errorf("unmarshal store: %w", err)
 	}
-	ss.cache.Add(ref, store)
 	return store, nil
 }
 

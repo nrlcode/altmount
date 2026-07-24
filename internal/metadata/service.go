@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -115,6 +116,37 @@ func (ms *MetadataService) IncStoreRef(ctx context.Context, storePath string) {
 		slog.WarnContext(ctx, "failed to increment store ref count",
 			"store_path", storePath, "error", err)
 	}
+}
+
+func (ms *MetadataService) acquireV3StoreReference(ctx context.Context, storePath string) error {
+	cleanupOperationMu.Lock()
+	defer cleanupOperationMu.Unlock()
+
+	if ms.storeRefCounter == nil {
+		return errors.New("v3 store reference counter is unavailable")
+	}
+	if err := ms.storeRefCounter.IncStoreRef(ctx, storePath); err != nil {
+		return fmt.Errorf("increment v3 store reference %q: %w", storePath, err)
+	}
+	if _, err := ms.store.readStoreFile(storePath); err != nil {
+		_, rollbackErr := ms.storeRefCounter.DecStoreRef(context.WithoutCancel(ctx), storePath)
+		if rollbackErr != nil {
+			rollbackErr = fmt.Errorf("roll back v3 store reference %q: %w", storePath, rollbackErr)
+		}
+		return errors.Join(fmt.Errorf("validate v3 store %q: %w", storePath, err), rollbackErr)
+	}
+	return nil
+}
+
+func (ms *MetadataService) rollbackV3StoreReference(ctx context.Context, storePath string) error {
+	cleanupOperationMu.Lock()
+	defer cleanupOperationMu.Unlock()
+
+	_, err := ms.storeRefCounter.DecStoreRef(context.WithoutCancel(ctx), storePath)
+	if err != nil {
+		return fmt.Errorf("roll back v3 store reference %q: %w", storePath, err)
+	}
+	return nil
 }
 
 // truncateFilename truncates the filename if it's too long to prevent filesystem issues
@@ -269,12 +301,15 @@ func (ms *MetadataService) WriteFileMetadataV3(ctx context.Context, virtualPath 
 	}
 	m.SharedOuterSources = nil
 
+	if err := ms.acquireV3StoreReference(ctx, storeRef); err != nil {
+		return err
+	}
+
 	// WriteFileMetadata's v3 branch (StoreRef set) clears inline SegmentData/
 	// SharedOuterSources/NestedSource.Segments and keeps SegmentRefs/SegmentRuns.
 	if err := ms.WriteFileMetadata(virtualPath, m); err != nil {
-		return err
+		return errors.Join(err, ms.rollbackV3StoreReference(ctx, storeRef))
 	}
-	ms.IncStoreRef(ctx, storeRef)
 	return nil
 }
 
