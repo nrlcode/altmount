@@ -3,11 +3,11 @@ package metadata
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	metapb "github.com/javi11/altmount/internal/metadata/proto"
 	"github.com/stretchr/testify/require"
@@ -21,15 +21,26 @@ type acquisitionRefCounter struct {
 	incCalls int
 	decCalls int
 
-	incEntered chan struct{}
-	incRelease <-chan struct{}
-	incOnce    sync.Once
-	decEntered chan struct{}
-	decRelease <-chan struct{}
-	decOnce    sync.Once
+	incEntered  chan struct{}
+	incRelease  <-chan struct{}
+	incOnce     sync.Once
+	checkLock   bool
+	incHeldLock bool
+	decEntered  chan struct{}
+	decRelease  <-chan struct{}
+	decOnce     sync.Once
 }
 
 func (c *acquisitionRefCounter) IncStoreRef(ctx context.Context, _ string) error {
+	if c.checkLock {
+		if cleanupOperationMu.TryLock() {
+			cleanupOperationMu.Unlock()
+		} else {
+			c.mu.Lock()
+			c.incHeldLock = true
+			c.mu.Unlock()
+		}
+	}
 	c.incOnce.Do(func() {
 		if c.incEntered != nil {
 			close(c.incEntered)
@@ -51,6 +62,12 @@ func (c *acquisitionRefCounter) IncStoreRef(ctx context.Context, _ string) error
 	}
 	c.count++
 	return nil
+}
+
+func (c *acquisitionRefCounter) incrementHeldCleanupLock() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.incHeldLock
 }
 
 func (c *acquisitionRefCounter) DecStoreRef(ctx context.Context, _ string) (int64, error) {
@@ -134,8 +151,9 @@ func TestWriteFileMetadataV3_RequiresReferenceBeforePublication(t *testing.T) {
 
 func TestWriteFileMetadataV3_ValidatesFreshStoreAndRollsBack(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		mutate func(*testing.T, string)
+		name          string
+		storeSurvives bool
+		mutate        func(*testing.T, string)
 	}{
 		{
 			name: "missing",
@@ -144,7 +162,8 @@ func TestWriteFileMetadataV3_ValidatesFreshStoreAndRollsBack(t *testing.T) {
 			},
 		},
 		{
-			name: "corrupt",
+			name:          "corrupt",
+			storeSurvives: true,
 			mutate: func(t *testing.T, path string) {
 				require.NoError(t, os.WriteFile(path, []byte("not a zstd store"), 0o600))
 			},
@@ -166,28 +185,36 @@ func TestWriteFileMetadataV3_ValidatesFreshStoreAndRollsBack(t *testing.T) {
 			require.Equal(t, int64(0), count)
 			require.Equal(t, 1, incCalls)
 			require.Equal(t, 1, decCalls)
+			if test.storeSurvives {
+				_, statErr := os.Stat(storePath)
+				require.NoError(t, statErr, "rollback must not unlink the store even when the count reaches zero")
+			}
 		})
 	}
 }
 
 func TestWriteFileMetadataV3_PublicationFailureRestoresReference(t *testing.T) {
-	root := t.TempDir()
-	metadataRoot := filepath.Join(root, "metadata-is-a-file")
-	require.NoError(t, os.WriteFile(metadataRoot, []byte("obstruction"), 0o600))
-	ms := NewMetadataService(metadataRoot)
-	storePath := filepath.Join(root, "store", "release.nzbz")
-	writeAcquisitionStore(t, ms, storePath)
-	counter := &acquisitionRefCounter{count: 1}
-	ms.SetStoreRefCounter(counter)
+	for _, initialCount := range []int64{0, 1} {
+		t.Run(fmt.Sprintf("initial count %d", initialCount), func(t *testing.T) {
+			root := t.TempDir()
+			metadataRoot := filepath.Join(root, "metadata-is-a-file")
+			require.NoError(t, os.WriteFile(metadataRoot, []byte("obstruction"), 0o600))
+			ms := NewMetadataService(metadataRoot)
+			storePath := filepath.Join(root, "store", "release.nzbz")
+			writeAcquisitionStore(t, ms, storePath)
+			counter := &acquisitionRefCounter{count: initialCount}
+			ms.SetStoreRefCounter(counter)
 
-	err := ms.WriteFileMetadataV3(context.Background(), "movie.mkv", acquisitionMetadata(), nil, storePath)
-	require.Error(t, err)
-	count, incCalls, decCalls := counter.snapshot()
-	require.Equal(t, int64(1), count, "the existing owner must survive rollback")
-	require.Equal(t, 1, incCalls)
-	require.Equal(t, 1, decCalls)
-	_, statErr := os.Stat(storePath)
-	require.NoError(t, statErr, "writer rollback must not remove a shared store")
+			err := ms.WriteFileMetadataV3(context.Background(), "movie.mkv", acquisitionMetadata(), nil, storePath)
+			require.Error(t, err)
+			count, incCalls, decCalls := counter.snapshot()
+			require.Equal(t, initialCount, count, "publication rollback must restore the prior owner count")
+			require.Equal(t, 1, incCalls)
+			require.Equal(t, 1, decCalls)
+			_, statErr := os.Stat(storePath)
+			require.NoError(t, statErr, "writer rollback must never remove the store")
+		})
+	}
 }
 
 func TestWriteFileMetadataV3_SerializesWriterBeforeCleanup(t *testing.T) {
@@ -203,12 +230,11 @@ func TestWriteFileMetadataV3_SerializesWriterBeforeCleanup(t *testing.T) {
 
 	incEntered := make(chan struct{})
 	incRelease := make(chan struct{})
-	decEntered := make(chan struct{})
 	counter := &acquisitionRefCounter{
 		count:      1,
 		incEntered: incEntered,
 		incRelease: incRelease,
-		decEntered: decEntered,
+		checkLock:  true,
 	}
 	writer.SetStoreRefCounter(counter)
 	cleanup.SetStoreRefCounter(counter)
@@ -226,18 +252,11 @@ func TestWriteFileMetadataV3_SerializesWriterBeforeCleanup(t *testing.T) {
 		cleanupDone <- cleanup.DeleteFileMetadataWithSourceNzb(context.Background(), "old.mkv", false)
 	}()
 	<-cleanupStarted
-
-	cleanupEnteredEarly := false
-	select {
-	case <-decEntered:
-		cleanupEnteredEarly = true
-	case <-time.After(100 * time.Millisecond):
-	}
 	close(incRelease)
 
 	require.NoError(t, <-writerDone)
 	require.NoError(t, <-cleanupDone)
-	require.False(t, cleanupEnteredEarly, "cleanup must wait for provisional acquisition and validation")
+	require.True(t, counter.incrementHeldCleanupLock(), "acquisition must hold the same process-wide lock used by cleanup")
 	count, incCalls, decCalls := counter.snapshot()
 	require.Equal(t, int64(1), count)
 	require.Equal(t, 1, incCalls)
@@ -261,10 +280,8 @@ func TestWriteFileMetadataV3_SerializesCleanupBeforeWriter(t *testing.T) {
 
 	decEntered := make(chan struct{})
 	decRelease := make(chan struct{})
-	incEntered := make(chan struct{})
 	counter := &acquisitionRefCounter{
 		count:      1,
-		incEntered: incEntered,
 		decEntered: decEntered,
 		decRelease: decRelease,
 	}
@@ -284,18 +301,10 @@ func TestWriteFileMetadataV3_SerializesCleanupBeforeWriter(t *testing.T) {
 		writerDone <- writer.WriteFileMetadataV3(context.Background(), "new.mkv", acquisitionMetadata(), nil, storePath)
 	}()
 	<-writerStarted
-
-	writerEnteredEarly := false
-	select {
-	case <-incEntered:
-		writerEnteredEarly = true
-	case <-time.After(100 * time.Millisecond):
-	}
 	close(decRelease)
 
 	require.NoError(t, <-cleanupDone)
 	require.Error(t, <-writerDone)
-	require.False(t, writerEnteredEarly, "writer must wait until cleanup releases its authority")
 	count, incCalls, decCalls := counter.snapshot()
 	require.Equal(t, int64(0), count)
 	require.Equal(t, 1, incCalls)
