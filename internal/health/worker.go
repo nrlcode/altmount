@@ -151,7 +151,6 @@ func NewHealthWorker(
 		configGetter:        configGetter,
 		progressBroadcaster: broadcaster,
 		status:              WorkerStatusStopped,
-		stopChan:            make(chan struct{}),
 		activeChecks:        make(map[string]activeHealthCheck),
 		stats: WorkerStats{
 			Status: WorkerStatusStopped,
@@ -171,6 +170,10 @@ func (hw *HealthWorker) Start(ctx context.Context) error {
 	hw.mu.Lock()
 	defer hw.mu.Unlock()
 
+	if hw.status == WorkerStatusStopping {
+		return fmt.Errorf("health worker is stopping")
+	}
+
 	if hw.running {
 		return fmt.Errorf("health worker already running")
 	}
@@ -180,6 +183,8 @@ func (hw *HealthWorker) Start(ctx context.Context) error {
 		return nil
 	}
 
+	stopChan := make(chan struct{})
+	hw.stopChan = stopChan
 	hw.running = true
 	hw.status = WorkerStatusStarting
 	hw.updateStats(func(s *WorkerStats) {
@@ -201,7 +206,7 @@ func (hw *HealthWorker) Start(ctx context.Context) error {
 
 	// Start the main worker goroutine
 	hw.wg.Go(func() {
-		hw.run(ctx)
+		hw.run(ctx, stopChan)
 	})
 
 	hw.status = WorkerStatusRunning
@@ -216,9 +221,9 @@ func (hw *HealthWorker) Start(ctx context.Context) error {
 // Stop gracefully stops the health worker
 func (hw *HealthWorker) Stop(ctx context.Context) error {
 	hw.mu.Lock()
-	defer hw.mu.Unlock()
 
 	if !hw.running {
+		hw.mu.Unlock()
 		return fmt.Errorf("health worker not running")
 	}
 
@@ -230,16 +235,19 @@ func (hw *HealthWorker) Stop(ctx context.Context) error {
 	slog.InfoContext(ctx, "Stopping health worker...")
 	close(hw.stopChan)
 	hw.running = false
+	hw.mu.Unlock()
 
 	// Wait for all goroutines to finish
 	hw.wg.Wait()
 
+	hw.mu.Lock()
 	hw.status = WorkerStatusStopped
 	hw.updateStats(func(s *WorkerStats) {
 		s.Status = WorkerStatusStopped
 		s.CurrentRunStartTime = nil
 		s.CurrentRunFilesChecked = 0
 	})
+	hw.mu.Unlock()
 
 	slog.InfoContext(ctx, "Health worker stopped")
 	return nil
@@ -343,7 +351,7 @@ func (hw *HealthWorker) IsCheckActive(filePath string) bool {
 }
 
 // run is the main worker loop
-func (hw *HealthWorker) run(ctx context.Context) {
+func (hw *HealthWorker) run(ctx context.Context, stopChan <-chan struct{}) {
 	ticker := time.NewTicker(hw.getCheckInterval())
 	defer ticker.Stop()
 
@@ -352,7 +360,7 @@ func (hw *HealthWorker) run(ctx context.Context) {
 		case <-ctx.Done():
 			slog.InfoContext(ctx, "Health worker stopped by context")
 			return
-		case <-hw.stopChan:
+		case <-stopChan:
 			slog.InfoContext(ctx, "Health worker stopped by stop signal")
 			return
 		case <-ticker.C:
