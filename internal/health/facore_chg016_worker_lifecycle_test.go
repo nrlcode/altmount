@@ -67,8 +67,10 @@ func TestFACORECHG016HealthWorkerStopReturnsAfterInflightCycleCompletes(t *testi
 	}
 
 	startResult := make(chan error, 1)
+	attemptCtx, cancelAttempt := context.WithCancel(context.Background())
+	t.Cleanup(cancelAttempt)
 	go func() {
-		startResult <- env.hw.Start(context.Background())
+		startResult <- env.hw.Start(attemptCtx)
 	}()
 	select {
 	case err := <-startResult:
