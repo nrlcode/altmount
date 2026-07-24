@@ -229,8 +229,8 @@ func (ms *MetadataService) WriteFileMetadata(virtualPath string, metadata *metap
 // meta at storeRef, and increments the store reference count exactly once.
 //
 // The conversion runs on a clone so a failure (e.g. a segment id missing from the
-// index) leaves the caller's in-memory meta untouched, letting the caller fall back
-// to a v1 WriteFileMetadata. Freshly-built archive metas still carry the
+// index) leaves the caller's in-memory meta untouched and can be returned safely.
+// Freshly-built archive metas still carry the
 // SharedOuterSources dedup, so it is expanded first (mirroring the read path) before
 // each nested source is converted independently and the dedup dissolved.
 func (ms *MetadataService) WriteFileMetadataV3(ctx context.Context, virtualPath string, metadata *metapb.FileMetadata, index map[string]int64, storeRef string) error {
