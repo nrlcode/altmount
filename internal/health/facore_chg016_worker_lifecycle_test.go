@@ -44,6 +44,9 @@ func TestFACORECHG016HealthWorkerStopReturnsAfterInflightCycleCompletes(t *testi
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	t.Cleanup(cancelWorker)
 	require.NoError(t, env.hw.Start(workerCtx))
+	env.hw.mu.RLock()
+	firstStopSignal := env.hw.stopChan
+	env.hw.mu.RUnlock()
 
 	waitForHealthContract(t, func() bool { return client.InFlight() == 1 },
 		"timed out waiting for an in-flight health cycle")
@@ -57,6 +60,28 @@ func TestFACORECHG016HealthWorkerStopReturnsAfterInflightCycleCompletes(t *testi
 		return env.hw.GetStats().Status == WorkerStatusStopping
 	}, "timed out waiting for the worker to enter stopping state")
 
+	select {
+	case err := <-stopResult:
+		t.Fatalf("Stop returned before the in-flight cycle completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- env.hw.Start(context.Background())
+	}()
+	select {
+	case err := <-startResult:
+		require.Error(t, err, "Start must reject a generation that is still stopping")
+		env.hw.mu.RLock()
+		currentStopSignal := env.hw.stopChan
+		env.hw.mu.RUnlock()
+		require.Equal(t, firstStopSignal, currentStopSignal,
+			"a rejected Start cannot replace the stopping generation")
+	case <-time.After(500 * time.Millisecond):
+		t.Error("Start did not promptly reject the stopping generation")
+	}
+
 	release()
 	select {
 	case err := <-stopResult:
@@ -64,12 +89,22 @@ func TestFACORECHG016HealthWorkerStopReturnsAfterInflightCycleCompletes(t *testi
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop did not return after the in-flight cycle completed")
 	}
+
+	restartCtx, cancelRestart := context.WithCancel(context.Background())
+	t.Cleanup(cancelRestart)
+	require.NoError(t, env.hw.Start(restartCtx))
+	env.hw.mu.RLock()
+	restartStopSignal := env.hw.stopChan
+	env.hw.mu.RUnlock()
+	require.NotEqual(t, firstStopSignal, restartStopSignal)
+	require.NoError(t, env.hw.Stop(context.Background()))
 }
 
 func TestFACORECHG016HealthWorkerCanStartStopStartStop(t *testing.T) {
 	env := newRepairTestEnv(t, t.TempDir(), nil)
 
 	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	t.Cleanup(cancelFirst)
 	require.NoError(t, env.hw.Start(firstCtx))
 	env.hw.mu.RLock()
 	firstStop := env.hw.stopChan
@@ -78,7 +113,14 @@ func TestFACORECHG016HealthWorkerCanStartStopStartStop(t *testing.T) {
 	cancelFirst()
 
 	secondCtx, cancelSecond := context.WithCancel(context.Background())
-	t.Cleanup(cancelSecond)
+	t.Cleanup(func() {
+		cancelSecond()
+		if env.hw.IsRunning() {
+			_ = callHealthLifecycle(func() error {
+				return env.hw.Stop(context.Background())
+			})
+		}
+	})
 	require.NoError(t, env.hw.Start(secondCtx))
 	env.hw.mu.RLock()
 	secondStop := env.hw.stopChan
@@ -155,7 +197,19 @@ func TestFACORECHG016HealthSystemControllerCanDisableReenableDisable(t *testing.
 		&MockRcloneClient{},
 	)
 	controller := NewHealthSystemController(env.hw, librarySync)
-	controller.RegisterConfigChangeHandler(context.Background(), configManager)
+	controllerCtx, cancelController := context.WithCancel(context.Background())
+	controller.RegisterConfigChangeHandler(controllerCtx, configManager)
+	t.Cleanup(func() {
+		cancelController()
+		if librarySync.IsRunning() {
+			librarySync.Stop(context.Background())
+		}
+		if env.hw.IsRunning() {
+			_ = callHealthLifecycle(func() error {
+				return env.hw.Stop(context.Background())
+			})
+		}
+	})
 
 	setEnabled := func(enabled bool) healthLifecycleResult {
 		candidate := configManager.GetConfig()
