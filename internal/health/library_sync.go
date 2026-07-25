@@ -673,9 +673,11 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 	// Create a worker pool for parallel metadata reading
 	p := pool.New().WithMaxGoroutines(concurrency)
 	waitForAddWorkers := func() {
+		defer func() {
+			close(filesToAddChan)
+			<-done
+		}()
 		p.Wait()
-		close(filesToAddChan)
-		<-done
 	}
 
 	for mountRelativePath := range metaFileSet {
