@@ -470,26 +470,44 @@ func testFACORECHG020FinalizationRetainsAdmissionOwner(t *testing.T, failure boo
 	assert.ErrorIs(t, manager.CancelProcessing(item.ID), ErrQueueItemNotProcessing,
 		"an admission-only finalization owner must not report a delivered cancellation")
 	overlapErr := manager.ExecuteItem(context.Background(), item.ID)
-	if overlapErr == nil {
-		facoreCHG020Wait(t, replacementStarted, "overlapping replacement did not start")
+	assert.ErrorIs(t, overlapErr, database.ErrQueueItemClaimConflict,
+		"manual retry admission must wait until the prior finalizer releases ownership")
+
+	require.NoError(t, repo.RestartQueueItemsBulk(context.Background(), []int64{item.ID}))
+	automaticAttemptDone := make(chan struct{})
+	go func() {
+		manager.processNextItem(context.Background(), 1)
+		close(automaticAttemptDone)
+	}()
+	facoreCHG020Wait(t, automaticAttemptDone,
+		"automatic retry did not reject the retained finalization owner")
+	select {
+	case <-replacementStarted:
+		t.Fatal("automatic retry overlapped the prior finalizer")
+	default:
 	}
+	stored, err := repo.GetQueueItem(context.Background(), item.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	require.Equal(t, database.QueueStatusPending, stored.Status,
+		"a rejected automatic claim must remain retryable rather than ownerless processing")
 
 	finalizerReleaseOnce.Do(func() { close(finalizerRelease) })
-	if overlapErr == nil {
-		require.NoError(t, manager.CancelProcessing(item.ID))
-		facoreCHG020Wait(t, replacementFinished, "overlapping replacement did not finish")
-	} else {
-		require.Eventually(t, func() bool {
-			manager.cancelMu.RLock()
-			defer manager.cancelMu.RUnlock()
-			_, present := manager.cancelFuncs[item.ID]
-			return !present
-		}, facoreCHG020BarrierTimeout, time.Millisecond)
-		require.NoError(t, manager.ExecuteItem(context.Background(), item.ID))
-		facoreCHG020Wait(t, replacementStarted, "post-finalization replacement did not start")
-		require.NoError(t, manager.CancelProcessing(item.ID))
-		facoreCHG020Wait(t, replacementFinished, "post-finalization replacement did not finish")
-	}
+	require.Eventually(t, func() bool {
+		manager.cancelMu.RLock()
+		defer manager.cancelMu.RUnlock()
+		_, present := manager.cancelFuncs[item.ID]
+		return !present
+	}, facoreCHG020BarrierTimeout, time.Millisecond)
+	postFinalizationDone := make(chan struct{})
+	go func() {
+		manager.processNextItem(context.Background(), 1)
+		close(postFinalizationDone)
+	}()
+	facoreCHG020Wait(t, replacementStarted, "post-finalization automatic retry did not start")
+	require.NoError(t, manager.CancelProcessing(item.ID))
+	facoreCHG020Wait(t, replacementFinished, "post-finalization replacement did not finish")
+	facoreCHG020Wait(t, postFinalizationDone, "post-finalization automatic retry did not return")
 	require.Eventually(t, func() bool {
 		manager.cancelMu.RLock()
 		defer manager.cancelMu.RUnlock()
@@ -497,7 +515,5 @@ func testFACORECHG020FinalizationRetainsAdmissionOwner(t *testing.T, failure boo
 		return !present
 	}, facoreCHG020BarrierTimeout, time.Millisecond)
 
-	assert.ErrorIs(t, overlapErr, database.ErrQueueItemClaimConflict,
-		"retry admission must wait until the prior finalizer releases ownership")
 	assert.EqualValues(t, 2, calls.Load())
 }
