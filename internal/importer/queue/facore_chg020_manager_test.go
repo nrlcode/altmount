@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -175,36 +176,36 @@ func TestFACORECHG020ExecuteItemRegistersCancellationBeforeReturning(t *testing.
 		executeResult <- manager.ExecuteItem(context.Background(), item.ID)
 	}()
 
+	var (
+		returnedWhileRegistryLocked bool
+		earlyResult                 error
+	)
 	deadline := time.NewTimer(facoreCHG020BarrierTimeout)
 	ticker := time.NewTicker(time.Millisecond)
 	defer deadline.Stop()
 	defer ticker.Stop()
-	for {
-		stored, err := repo.GetQueueItem(context.Background(), item.ID)
-		require.NoError(t, err)
-		if stored.Status == database.QueueStatusProcessing {
+	barrierReached := false
+	for !barrierReached && !returnedWhileRegistryLocked {
+		if !manager.claimMu.TryLock() {
+			barrierReached = true
 			break
 		}
+		manager.claimMu.Unlock()
 		select {
+		case earlyResult = <-executeResult:
+			returnedWhileRegistryLocked = true
 		case <-ticker.C:
 		case <-deadline.C:
-			manager.cancelMu.Unlock()
-			registryLocked = false
-			t.Fatal("ExecuteItem did not reach durable admission")
+			t.Fatal("ExecuteItem did not reach the manager admission boundary")
 		}
 	}
-
-	returnedWhileRegistryLocked := false
-	select {
-	case err := <-executeResult:
-		returnedWhileRegistryLocked = true
-		require.NoError(t, err)
-	case <-time.After(100 * time.Millisecond):
-	}
+	require.True(t, barrierReached || returnedWhileRegistryLocked)
 	manager.cancelMu.Unlock()
 	registryLocked = false
 
-	if !returnedWhileRegistryLocked {
+	if returnedWhileRegistryLocked {
+		require.NoError(t, earlyResult)
+	} else {
 		require.NoError(t, facoreCHG020Receive(t, executeResult,
 			"ExecuteItem did not return after the cancellation registry was unlocked"))
 	}
@@ -366,110 +367,137 @@ func TestFACORECHG020AutomaticClaimLosesAfterManualAdmission(t *testing.T) {
 	facoreCHG020Wait(t, finished, "manual processor did not finish")
 }
 
-func TestFACORECHG020StaleTeardownDoesNotEraseReplacementOwner(t *testing.T) {
+func TestFACORECHG020FinalizationRetainsAdmissionOwner(t *testing.T) {
+	for _, failure := range []bool{false, true} {
+		name := "success"
+		if failure {
+			name = "failure"
+		}
+		t.Run(name, func(t *testing.T) {
+			testFACORECHG020FinalizationRetainsAdmissionOwner(t, failure)
+		})
+	}
+}
+
+func testFACORECHG020FinalizationRetainsAdmissionOwner(t *testing.T, failure bool) {
 	var calls atomic.Int32
+	var finalizerCalls atomic.Int32
 	firstStarted := make(chan struct{})
 	firstRelease := make(chan struct{})
-	firstHandled := make(chan struct{})
-	firstFinalizeErr := make(chan error, 1)
-	firstFinalizeRelease := make(chan struct{})
-	secondStarted := make(chan struct{})
-	secondCancelled := make(chan struct{})
-	secondStop := make(chan struct{})
-	secondFinished := make(chan struct{})
-	var secondStopOnce sync.Once
-	t.Cleanup(func() { secondStopOnce.Do(func() { close(secondStop) }) })
+	finalizerStarted := make(chan struct{})
+	finalizerRelease := make(chan struct{})
+	finalizerErr := make(chan error, 1)
+	replacementStarted := make(chan struct{})
+	replacementFinished := make(chan struct{})
+	replacementStop := make(chan struct{})
+	var firstReleaseOnce, finalizerReleaseOnce, replacementStopOnce sync.Once
+	t.Cleanup(func() {
+		firstReleaseOnce.Do(func() { close(firstRelease) })
+		finalizerReleaseOnce.Do(func() { close(finalizerRelease) })
+	})
 
 	var repo *database.QueueRepository
 	var itemID int64
+	finalize := func(status database.QueueStatus) {
+		err := repo.UpdateQueueItemStatus(context.Background(), itemID, status, nil)
+		finalizerErr <- err
+		close(finalizerStarted)
+		if err == nil {
+			<-finalizerRelease
+		}
+	}
 	processor := &facoreCHG020Processor{
 		process: func(ctx context.Context, _ *database.ImportQueueItem) (string, error) {
 			switch calls.Add(1) {
 			case 1:
 				close(firstStarted)
 				<-firstRelease
+				if failure {
+					return "", assert.AnError
+				}
 				return "first", nil
 			case 2:
-				close(secondStarted)
-				defer close(secondFinished)
+				close(replacementStarted)
+				defer close(replacementFinished)
 				select {
 				case <-ctx.Done():
-					close(secondCancelled)
 					return "", ctx.Err()
-				case <-secondStop:
-					return "second", nil
+				case <-replacementStop:
+					return "stopped", nil
 				}
 			default:
 				return "", assert.AnError
 			}
 		},
-		success: func(_ context.Context, _ *database.ImportQueueItem, path string) error {
-			if path == "first" {
-				err := repo.UpdateQueueItemStatus(
-					context.Background(), itemID, database.QueueStatusCompleted, nil,
-				)
-				firstFinalizeErr <- err
-				close(firstHandled)
-				if err != nil {
-					return err
-				}
-				<-firstFinalizeRelease
+		success: func(context.Context, *database.ImportQueueItem, string) error {
+			if !failure && finalizerCalls.Add(1) == 1 {
+				finalize(database.QueueStatusCompleted)
 			}
 			return nil
 		},
+		failure: func(context.Context, *database.ImportQueueItem, error) {
+			if failure && finalizerCalls.Add(1) == 1 {
+				finalize(database.QueueStatusFailed)
+			}
+		},
 	}
 	manager, queueRepo := facoreCHG020Manager(t, processor, nil)
+	t.Cleanup(func() {
+		replacementStopOnce.Do(func() { close(replacementStop) })
+		select {
+		case <-replacementStarted:
+			select {
+			case <-replacementFinished:
+			case <-time.After(facoreCHG020BarrierTimeout):
+			}
+		default:
+		}
+	})
 	repo = queueRepo
-	item := facoreCHG020AddPendingItem(t, repo, "replacement-owner.nzb")
+	item := facoreCHG020AddPendingItem(t, repo, fmt.Sprintf("finalization-owner-%t.nzb", failure))
 	itemID = item.ID
 
 	require.NoError(t, manager.ExecuteItem(context.Background(), item.ID))
 	facoreCHG020Wait(t, firstStarted, "first processing owner did not start")
+	firstReleaseOnce.Do(func() { close(firstRelease) })
+	facoreCHG020Wait(t, finalizerStarted, "first finalizer did not publish an eligible status")
+	require.NoError(t, <-finalizerErr)
 
-	close(firstRelease)
-	facoreCHG020Wait(t, firstHandled, "first owner did not publish its completed state")
-	require.NoError(t, <-firstFinalizeErr)
 	manager.cancelMu.RLock()
-	_, staleOwnerStillRegistered := manager.cancelFuncs[item.ID]
+	_, ownerPresent := manager.cancelFuncs[item.ID]
 	manager.cancelMu.RUnlock()
-	assert.False(t, staleOwnerStillRegistered,
-		"the completed row must not become retry-eligible while its old runtime owner remains registered")
+	assert.True(t, ownerPresent, "admission ownership must span finalization")
+	assert.ErrorIs(t, manager.CancelProcessing(item.ID), ErrQueueItemNotProcessing,
+		"an admission-only finalization owner must not report a delivered cancellation")
+	overlapErr := manager.ExecuteItem(context.Background(), item.ID)
+	if overlapErr == nil {
+		facoreCHG020Wait(t, replacementStarted, "overlapping replacement did not start")
+	}
 
-	// The completed row can now be retried while the old finalizer is still
-	// unwinding. Its deferred teardown must not erase the replacement identity.
-	require.NoError(t, manager.ExecuteItem(context.Background(), item.ID))
-	facoreCHG020Wait(t, secondStarted, "replacement processing owner did not start")
-	close(firstFinalizeRelease)
-
-	// On the defective base, the stale owner's identity-blind defer deletes the
-	// replacement entry. Polling for that transition also provides a barrier that
-	// the stale teardown has run; a corrected registry deliberately stays present.
-	registryDeadline := time.NewTimer(100 * time.Millisecond)
-	registryTicker := time.NewTicker(time.Millisecond)
-	for registryPresent := true; registryPresent; {
+	finalizerReleaseOnce.Do(func() { close(finalizerRelease) })
+	if overlapErr == nil {
+		require.NoError(t, manager.CancelProcessing(item.ID))
+		facoreCHG020Wait(t, replacementFinished, "overlapping replacement did not finish")
+	} else {
+		require.Eventually(t, func() bool {
+			manager.cancelMu.RLock()
+			defer manager.cancelMu.RUnlock()
+			_, present := manager.cancelFuncs[item.ID]
+			return !present
+		}, facoreCHG020BarrierTimeout, time.Millisecond)
+		require.NoError(t, manager.ExecuteItem(context.Background(), item.ID))
+		facoreCHG020Wait(t, replacementStarted, "post-finalization replacement did not start")
+		require.NoError(t, manager.CancelProcessing(item.ID))
+		facoreCHG020Wait(t, replacementFinished, "post-finalization replacement did not finish")
+	}
+	require.Eventually(t, func() bool {
 		manager.cancelMu.RLock()
-		_, registryPresent = manager.cancelFuncs[item.ID]
-		manager.cancelMu.RUnlock()
-		if !registryPresent {
-			break
-		}
-		select {
-		case <-registryTicker.C:
-		case <-registryDeadline.C:
-			registryPresent = false
-		}
-	}
-	registryTicker.Stop()
-	registryDeadline.Stop()
+		defer manager.cancelMu.RUnlock()
+		_, present := manager.cancelFuncs[item.ID]
+		return !present
+	}, facoreCHG020BarrierTimeout, time.Millisecond)
 
-	cancelErr := manager.CancelProcessing(item.ID)
-	assert.NoError(t, cancelErr, "replacement owner must remain cancellable")
-	select {
-	case <-secondCancelled:
-	case <-time.After(100 * time.Millisecond):
-		t.Error("stale teardown erased the replacement cancellation owner")
-	}
-	secondStopOnce.Do(func() { close(secondStop) })
-	facoreCHG020Wait(t, secondFinished, "replacement processor did not finish")
-	assert.EqualValues(t, 2, calls.Load(), "the stale-owner scenario must create exactly one replacement")
+	assert.ErrorIs(t, overlapErr, database.ErrQueueItemClaimConflict,
+		"retry admission must wait until the prior finalizer releases ownership")
+	assert.EqualValues(t, 2, calls.Load())
 }
