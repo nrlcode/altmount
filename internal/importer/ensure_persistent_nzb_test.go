@@ -105,7 +105,6 @@ func newMinimalServiceForPersistTestDB(t *testing.T, db *sql.DB) *Service {
 		configGetter:    cfgGetter,
 		metadataService: metadataService,
 		log:             slog.Default(),
-		cancelFuncs:     make(map[int64]context.CancelFunc),
 		mu:              sync.RWMutex{},
 	}
 }

@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -10,6 +11,17 @@ import (
 	"github.com/javi11/altmount/internal/config"
 	"github.com/javi11/altmount/internal/database"
 )
+
+var (
+	// ErrQueueItemNotFound means manual execution targeted no durable queue row.
+	ErrQueueItemNotFound = errors.New("queue item not found")
+	// ErrQueueItemNotProcessing means no live runtime owner can receive cancellation.
+	ErrQueueItemNotProcessing = errors.New("queue item is not currently processing")
+)
+
+type processingOwner struct {
+	cancel context.CancelFunc
+}
 
 // QueueEventListener receives notifications about queue item lifecycle events.
 type QueueEventListener interface {
@@ -59,7 +71,7 @@ type Manager struct {
 	claimMu sync.Mutex
 
 	// Cancellation tracking for processing items
-	cancelFuncs map[int64]context.CancelFunc
+	cancelFuncs map[int64]*processingOwner
 	cancelMu    sync.RWMutex
 }
 
@@ -81,7 +93,7 @@ func NewManager(cfg ManagerConfig, repository *database.QueueRepository, process
 		log:          slog.Default().With("component", "queue-manager"),
 		ctx:          ctx,
 		cancel:       cancel,
-		cancelFuncs:  make(map[int64]context.CancelFunc),
+		cancelFuncs:  make(map[int64]*processingOwner),
 	}
 }
 
@@ -190,11 +202,15 @@ func (m *Manager) IsRunning() bool {
 // CancelProcessing cancels processing for a specific item
 func (m *Manager) CancelProcessing(itemID int64) error {
 	m.cancelMu.RLock()
-	cancel, exists := m.cancelFuncs[itemID]
+	owner, exists := m.cancelFuncs[itemID]
+	var cancel context.CancelFunc
+	if exists {
+		cancel = owner.cancel
+	}
 	m.cancelMu.RUnlock()
 
-	if !exists {
-		return nil // Not currently processing
+	if !exists || cancel == nil {
+		return fmt.Errorf("%w: queue item %d", ErrQueueItemNotProcessing, itemID)
 	}
 
 	m.log.InfoContext(m.ctx, "Cancelling processing for queue item", "item_id", itemID)
@@ -204,45 +220,103 @@ func (m *Manager) CancelProcessing(itemID int64) error {
 
 // ExecuteItem manually triggers processing for a specific queue item, bypassing concurrency limits.
 func (m *Manager) ExecuteItem(ctx context.Context, itemID int64) error {
-	item, err := m.repository.GetQueueItem(ctx, itemID)
+	m.claimMu.Lock()
+	if m.hasProcessingOwner(itemID) {
+		m.claimMu.Unlock()
+		return fmt.Errorf("%w: queue item %d already has an admission owner",
+			database.ErrQueueItemClaimConflict, itemID)
+	}
+	item, err := m.repository.ClaimQueueItemByID(ctx, itemID)
 	if err != nil {
+		m.claimMu.Unlock()
 		return err
 	}
 	if item == nil {
-		return fmt.Errorf("queue item %d not found", itemID)
+		m.claimMu.Unlock()
+		return fmt.Errorf("%w: queue item %d", ErrQueueItemNotFound, itemID)
 	}
 
-	// Set status to processing before running
-	err = m.repository.UpdateQueueItemStatus(ctx, itemID, database.QueueStatusProcessing, nil)
+	itemCtx, owner, err := m.registerProcessingOwner(context.Background(), item.ID)
+	m.claimMu.Unlock()
 	if err != nil {
 		return err
 	}
 
 	m.log.InfoContext(ctx, "Manually triggering processing for queue item", "queue_id", itemID)
+	if m.listener != nil {
+		m.listener.OnItemClaimed(ctx, item)
+	}
 
-	go func() {
-		// Use a separate context for the execution to avoid early termination
-		itemCtx, cancel := context.WithCancel(context.Background())
-		m.cancelMu.Lock()
-		m.cancelFuncs[item.ID] = cancel
-		m.cancelMu.Unlock()
-
-		defer func() {
-			m.cancelMu.Lock()
-			delete(m.cancelFuncs, item.ID)
-			m.cancelMu.Unlock()
-		}()
-
-		resultingPath, processingErr := m.processor.ProcessItem(itemCtx, item)
-
-		if processingErr != nil {
-			m.processor.HandleFailure(itemCtx, item, processingErr)
-		} else {
-			m.processor.HandleSuccess(itemCtx, item, resultingPath)
-		}
-	}()
+	go m.processClaimedItem(itemCtx, context.Background(), item, owner)
 
 	return nil
+}
+
+func (m *Manager) hasProcessingOwner(itemID int64) bool {
+	m.cancelMu.RLock()
+	defer m.cancelMu.RUnlock()
+	_, exists := m.cancelFuncs[itemID]
+	return exists
+}
+
+func (m *Manager) registerProcessingOwner(
+	ctx context.Context,
+	itemID int64,
+) (context.Context, *processingOwner, error) {
+	itemCtx, cancel := context.WithCancel(ctx)
+	owner := &processingOwner{cancel: cancel}
+	m.cancelMu.Lock()
+	defer m.cancelMu.Unlock()
+	if _, exists := m.cancelFuncs[itemID]; exists {
+		cancel()
+		return nil, nil, fmt.Errorf("%w: queue item %d already has an active owner",
+			database.ErrQueueItemClaimConflict, itemID)
+	}
+	m.cancelFuncs[itemID] = owner
+	return itemCtx, owner, nil
+}
+
+func (m *Manager) releaseProcessingOwner(itemID int64, owner *processingOwner) {
+	m.cancelMu.Lock()
+	if m.cancelFuncs[itemID] == owner {
+		delete(m.cancelFuncs, itemID)
+	}
+	cancel := owner.cancel
+	owner.cancel = nil
+	m.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (m *Manager) retainFinalizationOwner(owner *processingOwner) {
+	m.cancelMu.Lock()
+	cancel := owner.cancel
+	owner.cancel = nil
+	m.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (m *Manager) processClaimedItem(
+	itemCtx context.Context,
+	finalizationCtx context.Context,
+	item *database.ImportQueueItem,
+	owner *processingOwner,
+) {
+	defer m.releaseProcessingOwner(item.ID, owner)
+
+	resultingPath, processingErr := m.processor.ProcessItem(itemCtx, item)
+	// Finalization is deliberately uncancellable, but its admission identity must
+	// remain registered until all mutations for this attempt have finished.
+	m.retainFinalizationOwner(owner)
+
+	if processingErr != nil {
+		m.processor.HandleFailure(finalizationCtx, item, processingErr)
+	} else {
+		_ = m.processor.HandleSuccess(finalizationCtx, item, resultingPath)
+	}
 }
 
 // Resize dynamically adjusts the number of queue workers.
@@ -322,9 +396,9 @@ func (m *Manager) workerLoop(workerID int, loopCtx context.Context) {
 func (m *Manager) processNextItem(ctx context.Context, workerID int) {
 	m.claimMu.Lock()
 	item, err := m.claimer.ClaimWithRetry(ctx, workerID)
-	m.claimMu.Unlock()
 
 	if err != nil {
+		m.claimMu.Unlock()
 		if !IsDatabaseContentionError(err) {
 			m.log.ErrorContext(ctx, "Failed to claim next queue item", "worker_id", workerID, "error", err)
 		}
@@ -332,8 +406,26 @@ func (m *Manager) processNextItem(ctx context.Context, workerID int) {
 	}
 
 	if item == nil {
+		m.claimMu.Unlock()
 		return // No work to do
 	}
+
+	itemCtx, owner, err := m.registerProcessingOwner(ctx, item.ID)
+	if err != nil {
+		releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		releaseErr := m.repository.ReleaseQueueItemClaim(releaseCtx, item.ID)
+		releaseCancel()
+		m.claimMu.Unlock()
+		if releaseErr != nil {
+			m.log.ErrorContext(ctx, "Failed to release rejected queue claim", "worker_id", workerID,
+				"queue_id", item.ID, "claim_error", err, "release_error", releaseErr)
+			return
+		}
+		m.log.ErrorContext(ctx, "Failed to register claimed queue item", "worker_id", workerID,
+			"queue_id", item.ID, "error", err)
+		return
+	}
+	m.claimMu.Unlock()
 
 	if m.listener != nil {
 		m.listener.OnItemClaimed(ctx, item)
@@ -341,22 +433,5 @@ func (m *Manager) processNextItem(ctx context.Context, workerID int) {
 
 	m.log.DebugContext(ctx, "Processing claimed queue item", "worker_id", workerID, "queue_id", item.ID, "file", item.NzbPath)
 
-	itemCtx, cancel := context.WithCancel(ctx)
-	m.cancelMu.Lock()
-	m.cancelFuncs[item.ID] = cancel
-	m.cancelMu.Unlock()
-
-	defer func() {
-		m.cancelMu.Lock()
-		delete(m.cancelFuncs, item.ID)
-		m.cancelMu.Unlock()
-	}()
-
-	resultingPath, processingErr := m.processor.ProcessItem(itemCtx, item)
-
-	if processingErr != nil {
-		m.processor.HandleFailure(ctx, item, processingErr)
-	} else {
-		m.processor.HandleSuccess(ctx, item, resultingPath)
-	}
+	m.processClaimedItem(itemCtx, ctx, item, owner)
 }

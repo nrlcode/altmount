@@ -15,6 +15,10 @@ import (
 // PostgreSQL's 65535 parameter limit.
 const bulkChunkSize = 500
 
+// ErrQueueItemClaimConflict means a queue row exists but is not eligible for
+// the requested processing admission.
+var ErrQueueItemClaimConflict = errors.New("queue item claim conflict")
+
 // escapeLikePattern escapes LIKE wildcards so a literal string can be matched as a prefix.
 func escapeLikePattern(s string) string {
 	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
@@ -349,6 +353,76 @@ func (r *QueueRepository) ClaimNextQueueItem(ctx context.Context) (*ImportQueueI
 	}
 
 	return claimedItem, nil
+}
+
+// ClaimQueueItemByID atomically admits an eligible queue item for manual processing.
+func (r *QueueRepository) ClaimQueueItemByID(ctx context.Context, id int64) (*ImportQueueItem, error) {
+	var claimedItem *ImportQueueItem
+
+	err := r.withQueueTransaction(ctx, func(txRepo *QueueRepository) error {
+		result, err := txRepo.db.ExecContext(ctx, `
+			UPDATE import_queue
+			SET status = 'processing', started_at = datetime('now'), completed_at = NULL,
+			    error_message = NULL, updated_at = datetime('now')
+			WHERE id = ? AND status IN ('pending', 'failed', 'completed')
+		`, id)
+		if err != nil {
+			return fmt.Errorf("failed to claim queue item %d: %w", id, err)
+		}
+
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to inspect queue item %d claim: %w", id, err)
+		}
+		if rowsAffected > 1 {
+			return fmt.Errorf("queue item %d claim changed %d rows", id, rowsAffected)
+		}
+		if rowsAffected == 0 {
+			current, err := txRepo.GetQueueItem(ctx, id)
+			if err != nil {
+				return err
+			}
+			if current == nil {
+				return nil
+			}
+			return fmt.Errorf("%w: queue item %d has status %q",
+				ErrQueueItemClaimConflict, id, current.Status)
+		}
+
+		claimedItem, err = txRepo.GetQueueItem(ctx, id)
+		if err != nil {
+			return err
+		}
+		if claimedItem == nil {
+			return fmt.Errorf("claimed queue item %d disappeared", id)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claimedItem, nil
+}
+
+// ReleaseQueueItemClaim returns a rejected runtime admission to the pending queue.
+// The status guard prevents a stale release from overwriting later finalization.
+func (r *QueueRepository) ReleaseQueueItemClaim(ctx context.Context, id int64) error {
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE import_queue
+		SET status = 'pending', started_at = NULL, updated_at = datetime('now')
+		WHERE id = ? AND status = 'processing'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("failed to release queue item claim %d: %w", id, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to inspect queue item %d claim release: %w", id, err)
+	}
+	if rowsAffected > 1 {
+		return fmt.Errorf("queue item %d claim release changed %d rows", id, rowsAffected)
+	}
+	return nil
 }
 
 // UpdateQueueItemStatus updates the status of a queue item

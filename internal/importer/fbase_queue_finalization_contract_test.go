@@ -63,8 +63,7 @@ func newFbaseFinalizationEnv(t *testing.T) *fbaseFinalizationEnv {
 			ConfigGetter:    configGetter,
 			MetadataService: metadataService,
 		}),
-		log:         slog.Default(),
-		cancelFuncs: make(map[int64]context.CancelFunc),
+		log: slog.Default(),
 	}
 
 	return &fbaseFinalizationEnv{
