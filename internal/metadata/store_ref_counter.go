@@ -7,4 +7,5 @@ import "context"
 type StoreRefCounter interface {
 	IncStoreRef(ctx context.Context, storePath string) error
 	DecStoreRef(ctx context.Context, storePath string) (int64, error)
+	GetStoreRefCount(ctx context.Context, storePath string) (int64, error)
 }

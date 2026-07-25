@@ -385,7 +385,7 @@ func fastFailConcurrency(cfg *config.Config) int {
 // Returns (resultPath, writtenMetadataPaths, error). writtenMetadataPaths contains all virtual paths of
 // metadata files written to disk; it is populated even on partial failure so callers can clean up.
 // Paths prefixed with "DIR:" indicate a metadata directory that should be removed entirely.
-func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePath string, queueID int, allowedExtensionsOverride *[]string, virtualDirOverride *string, extractedFiles []parser.ExtractedFileInfo, category *string, metadata *string, downloadID *string) (string, []string, error) {
+func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePath string, queueID int, allowedExtensionsOverride *[]string, virtualDirOverride *string, extractedFiles []parser.ExtractedFileInfo, category *string, metadata *string, downloadID *string) (result string, writtenPaths []string, resultErr error) {
 	// Gate this import behind the pool admission controller so we can cap how
 	// many NZB imports run concurrently end-to-end and yield to streams under
 	// load. The Acquire is a no-op when no caps are configured.
@@ -526,9 +526,6 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 	}
 
 	// Step 5: Process based on file type
-	var result string
-	var writtenPaths []string
-
 	// Persist the NzbStore up front so every ordinary metadata write below can be
 	// emitted directly in the durable v3 store-backed format. STRM imports retain
 	// their intentional inline metadata representation.
@@ -587,6 +584,11 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 		}
 		storeRef = ref
 		storeIndex = parsed.SegmentIndex
+		defer func() {
+			if releaseErr := proc.metadataService.RemoveStoreIfUnreferenced(context.WithoutCancel(ctx), storeRef); releaseErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("release unreferenced NZB metadata store %q: %w", storeRef, releaseErr))
+			}
+		}()
 	}
 
 	// Bare-ISO Blu-ray expansion. ISOs posted directly to Usenet (without
