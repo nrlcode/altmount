@@ -2,6 +2,8 @@ package health
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -57,6 +59,62 @@ func assertNoCHG022Signal(t *testing.T, signal <-chan struct{}, message string) 
 	}
 }
 
+type chg022LogGateState struct {
+	message string
+	entered chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+type chg022LogGateHandler struct {
+	next  slog.Handler
+	state *chg022LogGateState
+}
+
+func (h *chg022LogGateHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.next.Enabled(ctx, level)
+}
+
+func (h *chg022LogGateHandler) Handle(ctx context.Context, record slog.Record) error {
+	if record.Message == h.state.message {
+		h.state.once.Do(func() { close(h.state.entered) })
+		<-h.state.release
+	}
+	return h.next.Handle(ctx, record)
+}
+
+func (h *chg022LogGateHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &chg022LogGateHandler{next: h.next.WithAttrs(attrs), state: h.state}
+}
+
+func (h *chg022LogGateHandler) WithGroup(name string) slog.Handler {
+	return &chg022LogGateHandler{next: h.next.WithGroup(name), state: h.state}
+}
+
+func newCHG022SyncWorker(
+	t *testing.T,
+	cfg *config.Config,
+	configGetter config.ConfigGetter,
+) (*LibrarySyncWorker, *repairTestEnv) {
+	t.Helper()
+	env := newRepairTestEnv(t, cfg.Metadata.RootPath, nil)
+	for _, path := range []string{
+		"complete/chg022-a.mkv",
+		"complete/chg022-b.mkv",
+		"complete/chg022-c.mkv",
+		"complete/chg022-d.mkv",
+	} {
+		writeHealthyFile(t, env, path)
+	}
+	return NewLibrarySyncWorker(
+		env.metadataService,
+		env.healthRepo,
+		configGetter,
+		nil,
+		&MockRcloneClient{},
+	), env
+}
+
 func TestFACORECHG022LibrarySyncStopJoinsAndExcludesRestart(t *testing.T) {
 	firstEntered := make(chan struct{})
 	secondEntered := make(chan struct{})
@@ -109,6 +167,8 @@ func TestFACORECHG022LibrarySyncStopJoinsAndExcludesRestart(t *testing.T) {
 		"Stop returned while its current library-sync generation was still active")
 	assert.True(t, worker.IsRunning(),
 		"a generation must remain observable while Stop is joining it")
+	assert.Error(t, worker.TriggerManualSync(context.Background()),
+		"a stopping generation must not accept work it cannot guarantee to consume")
 
 	worker.StartLibrarySync(workerCtx)
 	noOverlap := assertNoCHG022Signal(t, secondEntered,
@@ -207,4 +267,147 @@ func TestFACORECHG022ManualTriggerDoesNotCrossGenerations(t *testing.T) {
 	releaseSyncRun()
 	worker.Stop(context.Background())
 	require.False(t, worker.IsRunning())
+}
+
+func TestFACORECHG022MetadataOnlyCancellationJoinsWorkerPool(t *testing.T) {
+	root := t.TempDir()
+	cfg := chg022LibrarySyncConfig(360)
+	cfg.Metadata.RootPath = root
+	cfg.Import.ImportStrategy = config.ImportStrategyNone
+	cfg.Health.LibraryDir = nil
+	cfg.Health.LibrarySyncConcurrency = 1
+
+	secondChildEntered := make(chan struct{})
+	thirdChildEntered := make(chan struct{})
+	releaseSecondChild := make(chan struct{})
+	releaseThirdChild := make(chan struct{})
+	var releaseSecondOnce sync.Once
+	var releaseThirdOnce sync.Once
+	releaseSecond := func() { releaseSecondOnce.Do(func() { close(releaseSecondChild) }) }
+	releaseThird := func() { releaseThirdOnce.Do(func() { close(releaseThirdChild) }) }
+	var configCalls atomic.Int32
+
+	worker, _ := newCHG022SyncWorker(t, cfg, func() *config.Config {
+		switch configCalls.Add(1) {
+		case 10:
+			close(secondChildEntered)
+			<-releaseSecondChild
+		case 11:
+			close(thirdChildEntered)
+			<-releaseThirdChild
+		}
+		return cfg
+	})
+
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		releaseSecond()
+		releaseThird()
+		cancelWorker()
+		if worker.IsRunning() {
+			worker.Stop(context.Background())
+		}
+	})
+
+	worker.StartLibrarySync(workerCtx)
+	require.NoError(t, worker.TriggerManualSync(context.Background()))
+	waitForCHG022Signal(t, secondChildEntered,
+		"metadata-only sync did not enter its second worker task")
+
+	stopDone := make(chan struct{})
+	go func() {
+		worker.Stop(context.Background())
+		close(stopDone)
+	}()
+	releaseSecond()
+	waitForCHG022Signal(t, thirdChildEntered,
+		"metadata-only sync did not admit its third worker task after cancellation")
+	assertNoCHG022Signal(t, stopDone,
+		"Stop returned while a metadata-only generation worker remained active")
+
+	releaseThird()
+	waitForCHG022Signal(t, stopDone,
+		"Stop did not return after the metadata-only worker pool completed")
+}
+
+func TestFACORECHG022FullSyncCancellationJoinsResultConsumer(t *testing.T) {
+	root := t.TempDir()
+	libraryDir := t.TempDir()
+	cfg := chg022LibrarySyncConfig(360)
+	cfg.Metadata.RootPath = root
+	cfg.Import.ImportStrategy = config.ImportStrategyNone
+	cfg.Health.LibraryDir = &libraryDir
+	cfg.Health.LibrarySyncConcurrency = 1
+
+	secondChildEntered := make(chan struct{})
+	thirdChildEntered := make(chan struct{})
+	consumerEntered := make(chan struct{})
+	releaseSecondChild := make(chan struct{})
+	releaseThirdChild := make(chan struct{})
+	releaseConsumer := make(chan struct{})
+	var releaseSecondOnce sync.Once
+	var releaseThirdOnce sync.Once
+	var releaseConsumerOnce sync.Once
+	releaseSecond := func() { releaseSecondOnce.Do(func() { close(releaseSecondChild) }) }
+	releaseThird := func() { releaseThirdOnce.Do(func() { close(releaseThirdChild) }) }
+	releaseResultConsumer := func() { releaseConsumerOnce.Do(func() { close(releaseConsumer) }) }
+
+	previousLogger := slog.Default()
+	gate := &chg022LogGateState{
+		message: "Failed to batch add automatic health checks",
+		entered: consumerEntered,
+		release: releaseConsumer,
+	}
+	slog.SetDefault(slog.New(&chg022LogGateHandler{
+		next:  slog.NewTextHandler(io.Discard, nil),
+		state: gate,
+	}))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	var configCalls atomic.Int32
+	worker, _ := newCHG022SyncWorker(t, cfg, func() *config.Config {
+		switch configCalls.Add(1) {
+		case 12:
+			close(secondChildEntered)
+			<-releaseSecondChild
+		case 14:
+			close(thirdChildEntered)
+			<-releaseThirdChild
+		}
+		return cfg
+	})
+
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		releaseSecond()
+		releaseThird()
+		releaseResultConsumer()
+		cancelWorker()
+		if worker.IsRunning() {
+			worker.Stop(context.Background())
+		}
+	})
+
+	worker.StartLibrarySync(workerCtx)
+	require.NoError(t, worker.TriggerManualSync(context.Background()))
+	waitForCHG022Signal(t, secondChildEntered,
+		"full sync did not enter its second metadata worker task")
+
+	stopDone := make(chan struct{})
+	go func() {
+		worker.Stop(context.Background())
+		close(stopDone)
+	}()
+	releaseSecond()
+	waitForCHG022Signal(t, thirdChildEntered,
+		"full sync did not admit its third metadata worker task after cancellation")
+	releaseThird()
+	waitForCHG022Signal(t, consumerEntered,
+		"full sync result consumer did not enter its cancellation flush")
+	assertNoCHG022Signal(t, stopDone,
+		"Stop returned while the full-sync result consumer remained active")
+
+	releaseResultConsumer()
+	waitForCHG022Signal(t, stopDone,
+		"Stop did not return after the full-sync result consumer completed")
 }
