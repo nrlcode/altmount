@@ -88,7 +88,6 @@ func newMoveToFailedTestServiceWithDB(t *testing.T) (*Service, *sql.DB) {
 		configGetter:    cfgGetter,
 		metadataService: metadataService,
 		log:             slog.Default(),
-		cancelFuncs:     make(map[int64]context.CancelFunc),
 		mu:              sync.RWMutex{},
 	}, db
 }

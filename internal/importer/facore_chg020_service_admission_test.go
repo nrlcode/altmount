@@ -53,13 +53,14 @@ func TestFACORECHG020ServiceExecuteItemPropagatesManualAdmissionFailure(t *testi
 		}
 	}
 
-	require.Error(t, err, "manual admission failure must be returned to the caller")
+	require.ErrorIs(t, err, importqueue.ErrQueueItemNotFound,
+		"manual admission failure must be returned to the caller")
 }
 
 func TestFACORECHG020ServiceCancelProcessingPropagatesMissingRuntimeOwner(t *testing.T) {
 	env := newFbaseAdmissionEnv(t)
 
-	require.Error(t, env.service.CancelProcessing(1<<62),
+	require.ErrorIs(t, env.service.CancelProcessing(1<<62), importqueue.ErrQueueItemNotProcessing,
 		"a missing manager-owned cancellation handle must not be reported as success")
 }
 

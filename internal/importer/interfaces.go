@@ -22,8 +22,8 @@ type QueueManager interface {
 	IsRunning() bool
 	// CancelProcessing cancels processing of a specific item
 	CancelProcessing(itemID int64) error
-	// ProcessItemInBackground starts processing a specific item in the background
-	ProcessItemInBackground(ctx context.Context, itemID int64)
+	// ExecuteItem admits and starts processing a specific item in the background.
+	ExecuteItem(ctx context.Context, itemID int64) error
 }
 
 // DirectoryScanner provides manual directory scanning functionality

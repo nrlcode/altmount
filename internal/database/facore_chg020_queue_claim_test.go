@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -101,7 +102,8 @@ func testFACORECHG020QueueClaimByID(
 			seed := seedFACORECHG020QueueItem(t, ctx, repo, status)
 
 			claimed, err := claimer.ClaimQueueItemByID(ctx, seed.ID)
-			require.Error(t, err, "an ineligible row must report an admission conflict")
+			require.ErrorIs(t, err, ErrQueueItemClaimConflict,
+				"an ineligible row must report a typed admission conflict")
 			assert.Nil(t, claimed)
 			stored, err := repo.GetQueueItem(ctx, seed.ID)
 			require.NoError(t, err)
@@ -218,6 +220,8 @@ func assertFACORECHG020ClaimWinners(
 	for _, outcome := range outcomes {
 		if outcome.err != nil {
 			errorCount++
+			assert.True(t, errors.Is(outcome.err, ErrQueueItemClaimConflict),
+				"a losing by-ID claimant must be distinguishable from a database failure")
 			assert.Nil(t, outcome.item)
 			continue
 		}

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"github.com/javi11/altmount/internal/database"
 	internalerrors "github.com/javi11/altmount/internal/errors"
 	"github.com/javi11/altmount/internal/httpclient"
+	importqueue "github.com/javi11/altmount/internal/importer/queue"
 	"github.com/javi11/altmount/internal/importer/utils/nzbtrim"
 	"github.com/javi11/altmount/internal/nzbfile"
 	"github.com/javi11/altmount/internal/nzblnk"
@@ -309,6 +311,12 @@ func (s *Server) handleRetryQueue(c *fiber.Ctx) error {
 	// Update status to pending for manual retry
 	err = s.importerService.ExecuteItem(c.Context(), id)
 	if err != nil {
+		if errors.Is(err, database.ErrQueueItemClaimConflict) {
+			return RespondConflict(c, "Queue item is already being processed", err.Error())
+		}
+		if errors.Is(err, importqueue.ErrQueueItemNotFound) {
+			return RespondNotFound(c, "Queue item", err.Error())
+		}
 		return RespondInternalError(c, "Failed to retry queue item", err.Error())
 	}
 
@@ -373,7 +381,10 @@ func (s *Server) handleCancelQueue(c *fiber.Ctx) error {
 
 	err = s.importerService.CancelProcessing(id)
 	if err != nil {
-		return RespondNotFound(c, "Item is not currently processing", err.Error())
+		if errors.Is(err, importqueue.ErrQueueItemNotProcessing) {
+			return RespondConflict(c, "Item has no active processing owner", err.Error())
+		}
+		return RespondInternalError(c, "Failed to cancel queue item", err.Error())
 	}
 
 	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
@@ -1119,6 +1130,11 @@ func (s *Server) handleCancelQueueBulk(c *fiber.Ctx) error {
 
 		err = s.importerService.CancelProcessing(id)
 		if err != nil {
+			if errors.Is(err, importqueue.ErrQueueItemNotProcessing) {
+				notProcessingCount++
+				results[fmt.Sprintf("%d", id)] = "No active processing owner"
+				continue
+			}
 			results[fmt.Sprintf("%d", id)] = err.Error()
 		} else {
 			cancelledCount++

@@ -120,8 +120,34 @@ func TestFACORECHG020CancelProcessingRejectsMissingRuntimeOwner(t *testing.T) {
 	t.Cleanup(manager.cancel)
 
 	err := manager.CancelProcessing(404)
-	require.Error(t, err,
+	require.ErrorIs(t, err, ErrQueueItemNotProcessing,
 		"cancellation must distinguish a missing runtime owner from a delivered cancellation")
+}
+
+func TestFACORECHG020OwnerReleaseIsIdentityChecked(t *testing.T) {
+	manager := NewManager(ManagerConfig{
+		Workers:      1,
+		ConfigGetter: facoreCHG020ConfigGetter,
+	}, nil, &facoreCHG020Processor{}, nil)
+	t.Cleanup(manager.cancel)
+
+	oldCtx, cancelOld := context.WithCancel(context.Background())
+	replacementCtx, cancelReplacement := context.WithCancel(context.Background())
+	t.Cleanup(cancelReplacement)
+	oldOwner := &processingOwner{cancel: cancelOld}
+	replacement := &processingOwner{cancel: cancelReplacement}
+	manager.cancelFuncs[42] = replacement
+
+	manager.releaseProcessingOwner(42, oldOwner)
+
+	manager.cancelMu.RLock()
+	current := manager.cancelFuncs[42]
+	manager.cancelMu.RUnlock()
+	assert.Same(t, replacement, current)
+	assert.ErrorIs(t, oldCtx.Err(), context.Canceled,
+		"the retired owner's context must still be released")
+	assert.NoError(t, replacementCtx.Err(),
+		"retiring an old owner must not cancel its replacement")
 }
 
 func TestFACORECHG020ExecuteItemRegistersCancellationBeforeReturning(t *testing.T) {
@@ -218,7 +244,8 @@ func TestFACORECHG020DuplicateManualExecutionHasOneAdmission(t *testing.T) {
 		facoreCHG020Wait(t, finished, "second admitted manual execution did not finish")
 	}
 
-	assert.Error(t, secondErr, "an already-processing row must not receive a second manual owner")
+	assert.ErrorIs(t, secondErr, database.ErrQueueItemClaimConflict,
+		"an already-processing row must not receive a second manual owner")
 	assert.EqualValues(t, 1, calls.Load(), "one durable queue row must have one active processor")
 }
 
@@ -307,7 +334,8 @@ func TestFACORECHG020ManualAndAutomaticExecutionHaveOneAdmission(t *testing.T) {
 	}
 	facoreCHG020Wait(t, automaticDone, "automatic execution did not return")
 
-	assert.Error(t, manualErr, "manual admission must lose after the worker has claimed the row")
+	assert.ErrorIs(t, manualErr, database.ErrQueueItemClaimConflict,
+		"manual admission must lose after the worker has claimed the row")
 	assert.EqualValues(t, 1, calls.Load(), "manual and automatic paths must share one admission authority")
 }
 

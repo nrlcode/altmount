@@ -197,10 +197,6 @@ type Service struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 
-	// Cancellation tracking for processing items
-	cancelFuncs map[int64]context.CancelFunc
-	cancelMu    sync.RWMutex
-
 	// categoryPathCache memoizes buildCategoryPath results; cleared on config reload.
 	categoryPathCache sync.Map
 
@@ -253,7 +249,6 @@ func NewService(config ServiceConfig, metadataService *metadata.MetadataService,
 		log:             slog.Default().With("component", "importer-service"),
 		ctx:             ctx,
 		cancel:          cancel,
-		cancelFuncs:     make(map[int64]context.CancelFunc),
 		paused:          false,
 	}
 
@@ -1435,67 +1430,7 @@ func (s *Service) CancelProcessing(itemID int64) error {
 
 // ExecuteItem manually triggers processing for a specific queue item, bypassing concurrency limits.
 func (s *Service) ExecuteItem(ctx context.Context, itemID int64) error {
-	s.ProcessItemInBackground(ctx, itemID)
-	return nil
-}
-
-// ProcessItemInBackground processes a specific queue item in the background.
-// NOTE: This intentionally runs outside the worker pool — it is used for manual retries
-// of specific items and should not compete with the normal import queue workers.
-func (s *Service) ProcessItemInBackground(ctx context.Context, itemID int64) {
-	go func() {
-		s.log.DebugContext(ctx, "Starting background processing of queue item", "item_id", itemID, "background", true)
-
-		// Get the queue item
-		item, err := s.database.Repository.GetQueueItem(ctx, itemID)
-		if err != nil {
-			s.log.ErrorContext(ctx, "Failed to get queue item for background processing", "item_id", itemID, "error", err)
-			return
-		}
-
-		if item == nil {
-			s.log.WarnContext(ctx, "Queue item not found for background processing", "item_id", itemID)
-			return
-		}
-
-		// Update status to processing
-		if err := s.database.Repository.UpdateQueueItemStatus(ctx, itemID, database.QueueStatusProcessing, nil); err != nil {
-			s.log.ErrorContext(ctx, "Failed to update item status to processing", "item_id", itemID, "error", err)
-			return
-		}
-
-		if s.broadcaster != nil {
-			s.broadcaster.BroadcastQueueChanged()
-		}
-
-		// Create cancellable context for this item
-		itemCtx, cancel := context.WithCancel(ctx)
-
-		// Register cancel function
-		s.cancelMu.Lock()
-		s.cancelFuncs[item.ID] = cancel
-		s.cancelMu.Unlock()
-
-		// Clean up after processing
-		defer func() {
-			s.cancelMu.Lock()
-			delete(s.cancelFuncs, item.ID)
-			s.cancelMu.Unlock()
-		}()
-
-		// Process the NZB file using cancellable context
-		resultingPath, writtenPaths, processingErr := s.processNzbItem(itemCtx, item)
-
-		// Update queue database with results
-		if processingErr != nil {
-			// Clean up any metadata files written before the failure
-			s.cleanupWrittenPaths(ctx, item.ID, writtenPaths)
-			s.handleProcessingFailure(ctx, item, processingErr)
-		} else {
-			// Handle success (storage path, VFS notification, symlinks, status update)
-			s.handleProcessingSuccess(ctx, item, resultingPath, writtenPaths)
-		}
-	}()
+	return s.queueManager.ExecuteItem(ctx, itemID)
 }
 
 // CalculateFileSizeOnly calculates the total file size from NZB/STRM segments
