@@ -255,6 +255,22 @@ func TestCHG019RemovesSuccessfulArchiveStoreWithNoNewOwner(t *testing.T) {
 	assert.Equal(t, firstStore, meta.StoreRef)
 	_, err = env.svc.Store().ReadStore(meta.StoreRef)
 	require.NoError(t, err)
+
+	releaseErr := errors.New("release count unavailable")
+	counter.getErr = releaseErr
+	thirdStore := chg019StorePath(env, 203, source)
+
+	_, _, thirdErr := chg019Process(env, context.Background(), source, 203)
+
+	assert.NoError(t, thirdErr, "healthy archive reuse must not become a failed import when release ownership is unknown")
+	assert.FileExists(t, thirdStore, "unknown ownership must preserve the release-local store")
+	assert.Equal(t, int64(1), counter.count(firstStore))
+	assert.FileExists(t, firstStore)
+	meta, err = env.svc.ReadFileMetadata("/archive-reuse/archive-reuse.mkv")
+	require.NoError(t, err, "failure cleanup must not remove pre-existing healthy metadata")
+	assert.Equal(t, firstStore, meta.StoreRef)
+	_, err = env.svc.Store().ReadStore(meta.StoreRef)
+	require.NoError(t, err)
 }
 
 func TestCHG019RetainsStoreWithPartialOwner(t *testing.T) {
