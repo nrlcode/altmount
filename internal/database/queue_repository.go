@@ -425,6 +425,34 @@ func (r *QueueRepository) ReleaseQueueItemClaim(ctx context.Context, id int64) e
 	return nil
 }
 
+// HoldQueueItemFinalizationFailure makes a failed success-finalization attempt
+// visible for explicit recovery without overwriting a later durable state.
+func (r *QueueRepository) HoldQueueItemFinalizationFailure(
+	ctx context.Context,
+	id int64,
+	errorMessage string,
+) error {
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE import_queue
+		SET status = 'failed', error_message = ?, updated_at = datetime('now')
+		WHERE id = ? AND status = 'processing'
+	`, errorMessage, id)
+	if err != nil {
+		return fmt.Errorf("failed to hold queue item %d finalization failure: %w", id, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to inspect queue item %d finalization hold: %w", id, err)
+	}
+	if rowsAffected > 1 {
+		return fmt.Errorf("queue item %d finalization hold changed %d rows", id, rowsAffected)
+	}
+	if rowsAffected == 1 {
+		_ = r.IncrementDailyStat(ctx, "failed")
+	}
+	return nil
+}
+
 // UpdateQueueItemStatus updates the status of a queue item
 func (r *QueueRepository) UpdateQueueItemStatus(ctx context.Context, id int64, status QueueStatus, errorMessage *string) error {
 	now := time.Now()

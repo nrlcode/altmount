@@ -314,8 +314,24 @@ func (m *Manager) processClaimedItem(
 
 	if processingErr != nil {
 		m.processor.HandleFailure(finalizationCtx, item, processingErr)
-	} else {
-		_ = m.processor.HandleSuccess(finalizationCtx, item, resultingPath)
+		return
+	}
+
+	if finalizationErr := m.processor.HandleSuccess(finalizationCtx, item, resultingPath); finalizationErr != nil {
+		errorMessage := fmt.Sprintf("success finalization failed: %v", finalizationErr)
+		recoveryCtx, recoveryCancel := context.WithTimeout(context.WithoutCancel(finalizationCtx), 5*time.Second)
+		recoveryErr := m.repository.HoldQueueItemFinalizationFailure(recoveryCtx, item.ID, errorMessage)
+		recoveryCancel()
+		if recoveryErr != nil {
+			m.log.ErrorContext(finalizationCtx, "Failed to hold queue item after success finalization error",
+				"queue_id", item.ID,
+				"finalization_error", finalizationErr,
+				"recovery_error", recoveryErr)
+			return
+		}
+		m.log.ErrorContext(finalizationCtx, "Queue item held after success finalization error",
+			"queue_id", item.ID,
+			"error", finalizationErr)
 	}
 }
 
