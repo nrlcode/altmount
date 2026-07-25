@@ -25,6 +25,10 @@ func (c *setupCleanupRefCounter) DecStoreRef(_ context.Context, path string) (in
 	return 0, nil
 }
 
+func (*setupCleanupRefCounter) GetStoreRefCount(context.Context, string) (int64, error) {
+	return 0, nil
+}
+
 func TestInitializeMetadataWiresCleanupAuthorities(t *testing.T) {
 	configRoot := t.TempDir()
 	cfg := config.DefaultConfig(configRoot)

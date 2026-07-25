@@ -32,6 +32,10 @@ func (c *cleanupRefCounter) DecStoreRef(_ context.Context, path string) (int64, 
 	return c.count, c.err
 }
 
+func (c *cleanupRefCounter) GetStoreRefCount(context.Context, string) (int64, error) {
+	return c.count, c.err
+}
+
 func configureCleanupRootsForTest(t *testing.T, ms *MetadataService, storeRoot string, sourceRoots ...string) error {
 	t.Helper()
 	return ms.ConfigureCleanupRoots(storeRoot, sourceRoots...)
@@ -825,6 +829,12 @@ func (c *blockingCleanupRefCounter) DecStoreRef(_ context.Context, path string) 
 	return c.count, nil
 }
 
+func (c *blockingCleanupRefCounter) GetStoreRefCount(context.Context, string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.count, nil
+}
+
 func (c *blockingCleanupRefCounter) snapshot() (calls []string, count int64, fallbacks int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -901,6 +911,12 @@ func (c *retryCleanupRefCounter) DecStoreRef(_ context.Context, path string) (in
 		return c.count, c.err
 	}
 	c.count--
+	return c.count, nil
+}
+
+func (c *retryCleanupRefCounter) GetStoreRefCount(context.Context, string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.count, nil
 }
 

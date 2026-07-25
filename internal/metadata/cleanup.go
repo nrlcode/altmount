@@ -417,6 +417,33 @@ func (ms *MetadataService) cleanupOperation(run func(*cleanupPlanner, cleanupRoo
 	return run(planner, roots)
 }
 
+// RemoveStoreIfUnreferenced removes a release-local store only when no metadata
+// owns it. The count decision and rooted unlink share the cleanup lock with v3
+// reference acquisition so a newly acquired owner cannot lose its store.
+func (ms *MetadataService) RemoveStoreIfUnreferenced(ctx context.Context, storePath string) error {
+	return ms.cleanupOperation(func(planner *cleanupPlanner, roots cleanupRoots) error {
+		if ms.storeRefCounter == nil {
+			return errors.New("store reference counter is unavailable")
+		}
+		store, err := planner.externalFile(roots.store, storePath)
+		if err != nil {
+			return err
+		}
+		count, err := ms.storeRefCounter.GetStoreRefCount(ctx, store.absolute)
+		if err != nil {
+			return fmt.Errorf("read store reference count %q: %w", store.absolute, err)
+		}
+		if count != 0 {
+			return nil
+		}
+		if err := removeCleanupTarget(store); err != nil {
+			return fmt.Errorf("remove unreferenced store %q: %w", store.absolute, err)
+		}
+		ms.store.cache.Remove(store.absolute)
+		return nil
+	})
+}
+
 func (ms *MetadataService) deleteFileMetadata(ctx context.Context, virtualPath string, deleteSource bool, physicalPath, physicalRoot string) error {
 	return ms.cleanupOperation(func(planner *cleanupPlanner, roots cleanupRoots) error {
 		plan, err := ms.planFileCleanup(planner, roots, virtualPath, deleteSource, nil, physicalPath, physicalRoot)
