@@ -29,7 +29,6 @@ type batteryEnv struct {
 	proc      *Processor
 	metaRoot  string
 	configDir string // temp dir used as the config directory (Database.Path = configDir/altmount.db)
-	counter   *batteryStoreRefCounter
 }
 
 type batteryStoreRefCounter struct {
@@ -91,7 +90,7 @@ func newBatteryEnv(t *testing.T) *batteryEnv {
 	svc.SetStoreRefCounter(referenceCounter)
 	require.NoError(t, svc.ConfigureCleanupRoots(filepath.Join(configDir, ".nzbs")))
 	proc := NewProcessor(svc, processorTestPoolManager{client: client}, nil, func() *config.Config { return cfg }, nil)
-	return &batteryEnv{t: t, client: client, svc: svc, cfg: cfg, proc: proc, metaRoot: metaRoot, configDir: configDir, counter: referenceCounter}
+	return &batteryEnv{t: t, client: client, svc: svc, cfg: cfg, proc: proc, metaRoot: metaRoot, configDir: configDir}
 }
 
 // rawMetaPath returns the on-disk path to the .meta file for virtualPath.

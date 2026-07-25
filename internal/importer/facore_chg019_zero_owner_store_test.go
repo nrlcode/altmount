@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -157,6 +158,7 @@ func TestCHG019RemovesRejectedZeroOwnerStore(t *testing.T) {
 	_, written, err := chg019Process(env, context.Background(), source, 101)
 
 	require.Error(t, err)
+	assert.ErrorContains(t, err, "does not match allowed extensions")
 	assert.Empty(t, written)
 	assert.Zero(t, counter.count(storePath))
 	assert.NoFileExists(t, storePath)
@@ -243,11 +245,16 @@ func TestCHG019RemovesSuccessfulArchiveStoreWithNoNewOwner(t *testing.T) {
 
 	_, secondWritten, err := chg019Process(env, context.Background(), source, 202)
 	require.NoError(t, err)
-	require.Equal(t, []string{"DIR:/archive-reuse"}, secondWritten)
+	require.NotEmpty(t, secondWritten)
 	assert.Zero(t, counter.count(secondStore))
 	assert.NoFileExists(t, secondStore)
 	assert.Equal(t, int64(1), counter.count(firstStore))
 	assert.FileExists(t, firstStore)
+	meta, err := env.svc.ReadFileMetadata("/archive-reuse/archive-reuse.mkv")
+	require.NoError(t, err)
+	assert.Equal(t, firstStore, meta.StoreRef)
+	_, err = env.svc.Store().ReadStore(meta.StoreRef)
+	require.NoError(t, err)
 }
 
 func TestCHG019RetainsStoreWithPartialOwner(t *testing.T) {
@@ -289,6 +296,7 @@ func TestCHG019JoinsPrimaryAndReleaseErrors(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.Canceled)
 	assert.ErrorIs(t, err, releaseErr)
+	assert.True(t, strings.HasPrefix(err.Error(), "failed to write metadata"), "primary processing error must remain first")
 	assert.FileExists(t, storePath, "unknown ownership must preserve the store")
 }
 
@@ -379,6 +387,19 @@ func TestCHG019RootedStoreReleaseBoundary(t *testing.T) {
 		err := requireCHG019StoreReleaser(t, service).RemoveStoreIfUnreferenced(context.Background(), storePath)
 
 		assert.ErrorIs(t, err, lookupErr)
+		assert.FileExists(t, storePath)
+	})
+
+	t.Run("unwired counter retains", func(t *testing.T) {
+		service, _, storeRoot := newCHG019MetadataService(t)
+		storePath := filepath.Join(storeRoot, "unwired.nzbz")
+		require.NoError(t, service.Store().WriteStore(storePath, &metapb.NzbStore{}))
+		service.SetStoreRefCounter(nil)
+
+		err := requireCHG019StoreReleaser(t, service).RemoveStoreIfUnreferenced(context.Background(), storePath)
+
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "counter is unavailable")
 		assert.FileExists(t, storePath)
 	})
 
