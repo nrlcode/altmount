@@ -313,6 +313,10 @@ func TestFACORECHG022MetadataOnlyCancellationJoinsWorkerPool(t *testing.T) {
 	require.NoError(t, worker.TriggerManualSync(context.Background()))
 	waitForCHG022Signal(t, secondChildEntered,
 		"metadata-only sync did not enter its second worker task")
+	// The single pool worker is now held by child two. Give the submitting
+	// goroutine one bounded scheduling window to block while admitting child
+	// three before cancellation is published.
+	time.Sleep(50 * time.Millisecond)
 
 	stopDone := make(chan struct{})
 	go func() {
@@ -392,6 +396,9 @@ func TestFACORECHG022FullSyncCancellationJoinsResultConsumer(t *testing.T) {
 	require.NoError(t, worker.TriggerManualSync(context.Background()))
 	waitForCHG022Signal(t, secondChildEntered,
 		"full sync did not enter its second metadata worker task")
+	// As above, make the p.Go admission boundary deterministic before Stop can
+	// make the next loop-level cancellation check ready.
+	time.Sleep(50 * time.Millisecond)
 
 	stopDone := make(chan struct{})
 	go func() {
