@@ -93,6 +93,12 @@ func (c *acquisitionRefCounter) DecStoreRef(ctx context.Context, _ string) (int6
 	return c.count, nil
 }
 
+func (c *acquisitionRefCounter) GetStoreRefCount(context.Context, string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.count, nil
+}
+
 func (c *acquisitionRefCounter) snapshot() (count int64, incCalls, decCalls int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

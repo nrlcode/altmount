@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/javi11/altmount/internal/config"
@@ -16,6 +17,7 @@ import (
 	"github.com/javi11/altmount/internal/testsupport/nzbbuild"
 	"github.com/javi11/nntppool/v4"
 	"github.com/javi11/nzbparser"
+	"github.com/stretchr/testify/require"
 )
 
 // batteryEnv holds the full test environment for an import battery test.
@@ -27,13 +29,50 @@ type batteryEnv struct {
 	proc      *Processor
 	metaRoot  string
 	configDir string // temp dir used as the config directory (Database.Path = configDir/altmount.db)
+	counter   *batteryStoreRefCounter
 }
 
-type batteryStoreRefCounter struct{}
+type batteryStoreRefCounter struct {
+	mu     sync.Mutex
+	counts map[string]int64
+}
 
-func (batteryStoreRefCounter) IncStoreRef(context.Context, string) error { return nil }
+func newBatteryStoreRefCounter() *batteryStoreRefCounter {
+	return &batteryStoreRefCounter{counts: make(map[string]int64)}
+}
 
-func (batteryStoreRefCounter) DecStoreRef(context.Context, string) (int64, error) { return 0, nil }
+func (c *batteryStoreRefCounter) IncStoreRef(ctx context.Context, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counts[path]++
+	return nil
+}
+
+func (c *batteryStoreRefCounter) DecStoreRef(ctx context.Context, path string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.counts[path] <= 1 {
+		delete(c.counts, path)
+		return 0, nil
+	}
+	c.counts[path]--
+	return c.counts[path], nil
+}
+
+func (c *batteryStoreRefCounter) GetStoreRefCount(ctx context.Context, path string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.counts[path], nil
+}
 
 // newBatteryEnv creates a fresh test environment backed by an in-memory fakepool.
 // SegmentSamplePercentage is set to 100 so fast-fail checks every segment.
@@ -48,9 +87,11 @@ func newBatteryEnv(t *testing.T) *batteryEnv {
 	cfg.Import.SegmentSamplePercentage = 100
 	cfg.Import.AllowedFileExtensions = append(cfg.Import.AllowedFileExtensions, ".bin")
 	svc := metadata.NewMetadataService(metaRoot)
-	svc.SetStoreRefCounter(batteryStoreRefCounter{})
+	referenceCounter := newBatteryStoreRefCounter()
+	svc.SetStoreRefCounter(referenceCounter)
+	require.NoError(t, svc.ConfigureCleanupRoots(filepath.Join(configDir, ".nzbs")))
 	proc := NewProcessor(svc, processorTestPoolManager{client: client}, nil, func() *config.Config { return cfg }, nil)
-	return &batteryEnv{t: t, client: client, svc: svc, cfg: cfg, proc: proc, metaRoot: metaRoot, configDir: configDir}
+	return &batteryEnv{t: t, client: client, svc: svc, cfg: cfg, proc: proc, metaRoot: metaRoot, configDir: configDir, counter: referenceCounter}
 }
 
 // rawMetaPath returns the on-disk path to the .meta file for virtualPath.
