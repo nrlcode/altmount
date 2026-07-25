@@ -203,20 +203,29 @@ func (m *Manager) IsRunning() bool {
 func (m *Manager) CancelProcessing(itemID int64) error {
 	m.cancelMu.RLock()
 	owner, exists := m.cancelFuncs[itemID]
+	var cancel context.CancelFunc
+	if exists {
+		cancel = owner.cancel
+	}
 	m.cancelMu.RUnlock()
 
-	if !exists {
+	if !exists || cancel == nil {
 		return fmt.Errorf("%w: queue item %d", ErrQueueItemNotProcessing, itemID)
 	}
 
 	m.log.InfoContext(m.ctx, "Cancelling processing for queue item", "item_id", itemID)
-	owner.cancel()
+	cancel()
 	return nil
 }
 
 // ExecuteItem manually triggers processing for a specific queue item, bypassing concurrency limits.
 func (m *Manager) ExecuteItem(ctx context.Context, itemID int64) error {
 	m.claimMu.Lock()
+	if m.hasProcessingOwner(itemID) {
+		m.claimMu.Unlock()
+		return fmt.Errorf("%w: queue item %d already has an admission owner",
+			database.ErrQueueItemClaimConflict, itemID)
+	}
 	item, err := m.repository.ClaimQueueItemByID(ctx, itemID)
 	if err != nil {
 		m.claimMu.Unlock()
@@ -243,6 +252,13 @@ func (m *Manager) ExecuteItem(ctx context.Context, itemID int64) error {
 	return nil
 }
 
+func (m *Manager) hasProcessingOwner(itemID int64) bool {
+	m.cancelMu.RLock()
+	defer m.cancelMu.RUnlock()
+	_, exists := m.cancelFuncs[itemID]
+	return exists
+}
+
 func (m *Manager) registerProcessingOwner(
 	ctx context.Context,
 	itemID int64,
@@ -265,8 +281,22 @@ func (m *Manager) releaseProcessingOwner(itemID int64, owner *processingOwner) {
 	if m.cancelFuncs[itemID] == owner {
 		delete(m.cancelFuncs, itemID)
 	}
+	cancel := owner.cancel
+	owner.cancel = nil
 	m.cancelMu.Unlock()
-	owner.cancel()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (m *Manager) retainFinalizationOwner(owner *processingOwner) {
+	m.cancelMu.Lock()
+	cancel := owner.cancel
+	owner.cancel = nil
+	m.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (m *Manager) processClaimedItem(
@@ -275,18 +305,12 @@ func (m *Manager) processClaimedItem(
 	item *database.ImportQueueItem,
 	owner *processingOwner,
 ) {
-	released := false
-	defer func() {
-		if !released {
-			m.releaseProcessingOwner(item.ID, owner)
-		}
-	}()
+	defer m.releaseProcessingOwner(item.ID, owner)
 
 	resultingPath, processingErr := m.processor.ProcessItem(itemCtx, item)
-	// A completed processing call must stop owning cancellation before its
-	// finalizer can make the row eligible for another admission.
-	m.releaseProcessingOwner(item.ID, owner)
-	released = true
+	// Finalization is deliberately uncancellable, but its admission identity must
+	// remain registered until all mutations for this attempt have finished.
+	m.retainFinalizationOwner(owner)
 
 	if processingErr != nil {
 		m.processor.HandleFailure(finalizationCtx, item, processingErr)
