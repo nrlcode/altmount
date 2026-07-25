@@ -156,6 +156,33 @@ func testFACORECHG020QueueClaimByID(
 		errorCount := assertFACORECHG020ClaimWinners(t, outcomes, 2, first.ID, second.ID)
 		assert.Zero(t, errorCount)
 	})
+
+	t.Run("rejected_runtime_claim_returns_to_pending", func(t *testing.T) {
+		claimer := requireFACORECHG020QueueItemClaimer(t, repo)
+		seed := seedFACORECHG020QueueItem(t, ctx, repo, QueueStatusPending)
+
+		claimed, err := claimer.ClaimQueueItemByID(ctx, seed.ID)
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.NotNil(t, claimed.StartedAt)
+		require.NoError(t, repo.ReleaseQueueItemClaim(ctx, seed.ID))
+
+		stored, err := repo.GetQueueItem(ctx, seed.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, QueueStatusPending, stored.Status)
+		assert.Nil(t, stored.StartedAt)
+
+		errorMessage := "later finalization"
+		require.NoError(t, repo.UpdateQueueItemStatus(ctx, seed.ID, QueueStatusFailed, &errorMessage))
+		require.NoError(t, repo.ReleaseQueueItemClaim(ctx, seed.ID))
+		stored, err = repo.GetQueueItem(ctx, seed.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, QueueStatusFailed, stored.Status)
+		require.NotNil(t, stored.ErrorMessage)
+		assert.Equal(t, errorMessage, *stored.ErrorMessage)
+	})
 }
 
 func seedFACORECHG020QueueItem(

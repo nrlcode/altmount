@@ -404,6 +404,27 @@ func (r *QueueRepository) ClaimQueueItemByID(ctx context.Context, id int64) (*Im
 	return claimedItem, nil
 }
 
+// ReleaseQueueItemClaim returns a rejected runtime admission to the pending queue.
+// The status guard prevents a stale release from overwriting later finalization.
+func (r *QueueRepository) ReleaseQueueItemClaim(ctx context.Context, id int64) error {
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE import_queue
+		SET status = 'pending', started_at = NULL, updated_at = datetime('now')
+		WHERE id = ? AND status = 'processing'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("failed to release queue item claim %d: %w", id, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to inspect queue item %d claim release: %w", id, err)
+	}
+	if rowsAffected > 1 {
+		return fmt.Errorf("queue item %d claim release changed %d rows", id, rowsAffected)
+	}
+	return nil
+}
+
 // UpdateQueueItemStatus updates the status of a queue item
 func (r *QueueRepository) UpdateQueueItemStatus(ctx context.Context, id int64, status QueueStatus, errorMessage *string) error {
 	now := time.Now()

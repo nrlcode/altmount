@@ -411,12 +411,21 @@ func (m *Manager) processNextItem(ctx context.Context, workerID int) {
 	}
 
 	itemCtx, owner, err := m.registerProcessingOwner(ctx, item.ID)
-	m.claimMu.Unlock()
 	if err != nil {
+		releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		releaseErr := m.repository.ReleaseQueueItemClaim(releaseCtx, item.ID)
+		releaseCancel()
+		m.claimMu.Unlock()
+		if releaseErr != nil {
+			m.log.ErrorContext(ctx, "Failed to release rejected queue claim", "worker_id", workerID,
+				"queue_id", item.ID, "claim_error", err, "release_error", releaseErr)
+			return
+		}
 		m.log.ErrorContext(ctx, "Failed to register claimed queue item", "worker_id", workerID,
 			"queue_id", item.ID, "error", err)
 		return
 	}
+	m.claimMu.Unlock()
 
 	if m.listener != nil {
 		m.listener.OnItemClaimed(ctx, item)
