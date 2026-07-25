@@ -418,3 +418,54 @@ func TestFACORECHG022FullSyncCancellationJoinsResultConsumer(t *testing.T) {
 	waitForCHG022Signal(t, stopDone,
 		"Stop did not return after the full-sync result consumer completed")
 }
+
+func TestFACORECHG022FullSyncPanicJoinsResultConsumer(t *testing.T) {
+	root := t.TempDir()
+	libraryDir := t.TempDir()
+	cfg := chg022LibrarySyncConfig(360)
+	cfg.Metadata.RootPath = root
+	cfg.Import.ImportStrategy = config.ImportStrategyNone
+	cfg.Health.LibraryDir = &libraryDir
+	cfg.Health.LibrarySyncConcurrency = 1
+
+	panicReported := make(chan struct{})
+	logRelease := make(chan struct{})
+	close(logRelease)
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(&chg022LogGateHandler{
+		next: slog.NewTextHandler(io.Discard, nil),
+		state: &chg022LogGateState{
+			message: "Panic in library sync",
+			entered: panicReported,
+			release: logRelease,
+		},
+	}))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	var configCalls atomic.Int32
+	worker, env := newCHG022SyncWorker(t, cfg, func() *config.Config {
+		if configCalls.Add(1) == 12 {
+			panic("FACORE CHG-022 worker panic")
+		}
+		return cfg
+	})
+
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancelWorker()
+		if worker.IsRunning() {
+			worker.Stop(context.Background())
+		}
+	})
+
+	worker.StartLibrarySync(workerCtx)
+	require.NoError(t, worker.TriggerManualSync(context.Background()))
+	waitForCHG022Signal(t, panicReported,
+		"full sync did not report its metadata-worker panic")
+	worker.Stop(context.Background())
+
+	records, err := env.healthRepo.GetAllHealthCheckRecords(context.Background())
+	require.NoError(t, err)
+	assert.Len(t, records, 3,
+		"the result consumer must drain and exit before a worker panic is recovered")
+}
