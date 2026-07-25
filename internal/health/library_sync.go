@@ -61,19 +61,24 @@ type UsedFiles struct {
 	StrmFiles map[string]string // Map of virtual path (without .strm) -> library .strm file path
 }
 
+type librarySyncGeneration struct {
+	cancel   context.CancelFunc
+	done     chan struct{}
+	trigger  chan struct{}
+	stopping bool
+}
+
 // LibrarySyncWorker manages automatic health check library synchronization
 type LibrarySyncWorker struct {
 	metadataService *metadata.MetadataService
 	healthRepo      *database.HealthRepository
 	configGetter    config.ConfigGetter
 	configManager   *config.Manager
-	cancelFunc      context.CancelFunc
 	mu              sync.Mutex
-	running         bool
+	generation      *librarySyncGeneration
 	progressMu      sync.RWMutex
 	progress        *internalSyncProgress
 	lastSyncResult  *SyncResult
-	manualTrigger   chan struct{}
 	rcloneClient    rclonecli.RcloneRcClient
 }
 
@@ -91,7 +96,6 @@ func NewLibrarySyncWorker(
 		configGetter:    configGetter,
 		configManager:   configManager,
 		rcloneClient:    rcloneClient,
-		manualTrigger:   make(chan struct{}, 1), // Buffered channel for non-blocking sends
 	}
 
 	// Load last result from database if available
@@ -129,34 +133,36 @@ func (lsw *LibrarySyncWorker) StartLibrarySync(ctx context.Context) {
 	lsw.mu.Lock()
 	defer lsw.mu.Unlock()
 
-	if lsw.running {
+	if lsw.generation != nil {
 		slog.WarnContext(ctx, "Library sync worker already running")
 		return
 	}
 
-	// Create cancellable context
 	ctx, cancel := context.WithCancel(ctx)
-	lsw.cancelFunc = cancel
-	lsw.running = true
+	generation := &librarySyncGeneration{
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		trigger: make(chan struct{}, 1),
+	}
+	lsw.generation = generation
 
-	go lsw.run(ctx)
+	go lsw.run(ctx, generation)
 }
 
 // Stop stops the library sync worker
 func (lsw *LibrarySyncWorker) Stop(ctx context.Context) {
 	lsw.mu.Lock()
-	defer lsw.mu.Unlock()
-
-	if !lsw.running {
+	generation := lsw.generation
+	if generation == nil {
+		lsw.mu.Unlock()
 		slog.WarnContext(ctx, "Library sync worker not running")
 		return
 	}
+	generation.stopping = true
+	lsw.mu.Unlock()
 
-	if lsw.cancelFunc != nil {
-		lsw.cancelFunc()
-		lsw.cancelFunc = nil
-	}
-	lsw.running = false
+	generation.cancel()
+	<-generation.done
 	slog.InfoContext(ctx, "Library sync worker stopped")
 }
 
@@ -164,7 +170,7 @@ func (lsw *LibrarySyncWorker) Stop(ctx context.Context) {
 func (lsw *LibrarySyncWorker) IsRunning() bool {
 	lsw.mu.Lock()
 	defer lsw.mu.Unlock()
-	return lsw.running
+	return lsw.generation != nil
 }
 
 // GetStatus returns the current status of the library sync worker
@@ -199,16 +205,18 @@ func (lsw *LibrarySyncWorker) GetStatus() LibrarySyncStatus {
 // TriggerManualSync triggers a manual library sync
 func (lsw *LibrarySyncWorker) TriggerManualSync(ctx context.Context) error {
 	lsw.mu.Lock()
-	running := lsw.running
-	lsw.mu.Unlock()
+	defer lsw.mu.Unlock()
 
-	if !running {
+	if lsw.generation == nil {
 		return fmt.Errorf("library sync worker is not running")
+	}
+	if lsw.generation.stopping {
+		return fmt.Errorf("library sync worker is stopping")
 	}
 
 	// Non-blocking send to trigger channel
 	select {
-	case lsw.manualTrigger <- struct{}{}:
+	case lsw.generation.trigger <- struct{}{}:
 		slog.InfoContext(ctx, "Manual library sync triggered")
 		return nil
 	default:
@@ -218,10 +226,14 @@ func (lsw *LibrarySyncWorker) TriggerManualSync(ctx context.Context) error {
 }
 
 // run is the main library sync loop
-func (lsw *LibrarySyncWorker) run(ctx context.Context) {
+func (lsw *LibrarySyncWorker) run(ctx context.Context, generation *librarySyncGeneration) {
 	defer func() {
+		generation.cancel()
 		lsw.mu.Lock()
-		lsw.running = false
+		if lsw.generation == generation {
+			lsw.generation = nil
+		}
+		close(generation.done)
 		lsw.mu.Unlock()
 	}()
 
@@ -252,7 +264,7 @@ func (lsw *LibrarySyncWorker) run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			lsw.safeSyncLibrary(ctx, false)
-		case <-lsw.manualTrigger:
+		case <-generation.trigger:
 			slog.InfoContext(ctx, "Manual library sync trigger received")
 			lsw.safeSyncLibrary(ctx, false)
 		}
@@ -660,12 +672,16 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 
 	// Create a worker pool for parallel metadata reading
 	p := pool.New().WithMaxGoroutines(concurrency)
+	waitForAddWorkers := func() {
+		p.Wait()
+		close(filesToAddChan)
+		<-done
+	}
 
 	for mountRelativePath := range metaFileSet {
 		select {
 		case <-ctx.Done():
-			p.Wait()
-			close(filesToAddChan)
+			waitForAddWorkers()
 			return nil
 		default:
 		}
@@ -770,9 +786,7 @@ func (lsw *LibrarySyncWorker) SyncLibrary(ctx context.Context, dryRun bool) *Dry
 	}
 
 	// Wait for all workers to complete and close results channel
-	p.Wait()
-	close(filesToAddChan)
-	<-done
+	waitForAddWorkers()
 
 	// Two-pass soft delete for orphaned metadata files
 	// Only delete metadata if it was orphaned in BOTH the current AND previous sync run.
@@ -1756,6 +1770,7 @@ func (lsw *LibrarySyncWorker) syncMetadataOnly(ctx context.Context, startTime ti
 	for mountRelativePath := range metaFileSet {
 		select {
 		case <-ctx.Done():
+			p.Wait()
 			return nil
 		default:
 		}
