@@ -586,6 +586,11 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 		storeIndex = parsed.SegmentIndex
 		defer func() {
 			if releaseErr := proc.metadataService.RemoveStoreIfUnreferenced(context.WithoutCancel(ctx), storeRef); releaseErr != nil {
+				if resultErr == nil {
+					proc.log.WarnContext(ctx, "Could not release unreferenced NZB metadata store after successful import",
+						"store_ref", storeRef, "error", releaseErr)
+					return
+				}
 				resultErr = errors.Join(resultErr, fmt.Errorf("release unreferenced NZB metadata store %q: %w", storeRef, releaseErr))
 			}
 		}()

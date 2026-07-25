@@ -429,7 +429,7 @@ func (ms *MetadataService) RemoveStoreIfUnreferenced(ctx context.Context, storeP
 		if err != nil {
 			return err
 		}
-		count, err := ms.storeRefCounter.GetStoreRefCount(context.WithoutCancel(ctx), store.absolute)
+		count, err := ms.storeRefCounter.GetStoreRefCount(ctx, store.absolute)
 		if err != nil {
 			return fmt.Errorf("read store reference count %q: %w", store.absolute, err)
 		}
