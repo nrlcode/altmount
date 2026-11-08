@@ -32,6 +32,14 @@ type holeMetaSnapshot struct {
 	// patches finds the seeded holes a usable PAR2 patch serves; nil when
 	// no ceiling applies or there is no patch source.
 	patches *holePatches
+	// segments and segIndex locate a segment's bytes in the file, for the
+	// PadBytes hook (Void headers are addressed by file offset). Both are
+	// never mutated after open.
+	segments []*metapb.SegmentData
+	segIndex *segmentOffsetIndex
+	// voidLayouts reports that this handle serves Void headers (a plain
+	// Matroska file); pads then ask for the new run's layout.
+	voidLayouts bool
 }
 
 // holePatches finds, on first need, which seeded holes a usable PAR2 patch
@@ -147,11 +155,25 @@ func (mvf *MetadataVirtualFile) holeHooks() *usenet.HoleHooks {
 		if mvf.overCeiling(mvf.ceilingMissing(stored)) {
 			mvf.dropRecoveredStoredHoles(stored)
 		}
+		mvf.holePadded = &holes.Accumulator{}
 		mvf.holeAcc = stored
 		mvf.holeHooksVal = &usenet.HoleHooks{
 			OnHole:     mvf.onHole,
 			KnownHoles: mvf.isKnownHole,
 			Fetched:    mvf.onFetched,
+		}
+		// Matroska: pad with the persisted Void layouts (see void_layout.go)
+		// and ask for the ones still missing.
+		if voidEligible(mvf.name, mvf.meta.Encryption, len(mvf.meta.NestedSources), len(mvf.meta.ClipBoundaries), mvf.meta.SegmentData) {
+			mvf.segmentIndexOnce.Do(func() {
+				mvf.segmentIndex = buildSegmentIndex(mvf.meta.SegmentData)
+			})
+			mvf.holeMeta.segments = mvf.meta.SegmentData
+			mvf.holeMeta.segIndex = mvf.segmentIndex
+			mvf.holeMeta.voidLayouts = true
+			mvf.voidLayouts = mvf.loadVoidLayouts(mvf.segmentIndex)
+			mvf.holeHooksVal.PadBytes = mvf.padBytes
+			mvf.requestVoidLayouts(stored.Runs())
 		}
 		if mvf.patchSource != nil {
 			mvf.holeHooksVal.PatchLookup = mvf.patchLookup
@@ -241,10 +263,11 @@ func (mvf *MetadataVirtualFile) storedHoleCheckTimeout() time.Duration {
 func (mvf *MetadataVirtualFile) isKnownHole(segIndex int) bool {
 	mvf.holeMu.Lock()
 	defer mvf.holeMu.Unlock()
-	if !mvf.holeAcc.Has(segIndex) {
+	if !mvf.holeAcc.Has(segIndex) || mvf.overCeiling(mvf.ceilingMissing(mvf.holeAcc)) {
 		return false
 	}
-	return !mvf.overCeiling(mvf.ceilingMissing(mvf.holeAcc))
+	mvf.holePadded.Add(segIndex)
+	return true
 }
 
 // onFetched drops a segment from the handle's holes once a provider (or the
@@ -256,6 +279,7 @@ func (mvf *MetadataVirtualFile) onFetched(segIndex int) {
 	mvf.holeMu.Lock()
 	defer mvf.holeMu.Unlock()
 	removeHole(mvf.holeAcc, segIndex)
+	removeHole(mvf.holePadded, segIndex)
 }
 
 // removeHole takes one segment out of acc.
@@ -316,8 +340,8 @@ func (mvf *MetadataVirtualFile) onHole(segIndex int, segID string) holes.Decisio
 	// Use the immutable snapshot captured in holeHooks(), never mvf.meta —
 	// see the holeMetaSnapshot doc comment.
 	segBytes := avgSegBytes(mvf.holeMeta.fileSize, mvf.holeMeta.totalSegments)
-	verdict := holes.Classify(runs, mvf.holeMeta.fileSize, segBytes)
-	if verdict != holes.VerdictDegraded {
+	withinCaps, withinCeiling := mvf.padChecks(runs, ceilingMissing)
+	if !withinCaps {
 		// Caps exceeded: fail the stream; the DataCorruptionError path takes
 		// over (repair trigger, safety-folder move) as it always has.
 		slog.WarnContext(mvf.ctx, "Missing segment exceeds padding caps, failing stream",
@@ -327,7 +351,7 @@ func (mvf *MetadataVirtualFile) onHole(segIndex int, segID string) holes.Decisio
 			"longest_run", longest)
 		return holes.DecisionFail
 	}
-	if applyAcceptableMissing(verdict, ceilingMissing, mvf.holeMeta.totalSegments, mvf.holeMeta.acceptableMissingPct) == holes.VerdictFailed {
+	if !withinCeiling {
 		// Same DataCorruptionError path as the caps above.
 		slog.WarnContext(mvf.ctx, "Missing segments exceed acceptable_missing_segments_percentage, failing stream",
 			"file", mvf.name,
@@ -353,9 +377,32 @@ func (mvf *MetadataVirtualFile) onHole(segIndex int, segID string) holes.Decisio
 			totalSegments: mvf.holeMeta.totalSegments,
 			segBytes:      segBytes,
 			fingerprint:   mvf.holeMeta.fingerprint,
+			// This handle pads now (padChecks above), the same decision the
+			// open-time request follows (see requestVoidLayouts).
+			voidLayout: mvf.holeMeta.voidLayouts,
 		})
 	}
+	mvf.holeMu.Lock()
+	mvf.holePadded.Add(segIndex)
+	mvf.holeMu.Unlock()
 	return holes.DecisionPad
+}
+
+// padChecks is onHole's decision on a hole set: whether its runs are within
+// the padding caps, and whether its ceiling count is within the
+// acceptable-missing ceiling. onHole pads only when both hold; wouldPad asks
+// the same of the handle's current holes.
+func (mvf *MetadataVirtualFile) padChecks(runs []holes.Run, ceilingMissing int) (withinCaps, withinCeiling bool) {
+	segBytes := avgSegBytes(mvf.holeMeta.fileSize, mvf.holeMeta.totalSegments)
+	withinCaps = holes.Classify(runs, mvf.holeMeta.fileSize, segBytes) == holes.VerdictDegraded
+	return withinCaps, !mvf.overCeiling(ceilingMissing)
+}
+
+// wouldPad reports whether onHole would pad a miss now, with acc as the
+// handle's holes (the miss included). Caller holds mvf.holeMu.
+func (mvf *MetadataVirtualFile) wouldPad(acc *holes.Accumulator) bool {
+	withinCaps, withinCeiling := mvf.padChecks(acc.Runs(), mvf.ceilingMissing(acc))
+	return withinCaps && withinCeiling
 }
 
 // classifyStreamingFailure builds the playback-impact summary for a stream

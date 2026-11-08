@@ -74,6 +74,12 @@ message HoleRun {
   int64 start_segment = 1;  // first missing segment index
   int64 count = 2;          // number of consecutive missing segments
   int64 recorded_at = 3;    // unix seconds when the miss was confirmed; 0 = legacy, treated as expired
+  // Matroska only: where playback writes an EBML Void header into this run's
+  // zero-filled bytes so the demuxer skips to the next intact block instead of
+  // dropping the rest of the cluster. Valid only for exactly this
+  // (start_segment, count); dropped whenever a merge changes the run.
+  int64 void_offset = 4;    // file offset of the Void header; 0 = not computed, -1 = computed, serve plain zeros
+  int64 void_size = 5;      // Void data size; the element ends at void_offset + 9 + void_size
 }
 
 // FileMetadata represents a single virtual file in the filesystem

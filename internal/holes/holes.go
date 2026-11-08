@@ -226,6 +226,16 @@ func (a *Accumulator) Has(index int) bool {
 	return false
 }
 
+// RunContaining returns the run that holds the segment index.
+func (a *Accumulator) RunContaining(index int) (Run, bool) {
+	for _, r := range a.runs {
+		if index >= r.Start && index < r.Start+r.Count {
+			return r, true
+		}
+	}
+	return Run{}, false
+}
+
 // Add records one missing segment, merging into adjacent runs.
 func (a *Accumulator) Add(index int) {
 	a.AddRun(Run{Start: index, Count: 1})

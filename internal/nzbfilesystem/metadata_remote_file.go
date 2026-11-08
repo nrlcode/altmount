@@ -67,6 +67,7 @@ type MetadataRemoteFile struct {
 	cacheSource      *segcache.Source         // Segment cache source (nil = no cache configured)
 	repairCoalescer  *RepairCoalescer         // Throttles streaming-failure repair triggers and rclone VFS refreshes
 	padRecorder      *padRecorder             // Process-lived worker persisting degraded-pad events
+	voidLayouter     *voidLayouter            // Process-lived worker computing Matroska Void layouts for holes
 	patchSource      PatchSource              // Repaired-article payloads (nil = PAR2 repair disabled)
 	repairEnqueuer   RepairEnqueuer           // Queues PAR2 repairs (nil = PAR2 repair disabled)
 	renameMu         sync.Mutex               // Mutex to protect rename operations from race conditions
@@ -115,7 +116,7 @@ func NewMetadataRemoteFile(
 
 	repairCoalescer := NewRepairCoalescer(rcloneClient, configGetter)
 
-	return &MetadataRemoteFile{
+	mrf := &MetadataRemoteFile{
 		metadataService:  metadataService,
 		healthRepository: healthRepository,
 		arrsService:      arrsService,
@@ -129,6 +130,9 @@ func NewMetadataRemoteFile(
 		repairCoalescer:  repairCoalescer,
 		padRecorder:      newPadRecorder(metadataService, healthRepository, repairCoalescer),
 	}
+	mrf.voidLayouter = newVoidLayouter(metadataService, poolLayoutReaders(poolManager, mrf.resolveSegmentStore))
+	mrf.padRecorder.layouts = mrf.voidLayouter
+	return mrf
 }
 
 // Helper methods to get dynamic config values
@@ -315,6 +319,7 @@ func (mrf *MetadataRemoteFile) OpenFile(ctx context.Context, name string) (bool,
 		rcloneClient:     mrf.rcloneClient,
 		repairCoalescer:  mrf.repairCoalescer,
 		padRecorder:      mrf.padRecorder,
+		voidLayouter:     mrf.voidLayouter,
 		patchSource:      mrf.patchSource,
 		repairEnqueuer:   mrf.repairEnqueuer,
 		configGetter:     mrf.configGetter,
@@ -991,6 +996,14 @@ type MetadataVirtualFile struct {
 	holeHooksVal *usenet.HoleHooks
 	holeOnce     sync.Once
 	holeMeta     holeMetaSnapshot // set in holeHooks(); see holeMetaSnapshot doc
+	// voidLayouts are the persisted Matroska Void layouts by exact hole run,
+	// loaded once in holeHooks() and read under holeMu (see void_layout.go).
+	voidLayouts map[holes.Run]voidLayout
+	// holePadded holds the segments this handle has served as padding (a
+	// replay or a pad, until fetched), under holeMu. holeAcc also counts
+	// misses onHole failed; the Void gate needs to tell them apart.
+	holePadded   *holes.Accumulator
+	voidLayouter *voidLayouter // computes missing layouts; may be nil in tests
 }
 
 // randomReadCacheSize bounds the per-file ephemeral-read cache. 8

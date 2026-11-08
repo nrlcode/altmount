@@ -442,10 +442,16 @@ func (x *ClipBoundary) GetDelta_90K() int64 {
 // without a wasted network round-trip (replay pre-pad) and so health checks
 // accumulate damage across sweeps. Empty for undamaged files (zero overhead).
 type HoleRun struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	StartSegment  int64                  `protobuf:"varint,1,opt,name=start_segment,json=startSegment,proto3" json:"start_segment,omitempty"` // first missing segment index
-	Count         int64                  `protobuf:"varint,2,opt,name=count,proto3" json:"count,omitempty"`                                   // number of consecutive missing segments
-	RecordedAt    int64                  `protobuf:"varint,3,opt,name=recorded_at,json=recordedAt,proto3" json:"recorded_at,omitempty"`       // unix seconds when the miss was confirmed; 0 = legacy, treated as expired
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	StartSegment int64                  `protobuf:"varint,1,opt,name=start_segment,json=startSegment,proto3" json:"start_segment,omitempty"` // first missing segment index
+	Count        int64                  `protobuf:"varint,2,opt,name=count,proto3" json:"count,omitempty"`                                   // number of consecutive missing segments
+	RecordedAt   int64                  `protobuf:"varint,3,opt,name=recorded_at,json=recordedAt,proto3" json:"recorded_at,omitempty"`       // unix seconds when the miss was confirmed; 0 = legacy, treated as expired
+	// Matroska only: where playback writes an EBML Void header into this run's
+	// zero-filled bytes so the demuxer skips to the next intact block instead of
+	// dropping the rest of the cluster. Valid only for exactly this
+	// (start_segment, count); dropped whenever a merge changes the run.
+	VoidOffset    int64 `protobuf:"varint,4,opt,name=void_offset,json=voidOffset,proto3" json:"void_offset,omitempty"` // file offset of the Void header; 0 = not computed, -1 = computed, serve plain zeros
+	VoidSize      int64 `protobuf:"varint,5,opt,name=void_size,json=voidSize,proto3" json:"void_size,omitempty"`       // Void data size; the element ends at void_offset + 9 + void_size
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -497,6 +503,20 @@ func (x *HoleRun) GetCount() int64 {
 func (x *HoleRun) GetRecordedAt() int64 {
 	if x != nil {
 		return x.RecordedAt
+	}
+	return 0
+}
+
+func (x *HoleRun) GetVoidOffset() int64 {
+	if x != nil {
+		return x.VoidOffset
+	}
+	return 0
+}
+
+func (x *HoleRun) GetVoidSize() int64 {
+	if x != nil {
+		return x.VoidSize
 	}
 	return 0
 }
@@ -1081,12 +1101,15 @@ const file_metadata_proto_rawDesc = "" +
 	"\fsegment_refs\x18\b \x03(\v2\x14.metadata.SegmentRefR\vsegmentRefs\"F\n" +
 	"\fClipBoundary\x12\x19\n" +
 	"\bbyte_len\x18\x01 \x01(\x03R\abyteLen\x12\x1b\n" +
-	"\tdelta_90k\x18\x02 \x01(\x03R\bdelta90k\"e\n" +
+	"\tdelta_90k\x18\x02 \x01(\x03R\bdelta90k\"\xa3\x01\n" +
 	"\aHoleRun\x12#\n" +
 	"\rstart_segment\x18\x01 \x01(\x03R\fstartSegment\x12\x14\n" +
 	"\x05count\x18\x02 \x01(\x03R\x05count\x12\x1f\n" +
 	"\vrecorded_at\x18\x03 \x01(\x03R\n" +
-	"recordedAt\"\x91\b\n" +
+	"recordedAt\x12\x1f\n" +
+	"\vvoid_offset\x18\x04 \x01(\x03R\n" +
+	"voidOffset\x12\x1b\n" +
+	"\tvoid_size\x18\x05 \x01(\x03R\bvoidSize\"\x91\b\n" +
 	"\fFileMetadata\x12\x1b\n" +
 	"\tfile_size\x18\x01 \x01(\x03R\bfileSize\x12&\n" +
 	"\x0fsource_nzb_path\x18\x02 \x01(\tR\rsourceNzbPath\x12,\n" +

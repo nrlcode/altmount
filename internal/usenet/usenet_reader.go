@@ -66,6 +66,15 @@ type HoleHooks struct {
 	// Called on download goroutines once the whole body has arrived, before
 	// the segment cache stores it; must be cheap.
 	Fetched func(segIndex int)
+	// PadBytes may write into the zero-filled payload of a missing segment
+	// before it is served (an EBML Void header for Matroska files). payload
+	// is in article coordinates, the length the segment's End implies; the
+	// owner maps it to file offsets. Called for known-hole replays and
+	// approved OnHole pads, never for placeholders or patched segments.
+	// Must be fast and concurrency-safe, and must depend only on the
+	// segment and the owner's hole state, so every read of the segment gets
+	// the same bytes.
+	PadBytes func(segIndex int, payload []byte)
 }
 
 // defaultPatchLookup serves PAR2-repaired article payloads to every reader
@@ -992,6 +1001,16 @@ func (b *UsenetReader) patchFor(ctx context.Context, s *segment) []byte {
 	return nil
 }
 
+// padPayload is the zero-filled payload served for a missing segment, with
+// whatever the owner's PadBytes hook writes into it.
+func (b *UsenetReader) padPayload(s *segment) []byte {
+	p := make([]byte, s.End+1)
+	if b.holeHooks != nil && b.holeHooks.PadBytes != nil {
+		b.holeHooks.PadBytes(s.loaderIdx, p)
+	}
+	return p
+}
+
 func (b *UsenetReader) downloadManager(ctx context.Context) {
 	select {
 	case _, ok := <-b.init:
@@ -1113,7 +1132,7 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 					return
 				}
 				b.log.DebugContext(taskCtx, "zero-filling known-missing segment without fetch")
-				s.SetData(make([]byte, s.End+1))
+				s.SetData(b.padPayload(s))
 				return
 			}
 
@@ -1140,7 +1159,7 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 						b.holeHooks.OnHole(s.loaderIdx, s.Id) == holes.DecisionPad {
 						b.log.InfoContext(taskCtx, "zero-filling missing segment",
 							"file_segment_index", s.loaderIdx)
-						s.SetData(make([]byte, s.End+1))
+						s.SetData(b.padPayload(s))
 						return
 					}
 				}

@@ -38,6 +38,10 @@ type padEvent struct {
 	totalSegments int
 	segBytes      int64
 	fingerprint   string
+	// voidLayout asks for the new run's Matroska Void layout once the hole
+	// is persisted: set only by handles that serve Void headers, while the
+	// acceptable-missing ceiling still allows replaying the holes.
+	voidLayout bool
 }
 
 // RepairEnqueuer queues a file for background PAR2 repair (implemented by
@@ -68,6 +72,7 @@ type padRecorder struct {
 	health    padHealthStore
 	coalescer *RepairCoalescer
 	repair    RepairEnqueuer // optional; set once at boot before traffic
+	layouts   *voidLayouter  // optional; computes Matroska Void layouts for recorded holes
 
 	stopCh chan struct{}
 	stopWg sync.WaitGroup
@@ -141,6 +146,10 @@ func (r *padRecorder) record(ev padEvent) {
 	// Always persist the hole so the next open pre-pads it without a fetch.
 	if err := r.metadata.AddKnownHoles(ev.name, []holes.Run{{Start: ev.segIndex, Count: 1}}, ev.fingerprint); err != nil {
 		slog.Warn("Failed to persist known hole", "file", ev.name, "error", err)
+	} else if ev.voidLayout {
+		// The merged run now has no layout; compute it on the layouter's
+		// own worker, which reads the neighbouring bytes.
+		r.layouts.request(ev.name, ev.segIndex)
 	}
 
 	// Queue a background PAR2 repair so the zero-filled bytes eventually come

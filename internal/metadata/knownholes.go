@@ -75,9 +75,41 @@ func mergeStamped(stored []*metapb.HoleRun, fresh []holes.Run, now time.Time) []
 		if stamp == 0 {
 			stamp = now.Unix()
 		}
-		out = append(out, &metapb.HoleRun{StartSegment: int64(m.Start), Count: int64(m.Count), RecordedAt: stamp})
+		row := &metapb.HoleRun{StartSegment: int64(m.Start), Count: int64(m.Count), RecordedAt: stamp}
+		// A Void layout is computed for one exact run: it points from the
+		// end of the block containing the run's first byte to the first
+		// intact block after its last. It carries over only while the run
+		// keeps exactly that extent; a re-stamp of the same extent keeps it,
+		// any merge that grows the run drops it so it is recomputed.
+		if s := storedExact(stored, m); s != nil {
+			row.VoidOffset, row.VoidSize = s.VoidOffset, s.VoidSize
+		}
+		out = append(out, row)
 	}
 	return out
+}
+
+// storedExact returns the stored row with exactly run's extent, or nil.
+func storedExact(stored []*metapb.HoleRun, run holes.Run) *metapb.HoleRun {
+	for _, s := range stored {
+		if s != nil && s.StartSegment == int64(run.Start) && s.Count == int64(run.Count) {
+			return s
+		}
+	}
+	return nil
+}
+
+// SetHoleLayout records the Void layout computed for run (see HoleRun's
+// void_offset). It is written only if a stored run with exactly that extent
+// still exists: a run merged or dropped since the layout was computed must
+// never receive it, because a Void sized for the old extent would point into
+// the middle of the new hole. offset < 0 records "computed, plain zeros".
+func (ms *MetadataService) SetHoleLayout(virtualPath string, run holes.Run, offset, size int64) error {
+	return ms.UpdateFileMetadata(virtualPath, func(metadata *metapb.FileMetadata) {
+		if s := storedExact(metadata.KnownHoles, run); s != nil {
+			s.VoidOffset, s.VoidSize = offset, size
+		}
+	})
 }
 
 func overlaps(a, b holes.Run) bool {

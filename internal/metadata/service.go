@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -78,6 +80,10 @@ type MetadataService struct {
 	// storeRefCounter tracks reference counts for shared NzbStore files.
 	// nil means reference counting is disabled.
 	storeRefCounter StoreRefCounter
+	// updateLocks serialize UpdateFileMetadata's read-modify-write per path
+	// (striped by a hash of the path), so concurrent status, known-hole and
+	// Void-layout updates of one file cannot overwrite each other.
+	updateLocks [64]sync.Mutex
 }
 
 // NewMetadataService creates a new metadata service
@@ -733,6 +739,11 @@ func (ms *MetadataService) CreateFileMetadata(
 // UpdateFileStatus.
 func (ms *MetadataService) UpdateFileMetadata(virtualPath string, updateFunc func(*metapb.FileMetadata)) error {
 	virtualPath = normalizeVirtualPath(virtualPath)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(virtualPath))
+	mu := &ms.updateLocks[h.Sum32()%uint32(len(ms.updateLocks))]
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Read existing metadata
 	metadata, err := ms.ReadFileMetadata(virtualPath)
