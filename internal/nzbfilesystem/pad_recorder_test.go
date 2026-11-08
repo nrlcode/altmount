@@ -35,7 +35,7 @@ func (f *fakePadMetadataStore) AddKnownHoles(virtualPath string, runs []holes.Ru
 	return nil
 }
 
-func (f *fakePadMetadataStore) UpdateFileStatus(virtualPath string, status metapb.FileStatus) error {
+func (f *fakePadMetadataStore) UpdateFileStatusUnlessCorrupted(virtualPath string, status metapb.FileStatus) error {
 	f.mu.Lock()
 	f.statusUpdates = append(f.statusUpdates, virtualPath)
 	f.mu.Unlock()
@@ -50,7 +50,7 @@ type fakePadHealthStore struct {
 	updates []string
 }
 
-func (f *fakePadHealthStore) UpdateFileHealthScheduled(ctx context.Context, filePath string, status database.HealthStatus, errorMessage *string, sourceNzbPath *string, errorDetails *string, noRetry bool, scheduledAt time.Time) error {
+func (f *fakePadHealthStore) UpdateFileHealthScheduledUnlessCondemned(ctx context.Context, filePath string, status database.HealthStatus, errorMessage *string, sourceNzbPath *string, errorDetails *string, noRetry bool, scheduledAt time.Time) error {
 	f.mu.Lock()
 	f.updates = append(f.updates, filePath)
 	f.mu.Unlock()

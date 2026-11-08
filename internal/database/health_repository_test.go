@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -288,6 +289,78 @@ func TestUpdateFileHealthScheduled_UpdatesExistingRecord(t *testing.T) {
 	}
 	assert.LessOrEqual(t, diff, time.Second,
 		"scheduled_check_at should be updated to %v, got %v", future, got)
+}
+
+// TestUpdateFileHealthScheduledUnlessCondemned_KeepsCondemnedRows checks the
+// conditional upsert: new and non-condemned rows take the status, while
+// repair_triggered and corrupted rows keep theirs.
+func TestUpdateFileHealthScheduledUnlessCondemned_KeepsCondemnedRows(t *testing.T) {
+	repo := setupTestDB(t)
+	checkUnlessCondemnedKeepsCondemnedRows(t, repo, func(filePath string, status HealthStatus) {
+		require.NoError(t, repo.UpdateFileHealthScheduled(context.Background(), filePath, status, nil, nil, nil, false, time.Now().UTC()))
+	})
+}
+
+// The conditional upsert must also run on PostgreSQL, where unqualified
+// existing-row columns in ON CONFLICT DO UPDATE are ambiguous.
+func TestUpdateFileHealthScheduledUnlessCondemned_Postgres(t *testing.T) {
+	db := openPostgresLatest(t)
+	repo := NewHealthRepository(db, DialectPostgres)
+	checkUnlessCondemnedKeepsCondemnedRows(t, repo, func(filePath string, status HealthStatus) {
+		require.NoError(t, repo.UpdateFileHealthScheduled(context.Background(), filePath, status, nil, nil, nil, false, time.Now().UTC()))
+	})
+}
+
+// UpdateFileHealthScheduled updates an existing row on PostgreSQL too: the
+// streaming-failure path uses it to send a file to repair.
+func TestUpdateFileHealthScheduled_Postgres(t *testing.T) {
+	db := openPostgresLatest(t)
+	repo := NewHealthRepository(db, DialectPostgres)
+	ctx := context.Background()
+	filePath := "movies/pg-upsert.mkv"
+	nzb := "/nzbs/pg-upsert.nzb"
+
+	require.NoError(t, repo.UpdateFileHealthScheduled(ctx, filePath, HealthStatusPending, nil, &nzb, nil, false, time.Now().UTC()))
+	require.NoError(t, repo.UpdateFileHealthScheduled(ctx, filePath, HealthStatusRepairTriggered, nil, nil, nil, true, time.Now().UTC()))
+
+	fh, err := repo.GetFileHealth(ctx, filePath)
+	require.NoError(t, err)
+	require.NotNil(t, fh)
+	assert.Equal(t, HealthStatusRepairTriggered, fh.Status)
+	assert.Equal(t, fh.MaxRetries-1, fh.RetryCount, "noRetry spends the retries")
+	assert.Equal(t, HealthPriority(2), fh.Priority, "noRetry raises the priority")
+	require.NotNil(t, fh.SourceNzbPath)
+	assert.Equal(t, nzb, *fh.SourceNzbPath, "a nil source path keeps the stored one")
+}
+
+func checkUnlessCondemnedKeepsCondemnedRows(t *testing.T, repo *HealthRepository, seed func(filePath string, status HealthStatus)) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	tests := []struct {
+		name    string
+		initial HealthStatus // "" means no row yet
+		want    HealthStatus
+	}{
+		{name: "new row", want: HealthStatusDegraded},
+		{name: "healthy row", initial: HealthStatusHealthy, want: HealthStatusDegraded},
+		{name: "repair_triggered row", initial: HealthStatusRepairTriggered, want: HealthStatusRepairTriggered},
+		{name: "corrupted row", initial: HealthStatusCorrupted, want: HealthStatusCorrupted},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filePath := fmt.Sprintf("movies/condemned-%d.mkv", i)
+			if tt.initial != "" {
+				seed(filePath, tt.initial)
+			}
+			require.NoError(t, repo.UpdateFileHealthScheduledUnlessCondemned(ctx, filePath, HealthStatusDegraded, nil, nil, nil, false, now))
+			fh, err := repo.GetFileHealth(ctx, filePath)
+			require.NoError(t, err)
+			require.NotNil(t, fh)
+			assert.Equal(t, tt.want, fh.Status)
+		})
+	}
 }
 
 // TestRelinkFileByFilename_UpdatesAnyStatus verifies that relinking works for any status,

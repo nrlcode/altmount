@@ -89,6 +89,18 @@ func (p *PatchStore) Has(messageID string) bool {
 	return err == nil
 }
 
+// Size reports a stored patch's payload length without reading it.
+func (p *PatchStore) Size(messageID string) (int64, bool) {
+	if messageID == "" {
+		return 0, false
+	}
+	info, err := os.Stat(p.path(messageID))
+	if err != nil {
+		return 0, false
+	}
+	return info.Size(), true
+}
+
 // Prune bounds the store's total on-disk size: when the sum of all *.patch
 // files exceeds maxBytes, the oldest (by mtime) are deleted first until the
 // total fits. maxBytes <= 0 disables pruning. Patches are regenerable by

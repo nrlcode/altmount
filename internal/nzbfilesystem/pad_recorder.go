@@ -15,13 +15,13 @@ import (
 // needs; narrowed to an interface so tests can fake it.
 type padMetadataStore interface {
 	AddKnownHoles(virtualPath string, runs []holes.Run, fingerprint string) error
-	UpdateFileStatus(virtualPath string, status metapb.FileStatus) error
+	UpdateFileStatusUnlessCorrupted(virtualPath string, status metapb.FileStatus) error
 }
 
 // padHealthStore is the slice of database.HealthRepository the pad recorder
 // needs; narrowed to an interface so tests can fake it.
 type padHealthStore interface {
-	UpdateFileHealthScheduled(ctx context.Context, filePath string, status database.HealthStatus, errorMessage *string, sourceNzbPath *string, errorDetails *string, noRetry bool, scheduledAt time.Time) error
+	UpdateFileHealthScheduledUnlessCondemned(ctx context.Context, filePath string, status database.HealthStatus, errorMessage *string, sourceNzbPath *string, errorDetails *string, noRetry bool, scheduledAt time.Time) error
 }
 
 // padEvent carries everything a degraded-pad record needs as plain values.
@@ -159,7 +159,11 @@ func (r *padRecorder) record(ev padEvent) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := r.metadata.UpdateFileStatus(ev.name, metapb.FileStatus_FILE_STATUS_DEGRADED); err != nil {
+	// A later miss on this file may have failed the stream and condemned it
+	// while this event was queued or being recorded. Both writes below leave
+	// a condemned file as it is, or they would undo that verdict and drop the
+	// file out of repair.
+	if err := r.metadata.UpdateFileStatusUnlessCorrupted(ev.name, metapb.FileStatus_FILE_STATUS_DEGRADED); err != nil {
 		slog.WarnContext(ctx, "Failed to update metadata status to degraded", "file", ev.name, "error", err)
 	}
 
@@ -186,7 +190,7 @@ func (r *padRecorder) record(ev padEvent) {
 		"total_missing", ev.total,
 		"longest_run", ev.longest)
 
-	if err := r.health.UpdateFileHealthScheduled(ctx,
+	if err := r.health.UpdateFileHealthScheduledUnlessCondemned(ctx,
 		ev.name,
 		database.HealthStatusDegraded,
 		&errorMsg,

@@ -61,6 +61,11 @@ type HoleHooks struct {
 	// ignored. May be set alone (without OnHole/KnownHoles) so repaired
 	// articles serve even for files ineligible for zero-fill.
 	PatchLookup func(segID string) []byte
+	// Fetched reports a segment a provider (or the segment cache) served
+	// successfully, so the owner can drop it from its known-missing count.
+	// Called on download goroutines once the whole body has arrived, before
+	// the segment cache stores it; must be cheap.
+	Fetched func(segIndex int)
 }
 
 // defaultPatchLookup serves PAR2-repaired article payloads to every reader
@@ -643,6 +648,7 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 			)
 			// The fetch path publishes as it streams; a hit has nothing to
 			// stream, so hand the bytes to the segment here.
+			b.fetched(seg)
 			seg.SetData(data)
 			return data, nil
 		}
@@ -682,6 +688,9 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 
 	if !b.priority {
 		data, err := b.fetchWithRetry(ctx, cp, seg, segIdx, nil)
+		if err == nil {
+			b.fetched(seg)
+		}
 		if b.segmentStore != nil && data != nil && err == nil {
 			_ = b.segmentStore.Put(seg.Id, data)
 		}
@@ -721,6 +730,7 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 			cancelFetch()
 			switch {
 			case err == nil:
+				b.fetched(seg)
 				if b.segmentStore != nil && data != nil {
 					_ = b.segmentStore.Put(seg.Id, data)
 				}
@@ -742,12 +752,22 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 		}
 		if err == nil {
 			// Bytes are already visible through the shared buffer.
+			b.fetched(seg)
 			return nil, nil
 		}
 		if errors.Is(err, nntppool.ErrArticleNotFound) {
 			b.log.DebugContext(ctx, "missing segment", "segment_id", seg.Id)
 		}
 		return nil, err
+	}
+}
+
+// fetched reports a segment whose whole body has arrived (from a provider or
+// the segment cache) to the hole hooks, before it is cached: a reader can
+// already have consumed the bytes, so the hole must leave the count now.
+func (b *UsenetReader) fetched(seg *segment) {
+	if b.holeHooks != nil && b.holeHooks.Fetched != nil {
+		b.holeHooks.Fetched(seg.loaderIdx)
 	}
 }
 
@@ -958,12 +978,18 @@ func (b *UsenetReader) patchFor(ctx context.Context, s *segment) []byte {
 	if p == nil {
 		return nil
 	}
-	if int64(len(p)) != s.End+1 {
-		b.log.WarnContext(ctx, "Repaired payload size mismatch, ignoring patch",
-			"segment_id", s.Id, "patch_bytes", len(p), "want", s.End+1)
-		return nil
+	n := int64(len(p))
+	if n == s.End+1 {
+		return p
 	}
-	return p
+	// A patch holds the whole decoded article. A read that ends inside the
+	// segment needs only its prefix, as a fetched article would serve.
+	if s.SegmentSize > 0 && n == s.SegmentSize && s.End < n {
+		return p[:s.End+1]
+	}
+	b.log.WarnContext(ctx, "Repaired payload size mismatch, ignoring patch",
+		"segment_id", s.Id, "patch_bytes", len(p), "want", s.End+1)
+	return nil
 }
 
 func (b *UsenetReader) downloadManager(ctx context.Context) {
@@ -1119,7 +1145,9 @@ func (b *UsenetReader) downloadManager(ctx context.Context) {
 					}
 				}
 				s.SetError(err)
-			} else if !b.priority {
+				return
+			}
+			if !b.priority {
 				// Progressive readers were finished inside the fetch.
 				s.SetData(data)
 			}

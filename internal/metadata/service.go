@@ -784,6 +784,23 @@ func (ms *MetadataService) UpdateFileStatus(virtualPath string, status metapb.Fi
 	})
 }
 
+// UpdateFileStatusUnlessCorrupted is UpdateFileStatus, except that metadata
+// already FILE_STATUS_CORRUPTED keeps that status. The check is made inside
+// the read-modify-write, so a late caller does not reopen a file another
+// path has just condemned.
+func (ms *MetadataService) UpdateFileStatusUnlessCorrupted(virtualPath string, status metapb.FileStatus) error {
+	if lite, err := ms.ReadFileMetadataLite(virtualPath); err == nil && lite != nil &&
+		(lite.Status == status || lite.Status == metapb.FileStatus_FILE_STATUS_CORRUPTED) {
+		return nil
+	}
+
+	return ms.UpdateFileMetadata(virtualPath, func(metadata *metapb.FileMetadata) {
+		if metadata.Status != metapb.FileStatus_FILE_STATUS_CORRUPTED {
+			metadata.Status = status
+		}
+	})
+}
+
 // DeleteFileMetadata deletes a metadata file, its .id sidecar, and — when this was
 // the last metadata file referencing it — the shared .nzbz store behind it.
 //
