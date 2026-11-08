@@ -297,9 +297,11 @@ type UsenetReader struct {
 	// Tracing counters (atomic, no lock needed)
 	inFlight atomic.Int32 // goroutines actively downloading right now
 
-	// missRechecks counts re-checks attempted, refused ones included, so the
-	// budget holds under concurrent prefetch without a lock.
-	missRechecks atomic.Int32
+	// standingMisses counts re-checked misses that stood (confirmed gone,
+	// unresolved, or present but unfetchable). A re-check that finds the
+	// article and refetches it is not counted, so concurrent transient misses
+	// each get their own.
+	standingMisses atomic.Int32
 
 	// hedger decides when a slow demand-position fetch gets a second request.
 	hedger hedgePolicy
@@ -754,8 +756,11 @@ func (b *UsenetReader) downloadSegmentWithRetry(ctx context.Context, seg *segmen
 // adaptive provider window without letting a silent provider hold a slot.
 const MissRecheckTimeout = 2 * time.Second
 
-// maxMissRechecks budgets re-checks per reader: one desynced segment needs
-// one, and a dead release must not pay ~1.2s per hole.
+// maxMissRechecks budgets re-checks per reader by the misses that stood, not
+// by attempts: a re-check that finds the article present and refetches it is
+// free, so a burst of desynced segments is re-checked in full. Once that many
+// re-checked misses have stood, later misses go unverified, so a dead release
+// pays for one confirmation, not ~1.2s per hole.
 const maxMissRechecks = 1
 
 // fetchWithRetry runs the wire fetch for one segment. With art set the
@@ -784,7 +789,9 @@ func (b *UsenetReader) fetchWithRetry(ctx context.Context, cp pool.NntpClient, s
 	}
 
 	// Present but unfetchable: a real miss, or the file is re-checked forever
-	// and never repaired.
+	// and never repaired. It stands, so it spends the budget: a takedown
+	// would otherwise pay a STAT and a full refetch on every hole.
+	b.standingMisses.Add(1)
 	b.log.WarnContext(ctx, "article exists but a second fetch failed, treating the miss as real",
 		"segment_id", seg.Id, "error", retryErr)
 	return retryData, &missError{segmentID: seg.Id, verdict: MissUnfetchable, err: retryErr}
@@ -793,12 +800,17 @@ func (b *UsenetReader) fetchWithRetry(ctx context.Context, cp pool.NntpClient, s
 // recheckMiss asks the pool once whether a segment the fetch reported missing
 // is actually there. The verdict is meaningful only when present is false.
 //
+// The budget is read before the STAT and charged only once the outcome is
+// known and the miss stands (confirmed or unresolved here, unfetchable in
+// fetchWithRetry). Misses already in flight when the first one stands still
+// run their own STAT in parallel; MissRecheckTimeout bounds each.
+//
 // Streaming only: the import path sweeps availability up front and fast-fails.
 func (b *UsenetReader) recheckMiss(ctx context.Context, cp pool.NntpClient, seg *segment) (present bool, verdict MissVerdict) {
 	if !b.priority || cp == nil || seg.Id == "" || holes.IsPlaceholderID(seg.Id) {
 		return false, MissUnverified
 	}
-	if b.missRechecks.Add(1) > maxMissRechecks {
+	if b.standingMisses.Load() >= maxMissRechecks {
 		return false, MissUnverified
 	}
 
@@ -813,8 +825,10 @@ func (b *UsenetReader) recheckMiss(ctx context.Context, cp pool.NntpClient, seg 
 	case err == nil:
 		return true, MissUnverified
 	case errors.Is(err, nntppool.ErrArticleNotFound):
+		b.standingMisses.Add(1)
 		return false, MissConfirmed
 	default:
+		b.standingMisses.Add(1)
 		return false, MissUnresolved
 	}
 }

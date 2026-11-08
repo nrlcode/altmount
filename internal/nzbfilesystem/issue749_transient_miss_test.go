@@ -1,6 +1,7 @@
 package nzbfilesystem
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -158,4 +159,66 @@ func TestIssue749_PermanentMissStillCondemns(t *testing.T) {
 	require.NotNil(t, fh)
 	assert.Equal(t, 1, fh.StreamingFailureCount,
 		"a confirmed miss must still count toward masking")
+}
+
+// TestTransientMissBurst_NothingPaddedOrPersisted is the burst seen after an
+// import on a live install: a batch of read-ahead fetches 430s at once and
+// every article is there a moment later. Each miss must be re-checked, so none
+// is zero-filled, recorded as a known hole, or marks the file degraded.
+func TestTransientMissBurst_NothingPaddedOrPersisted(t *testing.T) {
+	const (
+		segCount    = 500
+		segSize     = 1024
+		maxPrefetch = 16
+	)
+	ctx := context.Background()
+
+	fp := fakepool.New()
+	configurePoolForFile(fp, segCount, segSize, fakepool.SegmentBehavior{})
+	// Eight scattered segments answer 430 once: within every padding cap, so
+	// without a re-check each one would be zero-filled and persisted.
+	var transient []int
+	for i := 10; i < 26; i += 2 {
+		transient = append(transient, i)
+		fp.SetBehavior(segments.MessageID(i), fakepool.SegmentBehavior{
+			Bytes:     segments.Payload(i, segSize),
+			FailFirst: 1,
+			FailErr:   nntppool.ErrArticleNotFound,
+		})
+	}
+
+	mvf := newTestMVF(t, ctx, fp, segCount, segSize, maxPrefetch)
+	mvf.name = "movies/burst.mkv"
+	metaStore := &fakePadMetadataStore{}
+	healthStore := &fakePadHealthStore{}
+	recorder := newPadRecorder(metaStore, healthStore, nil)
+	mvf.padRecorder = recorder
+
+	buf := make([]byte, segCount*segSize)
+	n, readErr := mvf.ReadAtContext(ctx, buf, 0)
+	require.NoError(t, readErr)
+	require.Equal(t, len(buf), n, "the whole range must be served")
+
+	for _, i := range transient {
+		assert.True(t, bytes.Equal(segments.Payload(i, segSize), buf[i*segSize:(i+1)*segSize]),
+			"segment %d must carry its real bytes, not zeros", i)
+	}
+	assert.Equal(t, int64(len(transient)), fp.StatPriorityCalls(), "every miss must be re-checked")
+
+	mvf.holeMu.Lock()
+	padded := 0
+	if mvf.holeAcc != nil {
+		padded = mvf.holeAcc.Total()
+	}
+	mvf.holeMu.Unlock()
+	assert.Zero(t, padded, "no segment may be zero-filled")
+
+	recorder.Close() // drains, so any write it was handed has happened
+	metaStore.mu.Lock()
+	assert.Empty(t, metaStore.knownHoles, "no known hole may be persisted")
+	assert.Empty(t, metaStore.statusUpdates, "the file must not be marked degraded")
+	metaStore.mu.Unlock()
+	healthStore.mu.Lock()
+	assert.Empty(t, healthStore.updates, "no health record may be written")
+	healthStore.mu.Unlock()
 }
